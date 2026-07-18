@@ -38,6 +38,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: |
             src-tauri/target/release/bundle/nsis/LeLeDownload_v*_x64-setup.exe
             src-tauri/target/release/bundle/nsis/LeLeDownload_v*_x64-setup.exe.sig

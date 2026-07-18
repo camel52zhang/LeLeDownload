@@ -9,7 +9,8 @@ const semver = `1.${yymmdd}.0`;
 const exe = `LeLeDownload_v${yymmdd}_x64-setup.exe`;
 const sigPath = `src-tauri/target/release/bundle/nsis/${exe}.sig`;
 const sig = fs.readFileSync(sigPath, 'utf8').trim();
-const tag = process.env.GITHUB_REF_NAME || `v${semver}`;
+const refName = process.env.GITHUB_REF_NAME || '';
+const tag = refName.startsWith('v') ? refName : `v${semver}`;
 const repo = process.env.GITHUB_REPOSITORY || 'OWNER/REPO';
 
 const latest = {
@@ -26,3 +27,7 @@ const latest = {
 
 fs.writeFileSync('latest.json', JSON.stringify(latest, null, 2));
 console.log(JSON.stringify(latest, null, 2));
+// 把 tag 写入 GITHUB_ENV，供后续 release 步骤用 tag_name 关联
+if (process.env.GITHUB_ENV) {
+  fs.appendFileSync(process.env.GITHUB_ENV, `TAG=${tag}\n`);
+}
