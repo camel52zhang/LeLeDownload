@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm install
+
+      # 自动按当天日期设版本号 + 构建 + 重命名为 LeLeDownload_vYYMMDD_x64-setup.exe
+      - name: Build (auto version + rename)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri:build
+
+      # 生成 updater 用的 latest.json（url 自动用 ${{ github.repository }}）
+      - name: Generate latest.json
+        run: node scripts/gen-latest-json.mjs
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/nsis/LeLeDownload_v*_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/LeLeDownload_v*_x64-setup.exe.sig
+            latest.json

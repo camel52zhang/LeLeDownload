@@ -1,0 +1,64 @@
+{
+    "productName": "LeLeDownload",
+    "version": "1.260718.0",
+    "identifier": "com.lele.download",
+    "build": {
+        "beforeDevCommand": "npm run dev",
+        "devUrl": "http://localhost:1420",
+        "beforeBuildCommand": "node build.mjs",
+        "frontendDist": "../dist"
+    },
+    "app": {
+        "withGlobalTauri": true,
+        "windows": [
+            {
+                "title": "LeLe Download",
+                "width": 900,
+                "height": 650,
+                "resizable": true,
+                "fullscreen": false,
+                "minWidth": 800,
+                "minHeight": 500
+            }
+        ],
+        "security": {
+            "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http: https:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; media-src 'self'; object-src 'none'"
+        }
+    },
+    "bundle": {
+        "active": true,
+        "targets": [
+            "nsis"
+        ],
+        "createUpdaterArtifacts": true,
+        "windows": {
+            "nsis": {
+                "installMode": "currentUser"
+            },
+            "webviewInstallMode": {
+                "type": "skip"
+            }
+        },
+        "resources": {
+            "resources/WebView2Loader.dll": "WebView2Loader.dll",
+            "extension": "extension"
+        },
+        "icon": [
+            "icons/32x32.png",
+            "icons/128x128.png",
+            "icons/128x128@2x.png",
+            "icons/icon.ico"
+        ]
+    },
+    "plugins": {
+        "shell": {
+            "open": true
+        },
+        "updater": {
+            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJCNzFGMTJGNkI1NUQyMkIKUldRcjBsVnJML0Z4SzJHNEsvalRBNTNWbW9aZUtUU29KcnUrMVBTWWlqc2pOKzFNVGVjVkh0MXoK",
+            "endpoints": [
+                "https://github.com/camel52zhang/LeLeDownload/releases/latest/download/latest.json"
+            ]
+        }
+    }
+}

@@ -1,0 +1,646 @@
+﻿// Download Engine - 澶氱嚎绋嬪垎鐗囦笅杞?use futures_util::stream::TryStreamExt;
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock as TokioRwLock;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadTask {
+    pub id: String,
+    pub url: String,
+    pub filename: String,
+    pub total_size: u64,
+    pub downloaded_size: u64,
+    pub speed: f64,
+    pub status: DownloadStatus,
+    pub progress: f64,
+    pub thread_count: usize,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+    pub save_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadStatus {
+    Pending,
+    Downloading,
+    Paused,
+    Completed,
+    Failed,
+}
+
+impl Default for DownloadStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChunkInfo {
+    start: u64,
+    end: u64,
+    downloaded: u64,
+}
+
+pub struct DownloadManager {
+    tasks: Arc<TokioRwLock<HashMap<String, DownloadTask>>>,
+    cancel_flags: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
+    app_handle: tauri::AppHandle,
+    max_threads: usize,
+}
+
+impl DownloadManager {
+    pub fn new(app_handle: tauri::AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            tasks: Arc::new(TokioRwLock::new(HashMap::new())),
+            cancel_flags: Arc::new(TokioRwLock::new(HashMap::new())),
+            app_handle,
+            max_threads: 8, // 榛樿8绾跨▼
+        })
+    }
+
+    /// 鍒涘缓鏂扮殑涓嬭浇浠诲姟
+    pub async fn create_download(
+        &self,
+        url: String,
+        save_dir: String,
+    ) -> Result<DownloadTask, String> {
+        // 鑾峰彇鏂囦欢鍚?        let filename = self.extract_filename(&url).await?;
+        
+        // 纭繚淇濆瓨鐩綍瀛樺湪
+        let save_path = PathBuf::from(&save_dir);
+        fs::create_dir_all(&save_path).map_err(|e| e.to_string())?;
+        
+        let id = Uuid::new_v4().to_string();
+        let task = DownloadTask {
+            id: id.clone(),
+            url: url.clone(),
+            filename: filename.clone(),
+            total_size: 0,
+            downloaded_size: 0,
+            speed: 0.0,
+            status: DownloadStatus::Pending,
+            progress: 0.0,
+            thread_count: self.max_threads,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+            error: None,
+            save_path: PathBuf::from(&save_dir)
+                .join(&filename)
+                .to_string_lossy()
+                .to_string(),
+        };
+        
+        // 淇濆瓨鍒板唴瀛?        self.tasks.write().await.insert(id.clone(), task.clone());
+        
+        // 鍒涘缓鍙栨秷鏍囧織
+        self.cancel_flags.write().await.insert(id.clone(), Arc::new(AtomicBool::new(false)));
+        
+        tracing::info!("Created download task: {} - {}", id, filename);
+        
+        Ok(task)
+    }
+
+    /// 鍚姩涓嬭浇
+    pub async fn start_download(&self, task_id: String) -> Result<(), String> {
+        // 鑾峰彇浠诲姟
+        let mut task = {
+            let tasks = self.tasks.read().await;
+            tasks.get(&task_id).cloned().ok_or("Task not found")?
+        };
+        
+        // 濡傛灉宸插畬鎴愭垨姝ｅ湪涓嬭浇锛屽垯璺宠繃
+        if task.status == DownloadStatus::Completed {
+            return Ok(());
+        }
+        if task.status == DownloadStatus::Downloading {
+            return Ok(());
+        }
+        
+        // 鏇存柊鐘舵€?        task.status = DownloadStatus::Downloading;
+        self.tasks.write().await.insert(task_id.clone(), task.clone());
+        
+        // 鑾峰彇鍙栨秷鏍囧織
+        let cancel_flag = self.cancel_flags.read().await
+            .get(&task_id)
+            .cloned()
+            .ok_or("Cancel flag not found")?;
+        
+        // 寮傛鎵ц涓嬭浇
+        let tasks = self.tasks.clone();
+        let cancel_flags = self.cancel_flags.clone();
+        let app_handle = self.app_handle.clone();
+        let max_threads = self.max_threads;
+        
+        tokio::spawn(async move {
+            if let Err(e) = Self::download_file(
+                task_id.clone(),
+                task.url.clone(),
+                task.save_path.clone(),
+                tasks.clone(),
+                cancel_flags.clone(),
+                app_handle.clone(),
+                max_threads,
+            ).await {
+                tracing::error!("Download failed: {}", e);
+                if let Some(t) = tasks.write().await.get_mut(&task_id) {
+                    t.status = DownloadStatus::Failed;
+                    t.error = Some(e.to_string());
+                }
+                // 鍙戦€佸け璐ヤ簨浠?                let _ = app_handle.emit("download-failed", (&task_id, e.to_string()));
+            }
+        });
+        
+        Ok(())
+    }
+
+    /// 鎵ц澶氱嚎绋嬩笅杞?    async fn download_file(
+        task_id: String,
+        url: String,
+        save_path: String,
+        tasks: Arc<TokioRwLock<HashMap<String, DownloadTask>>>,
+        cancel_flags: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
+        app_handle: tauri::AppHandle,
+        max_threads: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 鑾峰彇HEAD淇℃伅
+        let client = reqwest::Client::new();
+        let head_response = client.head(&url).send().await?;
+        
+        // 妫€鏌ユ槸鍚︽敮鎸?Range 璇锋眰
+        let accept_ranges = head_response
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "bytes")
+            .unwrap_or(false);
+        
+        let total_size = head_response
+            .content_length()
+            .unwrap_or(0);
+        
+        tracing::info!("File size: {}, Accept ranges: {}", total_size, accept_ranges);
+        
+        // 鏇存柊浠诲姟淇℃伅
+        {
+            let mut guard = tasks.write().await;
+            if let Some(t) = guard.get_mut(&task_id) {
+                t.total_size = total_size;
+            }
+        }
+        
+        // 濡傛灉涓嶆敮鎸佸垎鐗囷紝鎴栬€呮枃浠跺お灏忥紝浣跨敤鍗曠嚎绋?        if !accept_ranges || total_size < 1024 * 1024 {
+            // 鍗曠嚎绋嬩笅杞?            Self::download_single(
+                task_id.clone(),
+                url.clone(),
+                save_path,
+                tasks.clone(),
+                cancel_flags.clone(),
+                app_handle.clone(),
+            ).await?;
+        } else {
+            // 澶氱嚎绋嬪垎鐗囦笅杞?            let chunk_size = (total_size / max_threads as u64).max(1024 * 1024); // 鑷冲皯1MB
+            let mut chunks = Vec::new();
+            
+            for i in 0..max_threads {
+                let start = i as u64 * chunk_size;
+                let end = if i == max_threads - 1 {
+                    total_size.saturating_sub(1)
+                } else {
+                    (i + 1) as u64 * chunk_size - 1
+                };
+                
+                if start <= end && start < total_size {
+                    chunks.push(ChunkInfo {
+                        start,
+                        end: end.min(total_size - 1),
+                        downloaded: 0,
+                    });
+                }
+            }
+            
+            // 娲昏穬浠诲姟璁℃暟鍣紙鍦╥nto_iter涔嬪悗浣跨敤锛?            let num_chunks = chunks.len() as u32;
+            
+            // 骞惰涓嬭浇鍚勪釜鍒嗙墖
+            let downloaded_total = Arc::new(AtomicU64::new(0));
+            let start_time = Instant::now();
+            
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let url = url.clone();
+                    let save_path = save_path.clone();
+                    let task_id_for_spawn = task_id.clone();
+                    let tasks = tasks.clone();
+                    let cancel_flags = cancel_flags.clone();
+                    let downloaded_total = downloaded_total.clone();
+                    
+                    tokio::spawn(async move {
+                        Self::download_chunk(
+                            task_id_for_spawn,
+                            url,
+                            save_path,
+                            chunk.start,
+                            chunk.end,
+                            tasks,
+                            cancel_flags,
+                            downloaded_total,
+                        ).await
+                    })
+                })
+                .collect();
+            
+            // 绛夊緟鎵€鏈夊垎鐗囧畬鎴愶紝骞跺彂閫佽繘搴︽洿鏂?            let task_id_clone = task_id.clone();
+            let tasks_clone = tasks.clone();
+            let app_handle_clone = app_handle.clone();
+            let cancel_flags_clone = cancel_flags.clone();
+            
+            // 浣跨敤鍘熷瓙璁℃暟鍣ㄨ窡韪椿璺冧换鍔℃暟
+            let active_tasks = Arc::new(AtomicU32::new(num_chunks));
+            let active_tasks_clone = active_tasks.clone();
+            let downloaded_total_clone = downloaded_total.clone();
+            let total_size_clone = total_size;
+            let start_time_clone = start_time;
+            
+            tokio::spawn(async move {
+                let mut last_update = Instant::now();
+                
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    
+                    // 妫€鏌ユ槸鍚﹁繕鏈夋椿璺冧换鍔?                    let remaining = active_tasks_clone.load(Ordering::Relaxed);
+                    if remaining == 0 {
+                        break;
+                    }
+                    
+                    let downloaded = downloaded_total_clone.load(Ordering::Relaxed);
+                    let elapsed = start_time_clone.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+                    
+                    if let Some(t) = tasks_clone.write().await.get_mut(&task_id_clone) {
+                        t.downloaded_size = downloaded;
+                        t.speed = speed;
+                        t.progress = if total_size_clone > 0 {
+                            (downloaded as f64 / total_size_clone as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        
+                        // 姣?00ms鍙戦€佷竴娆¤繘搴︽洿鏂?                        if last_update.elapsed() > Duration::from_millis(200) {
+                            let progress = serde_json::json!({
+                                "id": task_id_clone,
+                                "downloadedSize": downloaded,
+                                "speed": speed,
+                                "progress": t.progress,
+                                "status": "downloading"
+                            });
+                            let _ = app_handle_clone.emit("download-progress", progress);
+                            last_update = Instant::now();
+                        }
+                    }
+                    
+                    // 妫€鏌ュ彇娑堟爣蹇?                    let cancel = {
+                        let flags = cancel_flags_clone.read().await;
+                        flags.get(&task_id_clone).map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
+                    };
+                    
+                    if cancel {
+                        break;
+                    }
+                }
+            });
+            
+            // 绛夊緟鎵€鏈夌嚎绋嬪畬鎴?            for handle in handles {
+                handle.await.map_err(|e| e.to_string())??;
+                active_tasks.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        
+        // 鏍囪瀹屾垚
+        {
+            let mut guard = tasks.write().await;
+            if let Some(t) = guard.get_mut(&task_id) {
+                t.status = DownloadStatus::Completed;
+                t.progress = 100.0;
+                t.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                t.downloaded_size = t.total_size;
+            }
+        }
+        
+        // 鍙戦€佸畬鎴愪簨浠?        let _ = app_handle.emit("download-completed", &task_id);
+        
+        tracing::info!("Download completed: {}", task_id);
+        
+        Ok(())
+    }
+
+    /// 鍗曠嚎绋嬩笅杞斤紙鐢ㄤ簬涓嶆敮鎸佸垎鐗囩殑鏈嶅姟鍣級
+    async fn download_single(
+        task_id: String,
+        url: String,
+        save_path: String,
+        tasks: Arc<TokioRwLock<HashMap<String, DownloadTask>>>,
+        cancel_flags: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
+        app_handle: tauri::AppHandle,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::new();
+        let response = client.get(&url).send().await?;
+        
+        let total_size = response.content_length().unwrap_or(0);
+        
+        // 鏇存柊鎬诲ぇ灏?        {
+            let mut guard = tasks.write().await;
+            if let Some(t) = guard.get_mut(&task_id) {
+                t.total_size = total_size;
+            }
+        }
+        
+        let mut file = File::create(&save_path)?;
+        let mut downloaded: u64 = 0;
+        let start_time = Instant::now();
+        
+        let mut stream = response.bytes_stream().into_stream();
+        let mut last_update = Instant::now();
+        
+        while let Some(chunk_result) = stream.try_next().await? {
+            // 妫€鏌ュ彇娑?            let cancel = {
+                let flags = cancel_flags.read().await;
+                flags.get(&task_id).map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
+            };
+            if cancel {
+                return Err("Download cancelled".into());
+            }
+            
+            file.write_all(&chunk_result)?;
+            downloaded += chunk_result.len() as u64;
+            
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+            
+            // 鏇存柊浠诲姟
+            {
+                let mut guard = tasks.write().await;
+                if let Some(t) = guard.get_mut(&task_id) {
+                    t.downloaded_size = downloaded;
+                    t.speed = speed;
+                    t.progress = if total_size > 0 {
+                        (downloaded as f64 / total_size as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            
+            // 鍙戦€佽繘搴︽洿鏂?            if last_update.elapsed() > Duration::from_millis(200) {
+                let progress = serde_json::json!({
+                    "id": task_id,
+                    "downloadedSize": downloaded,
+                    "speed": speed,
+                    "progress": if total_size > 0 {
+                        (downloaded as f64 / total_size as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                    "status": "downloading"
+                });
+                let _ = app_handle.emit("download-progress", progress);
+                last_update = Instant::now();
+            }
+        }
+        
+        // 鏍囪瀹屾垚
+        {
+            let mut guard = tasks.write().await;
+            if let Some(t) = guard.get_mut(&task_id) {
+                t.status = DownloadStatus::Completed;
+                t.progress = 100.0;
+                t.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                t.downloaded_size = t.total_size;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 涓嬭浇鍗曚釜鍒嗙墖
+    async fn download_chunk(
+        task_id: String,
+        url: String,
+        save_path: String,
+        start: u64,
+        end: u64,
+        tasks: Arc<TokioRwLock<HashMap<String, DownloadTask>>>,
+        cancel_flags: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
+        downloaded_total: Arc<AtomicU64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::new();
+        
+        let response = client
+            .get(&url)
+            .header("Range", format!("bytes={}-{}", start, end))
+            .send()
+            .await?;
+        
+        // 鍒涘缓涓存椂鏂囦欢瀛樺偍鍒嗙墖
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("{}_chunk_{}.tmp", task_id, start));
+        
+        let mut file = File::create(&temp_file)?;
+        let mut downloaded: u64 = 0;
+        let mut stream = response.bytes_stream().into_stream();
+        while let Some(chunk_result) = stream.try_next().await? {
+            // 妫€鏌ュ彇娑?            let cancel = {
+                let flags = cancel_flags.read().await;
+                flags.get(&task_id).map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
+            };
+            if cancel {
+                let _ = fs::remove_file(&temp_file);
+                return Err("Download cancelled".into());
+            }
+            
+            file.write_all(&chunk_result)?;
+            downloaded += chunk_result.len() as u64;
+            downloaded_total.fetch_add(chunk_result.len() as u64, Ordering::Relaxed);
+        }
+        
+        // 鍒嗙墖涓嬭浇瀹屾垚
+        tracing::debug!("Chunk {}-{} downloaded: {} bytes", start, end, downloaded);
+        
+        // 鍚堝苟鍒嗙墖鍒颁富鏂囦欢
+        Self::merge_chunks(&save_path, &temp_file, start).await?;
+        
+        // 鍒犻櫎涓存椂鏂囦欢
+        let _ = fs::remove_file(&temp_file);
+        
+        Ok(())
+    }
+
+    /// 鍚堝苟鍒嗙墖鍒颁富鏂囦欢
+    async fn merge_chunks(
+        save_path: &str,
+        chunk_file: &PathBuf,
+        offset: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 鎵撳紑鎴栧垱寤轰富鏂囦欢
+        let mut main_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(save_path)?;
+        
+        // 鎵撳紑鍒嗙墖鏂囦欢
+        let mut chunk_data = File::open(chunk_file)?;
+        
+        // 瀹氫綅鍒板亸绉讳綅缃?        main_file.seek(SeekFrom::Start(offset))?;
+        
+        // 澶嶅埗鏁版嵁
+        std::io::copy(&mut chunk_data, &mut main_file)?;
+        
+        Ok(())
+    }
+
+    /// 浠嶶RL鎻愬彇鏂囦欢鍚?    async fn extract_filename(&self, url: &str) -> Result<String, String> {
+        let client = reqwest::Client::new();
+        
+        // 鍏堝皾璇旽EAD璇锋眰鑾峰彇鏂囦欢鍚?        if let Ok(response) = client.head(url).send().await {
+            if let Some(disposition) = response.headers().get("content-disposition") {
+                if let Ok(disposition_str) = disposition.to_str() {
+                    // 瑙ｆ瀽 Content-Disposition header
+                    for part in disposition_str.split(';') {
+                        let part = part.trim();
+                        if part.starts_with("filename=") {
+                            let filename = part.trim_start_matches("filename=").trim_matches('"').trim_matches('\'');
+                            if !filename.is_empty() {
+                                return Ok(filename.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 浠嶶RL璺緞涓彁鍙?        if let Some(parsed) = url::Url::parse(url).ok() {
+            let path = parsed.path();
+            if let Some(pos) = path.rfind('/') {
+                let filename = &path[pos + 1..];
+                if !filename.is_empty() && (!filename.contains('.') || (filename.contains('.') && filename.len() > 4)) {
+                    return Ok(urlencoding_decode(filename));
+                }
+            }
+        }
+        
+        // 榛樿鏂囦欢鍚?        Ok("download.dat".to_string())
+    }
+
+    /// 鏆傚仠涓嬭浇
+    pub async fn pause_download(&self, task_id: String) -> Result<(), String> {
+        let cancel_flags = self.cancel_flags.read().await;
+        if let Some(flag) = cancel_flags.get(&task_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+        
+        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
+            t.status = DownloadStatus::Paused;
+        }
+        
+        tracing::info!("Paused download: {}", task_id);
+        Ok(())
+    }
+
+    /// 鎭㈠涓嬭浇
+    pub async fn resume_download(&self, task_id: String) -> Result<(), String> {
+        // 閲嶇疆鍙栨秷鏍囧織
+        {
+            let mut cancel_flags = self.cancel_flags.write().await;
+            if let Some(flag) = cancel_flags.get(&task_id) {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+        
+        // 閲嶆柊鍚姩涓嬭浇
+        self.start_download(task_id).await
+    }
+
+    /// 鍙栨秷涓嬭浇
+    pub async fn cancel_download(&self, task_id: String) -> Result<(), String> {
+        // 璁剧疆鍙栨秷鏍囧織
+        let cancel_flags = self.cancel_flags.read().await;
+        if let Some(flag) = cancel_flags.get(&task_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+        
+        // 鏇存柊鐘舵€?        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
+            t.status = DownloadStatus::Failed;
+            t.error = Some("Cancelled by user".to_string());
+        }
+        
+        tracing::info!("Cancelled download: {}", task_id);
+        Ok(())
+    }
+
+    /// 鍒犻櫎涓嬭浇
+    pub async fn remove_download(&self, task_id: String) -> Result<(), String> {
+        // 鍙栨秷涓嬭浇
+        {
+            let cancel_flags = self.cancel_flags.read().await;
+            if let Some(flag) = cancel_flags.get(&task_id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        
+        // 鍒犻櫎浠诲姟
+        self.tasks.write().await.remove(&task_id);
+        self.cancel_flags.write().await.remove(&task_id);
+        
+        tracing::info!("Removed download: {}", task_id);
+        Ok(())
+    }
+
+    /// 鑾峰彇鎵€鏈変笅杞戒换鍔?    pub async fn get_all_downloads(&self) -> Vec<DownloadTask> {
+        let tasks = self.tasks.read().await;
+        tasks.values().cloned().collect()
+    }
+
+    /// 鑾峰彇鍗曚釜涓嬭浇浠诲姟
+    pub async fn get_download(&self, task_id: &str) -> Option<DownloadTask> {
+        let tasks = self.tasks.read().await;
+        tasks.get(task_id).cloned()
+    }
+
+    /// 娓呯┖宸插畬鎴愮殑浠诲姟
+    pub async fn clear_completed(&self) {
+        let mut tasks = self.tasks.write().await;
+        tasks.retain(|_, t| t.status != DownloadStatus::Completed);
+    }
+}
+
+fn urlencoding_decode(s: &str) -> String {
+    // 绠€鍗曠殑URL瑙ｇ爜
+    s.replace("%20", " ")
+        .replace("%21", "!")
+        .replace("%23", "#")
+        .replace("%24", "$")
+        .replace("%25", "%")
+        .replace("%26", "&")
+        .replace("%27", "'")
+        .replace("%28", "(")
+        .replace("%29", ")")
+        .replace("%2B", "+")
+        .replace("%2C", ",")
+        .replace("%2F", "/")
+        .replace("%3A", ":")
+        .replace("%3B", ";")
+        .replace("%3D", "=")
+        .replace("%3F", "?")
+        .replace("%40", "@")
+        .replace("%5B", "[")
+        .replace("%5D", "]")
+}

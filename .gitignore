@@ -1,0 +1,51 @@
+﻿# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm_install.log
+
+# Env
+.env
+.env.local
+
+# Temp
+*.tmp
+*.part.*
+
+# Tauri updater signing keys (NEVER commit)
+.tauri/
+
+# Debug / build artifacts (keep out of VCS)
+debug-*.png
+*.log
+*.bak
+npm_install.log
+error1.png
+windows1.png
+LLD.png
+schemars-fix_*.md
+installer-fix_*.md
+vite_stderr.txt
+vite_stdout.txt
+dist/
+src-tauri/target/
+src-tauri/LeLeDownload_1.0.0_x64-setup.exe
+
+# Keep the local cargo patch (build dependency) but ignore its build output
+vpatch/*/target/

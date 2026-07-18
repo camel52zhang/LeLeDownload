@@ -1,0 +1,207 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>乐乐下载器</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+      padding: 20px;
+    }
+    
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    
+    .header img {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+    }
+    
+    .header h1 {
+      font-size: 18px;
+      font-weight: 600;
+    }
+    
+    .header p {
+      font-size: 12px;
+      opacity: 0.8;
+    }
+    
+    .status {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+      backdrop-filter: blur(10px);
+    }
+    
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+    }
+    
+    .status-item .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #4ade80;
+    }
+    
+    .status-item .dot.offline {
+      background: #f87171;
+    }
+    
+    .download-form {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 16px;
+      backdrop-filter: blur(10px);
+    }
+    
+    .download-form h3 {
+      font-size: 14px;
+      margin-bottom: 12px;
+    }
+    
+    .download-form input {
+      width: 100%;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+      background: rgba(255, 255, 255, 0.9);
+      color: #333;
+    }
+    
+    .download-form input::placeholder {
+      color: #999;
+    }
+    
+    .download-form button {
+      width: 100%;
+      margin-top: 10px;
+      padding: 10px;
+      border: none;
+      border-radius: 8px;
+      background: #4ade80;
+      color: #166534;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    .download-form button:hover {
+      background: #22c55e;
+      transform: scale(1.02);
+    }
+    
+    .download-form button:active {
+      transform: scale(0.98);
+    }
+    
+    .tips {
+      font-size: 12px;
+      opacity: 0.7;
+      margin-top: 12px;
+      text-align: center;
+    }
+    
+    .settings {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 16px;
+      margin-top: 16px;
+      backdrop-filter: blur(10px);
+    }
+    
+    .switch-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    
+    .switch-row input {
+      width: 18px;
+      height: 18px;
+      cursor: pointer;
+      accent-color: #4ade80;
+    }
+    
+    .settings .tips {
+      margin-top: 8px;
+      text-align: left;
+    }
+    
+    .footer {
+      margin-top: 16px;
+      text-align: center;
+      font-size: 11px;
+      opacity: 0.6;
+    }
+    
+    .footer a {
+      color: #fff;
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <img src="icons/icon128.png" alt="Logo">
+    <div>
+      <h1>乐乐下载器</h1>
+      <p>IDM 风格的下载管理器</p>
+    </div>
+  </div>
+  
+  <div class="status">
+    <div class="status-item">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">正在检测本地服务...</span>
+    </div>
+  </div>
+  
+  <div class="download-form">
+    <h3>快速下载</h3>
+    <input type="text" id="urlInput" placeholder="粘贴下载链接..." />
+    <button id="downloadBtn">开始下载</button>
+    <p class="tips">右键点击链接也可快速调用乐乐下载器</p>
+  </div>
+  
+  <div class="settings">
+    <label class="switch-row">
+      <span>自动接管浏览器下载</span>
+      <input type="checkbox" id="autoCapture" />
+    </label>
+    <p class="tips">开启后，浏览器开始下载时自动交由乐乐下载器接管（类似 IDM）</p>
+  </div>
+  
+  <div class="footer">
+    <a href="#" id="openApp">打开主程序</a> · 
+    <a href="#">设置</a>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>
