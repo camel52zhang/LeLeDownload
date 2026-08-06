@@ -14,6 +14,8 @@
   save_path: string;
   retry_count?: number;
   max_retries?: number;
+  // 任务来源标识："direct"（旧直链路径）/ "share-link"（分享链接·需会话凭证增强路径）
+  source?: string;
 }
 
 export interface DownloadProgress {

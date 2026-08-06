@@ -2,6 +2,7 @@ mod download;
 mod db;
 mod commands;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -141,6 +142,45 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("run error");
+}
+
+// 对桥接上报的自定义请求头做边界校验（P1-3 安全收尾）：
+// - 丢弃由引擎自行管理的头：Host / Content-Length / Range / Connection /
+//   Transfer-Encoding / Content-Encoding / Proxy-*（避免请求走私或覆盖引擎行为）；
+// - 丢弃空值头、键名超长（>256）或单值超长（>8KB）防滥用；
+// - 限制头数量（<=64）防滥用。
+// 返回 None 表示无任何有效头（等价于旧路径，引擎按无头下载，行为完全不变）。
+fn sanitize_headers(raw: &Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
+    let Some(h) = raw else { return None; };
+    let mut out: HashMap<String, String> = HashMap::with_capacity(h.len().min(64));
+    for (k, v) in h.iter() {
+        let kl = k.to_lowercase();
+        if kl.is_empty() || kl.len() > 256 {
+            continue;
+        }
+        if kl == "host"
+            || kl == "content-length"
+            || kl == "range"
+            || kl == "connection"
+            || kl == "transfer-encoding"
+            || kl == "content-encoding"
+            || kl.starts_with("proxy-")
+        {
+            continue;
+        }
+        if v.is_empty() || v.len() > 8192 {
+            continue;
+        }
+        if out.len() >= 64 {
+            break;
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 // 向 socket 写出一段 JSON 响应。CORS 仅对浏览器扩展 origin 放开（chrome-extension://*、
@@ -335,11 +375,29 @@ fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> 
                                         );
                                         return;
                                     }
-                                    let dir = dirs::download_dir()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .to_string();
-                                    match dm.create_download(u.into(), dir).await {
+                                    // 分享链接场景：解析并校验自定义头（Cookie/Referer 等）。
+                                    // 缺省 None => 旧路径行为完全不变（create_download 第三参为 None）。
+                                    let raw_headers = j
+                                        .get("headers")
+                                        .and_then(|h| h.as_object())
+                                        .map(|m| {
+                                            m.iter()
+                                                .map(|(k, v)| {
+                                                    (k.clone(), v.as_str().unwrap_or("").to_string())
+                                                })
+                                                .collect::<HashMap<String, String>>()
+                                        });
+                                    let headers = sanitize_headers(&raw_headers);
+                                    // 修复：优先用用户配置的首选下载目录（设置面板持久化到
+                                    // settings.json），未配置时回退系统默认 Downloads。
+                                    let dir = commands::load_download_dir()
+                                        .unwrap_or_else(|| {
+                                            dirs::download_dir()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_string()
+                                        });
+                                    match dm.create_download(u.into(), dir, headers).await {
                                         Ok(t) => {
                                             let _ = dm.start_download(t.id.clone()).await;
                                             write_json(

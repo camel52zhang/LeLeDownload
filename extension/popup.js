@@ -92,6 +92,55 @@ document.addEventListener('DOMContentLoaded', () => {
       .catch(() => { alert('请手动启动桌面端的「乐乐下载器」程序（lele_download.exe）'); });
   });
   
+  // 接管此页面：把嗅探脚本注入当前标签页（手动触发，不限自动嗅探范围）
+  const takeoverBtn = document.getElementById('takeoverBtn');
+  const pageStatus = document.getElementById('pageStatus');
+
+  // 是否为分享链接页面（与 manifest content_scripts.matches 保持一致）
+  function isSharePage(url) {
+    if (!url) return false;
+    return /^https?:\/\/(we\.tl|.*\.wetransfer\.com)\//i.test(url) ||
+      /^https?:\/\/.*drive\.google\.com\//i.test(url);
+  }
+
+  // 回显当前页面是否可嗅探
+  function refreshPageStatus() {
+    if (!pageStatus) return;
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const url = tabs && tabs[0] && tabs[0].url;
+      if (isSharePage(url)) {
+        pageStatus.textContent = '检测到分享链接页面，点击「接管此页面」可自动嗅探真实直链';
+      } else {
+        pageStatus.textContent = '当前为直链/普通页面；「接管此页面」可对任意页面手动注入嗅探';
+      }
+    });
+  }
+
+  if (takeoverBtn) {
+    takeoverBtn.addEventListener('click', () => {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        const tab = tabs && tabs[0];
+        if (!tab || tab.id == null) { alert('无法获取当前标签页'); return; }
+        if (typeof chrome.scripting === 'undefined' || !chrome.scripting.executeScript) {
+          alert('当前浏览器不支持 scripting API，无法手动注入');
+          return;
+        }
+        chrome.scripting.executeScript(
+          { target: { tabId: tab.id }, files: ['content-script.js'] },
+          () => {
+            if (chrome.runtime.lastError) {
+              alert('注入失败：' + chrome.runtime.lastError.message);
+            } else if (pageStatus) {
+              pageStatus.textContent = '已注入嗅探脚本，正在监听页面下载请求…';
+            }
+          }
+        );
+      });
+    });
+  }
+
+  refreshPageStatus();
+
   // 初始化
   checkService();
   setInterval(checkService, 5000);

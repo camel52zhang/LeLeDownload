@@ -30,6 +30,14 @@ pub struct DownloadTask {
     pub completed_at: Option<String>,
     pub error: Option<String>,
     pub save_path: String,
+    // 分享链接场景的自定义请求头（Cookie / Referer / Authorization 等）。
+    // 关键：`#[serde(skip)]` 确保该字段不序列化 —— 不进 SQLite、不进前端事件、
+    // 不进日志。凭证仅在本次下载任务的内存中存活，下载结束/任务移除即从内存释放。
+    #[serde(skip)]
+    pub headers: Option<HashMap<String, String>>,
+    // 任务来源标识："direct"（旧直链路径）/ "share-link"（分享链接增强路径）。
+    // 可持久化、无敏感信息，仅用于前端打标签。
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -314,6 +322,23 @@ where
     Err(last_err.unwrap())
 }
 
+/// 将调用方传入的自定义请求头逐个附加到 reqwest 请求上。
+/// 不修改全局 `client`，天然满足「一次性、仅本次」语义。
+/// 引擎自行管理的头（Host / Range / Content-Length / Proxy-* 等）已在桥接处
+/// `sanitize_headers` 剔除，这里只做纯附加（不打印任何头内容，符合凭证不落日志硬约束）。
+fn with_headers(
+    builder: reqwest::RequestBuilder,
+    headers: &Option<HashMap<String, String>>,
+) -> reqwest::RequestBuilder {
+    let mut builder = builder;
+    if let Some(h) = headers {
+        for (k, v) in h.iter() {
+            builder = builder.header(k.clone(), v.clone());
+        }
+    }
+    builder
+}
+
 impl DownloadManager {
     pub fn new(app_handle: tauri::AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
         let config = DownloadConfig::default();
@@ -350,8 +375,9 @@ impl DownloadManager {
         &self,
         url: String,
         save_dir: String,
+        headers: Option<HashMap<String, String>>,
     ) -> Result<DownloadTask, String> {
-        let filename = self.extract_filename(&url).await?;
+        let filename = self.extract_filename(&url, &headers).await?;
 
         let save_path = PathBuf::from(&save_dir);
         fs::create_dir_all(&save_path).map_err(|e| e.to_string())?;
@@ -362,6 +388,13 @@ impl DownloadManager {
 
         // 使用配置中的线程数，使设置面板生效（不再硬编码 16）
         let thread_count = self.config.read().await.max_threads;
+
+        // 来源标识：带自定义头（分享链接场景）记为 "share-link"，否则 "direct"（旧路径）。
+        let source = if headers.is_some() {
+            Some("share-link".to_string())
+        } else {
+            Some("direct".to_string())
+        };
 
         let id = Uuid::new_v4().to_string();
         let task = DownloadTask {
@@ -383,6 +416,8 @@ impl DownloadManager {
                 .join(&filename)
                 .to_string_lossy()
                 .to_string(),
+            headers: headers.clone(),
+            source,
         };
 
         self.tasks.write().await.insert(id.clone(), task.clone());
@@ -453,6 +488,7 @@ impl DownloadManager {
                 config.clone(),
                 speed_limit,
                 client,
+                task.headers.clone(),
             ).await;
 
             // 释放并发名额并唤醒等待者
@@ -482,11 +518,13 @@ impl DownloadManager {
         config: Arc<TokioRwLock<DownloadConfig>>,
         speed_limit_bps: Arc<AtomicU64>,
         client: reqwest::Client,
+        headers: Option<HashMap<String, String>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // HEAD 探测；部分 CDN/对象存储对 HEAD 返回 405/403，fallback 到 GET Range:0-0 拿 headers
-        let head_response = match client.head(&url).send().await {
+        // 分享链接场景：HEAD/GET 均携带调用方自定义头（Cookie/Referer 等），用于会话绑定资源鉴权。
+        let head_response = match with_headers(client.head(&url), &headers).send().await {
             Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::PARTIAL_CONTENT => r,
-            _ => client.get(&url).header("Range", "bytes=0-0").send().await?,
+            _ => with_headers(client.get(&url).header("Range", "bytes=0-0"), &headers).send().await?,
         };
         
         let accept_ranges = head_response
@@ -540,6 +578,7 @@ impl DownloadManager {
                 app_handle,
                 rate_limiter.clone(),
                 client,
+                headers,
             ).await
         } else {
             // Multi-threaded chunked download（支持断点续传：已完成的 .part 分片直接跳过，
@@ -594,6 +633,7 @@ impl DownloadManager {
                 // 共享同一把进度计数器：各分片用 fetch_add 累加实时下载字节，
                 // 进度上报任务读取的也是它，保证进度条实时推进（而非冻结在跳过字节处）。
                 let downloaded_total = downloaded_total.clone();
+                let headers_clone = headers.clone();
                 let client = client.clone();
                 let rate_limiter_clone = rate_limiter.clone();
 
@@ -610,6 +650,7 @@ impl DownloadManager {
                         downloaded_total,
                         rate_limiter_clone.clone(),
                         client,
+                        headers_clone,
                     ).await
                 }));
             }
@@ -758,13 +799,15 @@ impl DownloadManager {
         app_handle: tauri::AppHandle,
         rate_limiter: RateLimiter,
         client: reqwest::Client,
+        headers: Option<HashMap<String, String>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 断点续传：若目标文件已存在，从已下载字节处 Range 续传
         let mut resume_from = fs::metadata(&save_path).map(|m| m.len()).unwrap_or(0);
+        // 分享链接场景：GET 携带调用方自定义头；引擎的 Range 头在用户头之后追加，确保续传控制优先。
         let request = if resume_from > 0 {
-            client.get(&url).header("Range", format!("bytes={}-", resume_from))
+            with_headers(client.get(&url), &headers).header("Range", format!("bytes={}-", resume_from))
         } else {
-            client.get(&url)
+            with_headers(client.get(&url), &headers)
         };
         let response = request.send().await?;
 
@@ -900,9 +943,11 @@ impl DownloadManager {
         downloaded_total: Arc<AtomicU64>,
         rate_limiter: RateLimiter,
         client: reqwest::Client,
+        headers: Option<HashMap<String, String>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let range_start = (start + resume_from).min(end);
-        let request = client.get(&url)
+        // 分享链接场景：GET 携带调用方自定义头；引擎的 Range 头在用户头之后追加（续传控制优先）。
+        let request = with_headers(client.get(&url), &headers)
             .header("Range", format!("bytes={}-{}", range_start, end));
 
         let response = request.send().await?;
@@ -1066,11 +1111,12 @@ impl DownloadManager {
         self.tasks.write().await.retain(|_, t| t.status != DownloadStatus::Completed);
     }
 
-    async fn extract_filename(&self, url: &str) -> Result<String, String> {
+    async fn extract_filename(&self, url: &str, headers: &Option<HashMap<String, String>>) -> Result<String, String> {
         // HEAD 探测；部分服务器对 HEAD 返回 405/403，fallback 到 GET Range:0-0
-        let response = match self.client.head(url).send().await {
+        // 分享链接场景：HEAD/GET 均携带调用方自定义头，确保会话绑定资源可正确返回文件名。
+        let response = match with_headers(self.client.head(url), headers).send().await {
             Ok(r) if r.status().is_success() => r,
-            _ => match self.client.get(url).header("Range", "bytes=0-0").send().await {
+            _ => match with_headers(self.client.get(url).header("Range", "bytes=0-0"), headers).send().await {
                 Ok(r) => r,
                 Err(e) => return Err(e.to_string()),
             },

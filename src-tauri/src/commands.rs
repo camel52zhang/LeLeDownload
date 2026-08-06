@@ -1,6 +1,9 @@
 ﻿// Tauri Commands
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Manager, State};
 use tokio::sync::RwLock;
@@ -8,11 +11,48 @@ use tokio::sync::RwLock;
 use crate::download::{DownloadManager, DownloadTask};
 use crate::db::Database;
 
+// 用户首选下载目录的持久化文件（位于系统本地数据目录）。
+// 设置面板保存时会写入此处；桥接(扩展)路径与 create_download 默认值都从这里读取，
+// 确保「浏览器扩展触发的下载」也落到用户在设置里配置的首选目录，而非系统默认 Downloads。
+fn settings_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("lele_download")
+        .join("settings.json")
+}
+
+/// 读取用户配置的首选下载目录；未配置或文件不存在时返回 None，调用方应回退系统默认目录。
+pub fn load_download_dir() -> Option<String> {
+    let content = fs::read_to_string(settings_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v.get("download_dir")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+/// 持久化首选下载目录到 settings.json，供桥接/默认路径读取。
+pub fn save_download_dir(dir: &str) -> Result<(), String> {
+    if dir.trim().is_empty() {
+        return Ok(());
+    }
+    let p = settings_path();
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let obj = serde_json::json!({ "download_dir": dir });
+    let s = serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?;
+    fs::write(&p, s).map_err(|e| e.to_string())
+}
+
 fn get_default_save_dir() -> String {
-    dirs::download_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .to_string_lossy()
-        .to_string()
+    // 优先用用户配置的首选目录；未配置时回退系统默认 Downloads。
+    load_download_dir().unwrap_or_else(|| {
+        dirs::download_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string()
+    })
 }
 
 #[tauri::command]
@@ -21,9 +61,12 @@ pub async fn create_download(
     db: State<'_, Arc<RwLock<Database>>>,
     url: String,
     save_dir: Option<String>,
+    headers: Option<HashMap<String, String>>,
 ) -> Result<DownloadTask, String> {
     let save_directory = save_dir.unwrap_or_else(get_default_save_dir);
-    let task = download_manager.create_download(url, save_directory).await?;
+    // headers 为可选：分享链接场景由浏览器扩展上报（Cookie/Referer 等）；
+    // 前端直链触发不传 => None => 旧路径行为不变。
+    let task = download_manager.create_download(url, save_directory, headers).await?;
     let _ = db.write().await.insert_task(&task);
     download_manager.start_download(task.id.clone()).await?;
     Ok(task)
@@ -142,6 +185,11 @@ pub async fn update_download_settings(
         settings.max_concurrent as usize,
         settings.speed_limit_kb,
     ).await;
+    // 修复：持久化首选下载目录，使浏览器扩展/桥接路径也使用用户配置目录
+    // （此前该字段被忽略，导致扩展触发的下载落到系统默认 Downloads）。
+    if let Err(e) = save_download_dir(&settings.download_dir) {
+        tracing::warn!("保存下载目录失败: {}", e);
+    }
     tracing::info!("Updated download settings: {:?}", settings);
     Ok(())
 }

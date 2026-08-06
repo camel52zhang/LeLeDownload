@@ -165,6 +165,8 @@ impl Database {
                 completed_at: row.get(10)?,
                 error: row.get(11)?,
                 save_path: row.get(12)?,
+                headers: None,
+                source: None,
             })
         }).map_err(|e| e.to_string())?;
 

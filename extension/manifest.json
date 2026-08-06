@@ -8,10 +8,24 @@
     "downloads",
     "storage",
     "tabs",
-    "notifications"
+    "notifications",
+    "cookies",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://we.tl/*",
+        "*://*.wetransfer.com/*",
+        "*://drive.google.com/*",
+        "*://*.drive.google.com/*"
+      ],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
   ],
   "background": {
     "service_worker": "background.js"
