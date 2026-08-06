@@ -183,6 +183,24 @@ fn sanitize_headers(raw: &Option<HashMap<String, String>>) -> Option<HashMap<Str
     }
 }
 
+// 从 /download 请求 body 中解析出 (url, 已清洗的 headers)。
+// 供 run_http 桥接主流程与测试复用；headers 缺省时返回 None（旧路径兼容）。
+// 注意：此处只做 JSON 解析 + 边界清洗，SSRF 校验(is_url_safe)由调用方在拿到 url 后执行。
+fn parse_download_request(body: &str) -> Option<(String, Option<HashMap<String, String>>)> {
+    let j: serde_json::Value = serde_json::from_str(body).ok()?;
+    let url = j.get("url").and_then(|v| v.as_str())?.to_string();
+    let raw_headers = j
+        .get("headers")
+        .and_then(|h| h.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                .collect::<HashMap<String, String>>()
+        });
+    let headers = sanitize_headers(&raw_headers);
+    Some((url, headers))
+}
+
 // 向 socket 写出一段 JSON 响应。CORS 仅对浏览器扩展 origin 放开（chrome-extension://*、
 // moz-extension://*），普通网页跨域请求不返回 CORS 头，阻止恶意页面调用本地桥接。
 fn write_json(s: &mut std::net::TcpStream, status_line: &str, body: &str, origin: Option<&str>) {
@@ -362,64 +380,49 @@ fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> 
                     if r.contains("/download") {
                         if let Some(pos) = r.find("\r\n\r\n") {
                             let body = &r[pos + 4..];
-                            if let Ok(j) = serde_json::from_str::<serde_json::Value>(body) {
-                                if let Some(u) = j.get("url").and_then(|v| v.as_str()) {
-                                    // 修复(P0)：SSRF 防护——仅允许 http/https，拒绝私网/回环/链路本地 IP
-                                    if let Err(reason) = is_url_safe(u) {
-                                        log_http(&format!("[block] {} -> {}", u, reason));
+                            if let Some((url, headers)) = parse_download_request(body) {
+                                // 修复(P0)：SSRF 防护——仅允许 http/https，拒绝私网/回环/链路本地 IP
+                                if let Err(reason) = is_url_safe(&url) {
+                                    log_http(&format!("[block] {} -> {}", url, reason));
+                                    write_json(
+                                        &mut s,
+                                        "400 Bad Request",
+                                        &format!("{{\"e\":\"url_blocked\",\"msg\":\"{}\"}}", reason),
+                                        origin,
+                                    );
+                                    return;
+                                }
+                                // 修复：优先用用户配置的首选下载目录（设置面板持久化到
+                                // settings.json），未配置时回退系统默认 Downloads。
+                                let dir = commands::load_download_dir()
+                                    .unwrap_or_else(|| {
+                                        dirs::download_dir()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_string()
+                                    });
+                                match dm.create_download(url, dir, headers).await {
+                                    Ok(t) => {
+                                        let _ = dm.start_download(t.id.clone()).await;
                                         write_json(
                                             &mut s,
-                                            "400 Bad Request",
-                                            &format!("{{\"e\":\"url_blocked\",\"msg\":\"{}\"}}", reason),
+                                            "200 OK",
+                                            &format!("{{\"ok\":true,\"id\":\"{}\"}}", t.id),
                                             origin,
                                         );
                                         return;
                                     }
-                                    // 分享链接场景：解析并校验自定义头（Cookie/Referer 等）。
-                                    // 缺省 None => 旧路径行为完全不变（create_download 第三参为 None）。
-                                    let raw_headers = j
-                                        .get("headers")
-                                        .and_then(|h| h.as_object())
-                                        .map(|m| {
-                                            m.iter()
-                                                .map(|(k, v)| {
-                                                    (k.clone(), v.as_str().unwrap_or("").to_string())
-                                                })
-                                                .collect::<HashMap<String, String>>()
-                                        });
-                                    let headers = sanitize_headers(&raw_headers);
-                                    // 修复：优先用用户配置的首选下载目录（设置面板持久化到
-                                    // settings.json），未配置时回退系统默认 Downloads。
-                                    let dir = commands::load_download_dir()
-                                        .unwrap_or_else(|| {
-                                            dirs::download_dir()
-                                                .unwrap_or_default()
-                                                .to_string_lossy()
-                                                .to_string()
-                                        });
-                                    match dm.create_download(u.into(), dir, headers).await {
-                                        Ok(t) => {
-                                            let _ = dm.start_download(t.id.clone()).await;
-                                            write_json(
-                                                &mut s,
-                                                "200 OK",
-                                                &format!("{{\"ok\":true,\"id\":\"{}\"}}", t.id),
-                                                origin,
-                                            );
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            write_json(
-                                                &mut s,
-                                                "400 Bad Request",
-                                                &format!(
-                                                    "{{\"e\":\"create_failed\",\"msg\":\"{:?}\"}}",
-                                                    e
-                                                ),
-                                                origin,
-                                            );
-                                            return;
-                                        }
+                                    Err(e) => {
+                                        write_json(
+                                            &mut s,
+                                            "400 Bad Request",
+                                            &format!(
+                                                "{{\"e\":\"create_failed\",\"msg\":\"{:?}\"}}",
+                                                e
+                                            ),
+                                            origin,
+                                        );
+                                        return;
                                     }
                                 }
                             }
@@ -500,5 +503,124 @@ mod http_tests {
         let (mut server, _) = listener.accept().unwrap();
         let got = read_full_request(&mut server).expect("should read");
         assert!(got.contains("/status"), "got: {}", got);
+    }
+
+    // ---- sanitize_headers 边界校验（P1-3 安全收尾）----
+
+    #[test]
+    fn sanitize_drops_engine_managed_headers() {
+        let mut h = HashMap::new();
+        h.insert("Host".to_string(), "evil.com".to_string());
+        h.insert("Proxy-Authorization".to_string(), "secret".to_string());
+        h.insert("Content-Length".to_string(), "999".to_string());
+        h.insert("Range".to_string(), "bytes=0-10".to_string());
+        h.insert("Connection".to_string(), "keep-alive".to_string());
+        h.insert("Transfer-Encoding".to_string(), "chunked".to_string());
+        h.insert("Content-Encoding".to_string(), "gzip".to_string());
+        h.insert("Cookie".to_string(), "a=1".to_string());
+        let out = sanitize_headers(&Some(h)).expect("应至少保留 Cookie");
+        assert!(out.get("Host").is_none(), "Host 必须被丢弃");
+        assert!(out.get("Proxy-Authorization").is_none(), "Proxy-* 必须被丢弃");
+        assert!(out.get("Content-Length").is_none(), "Content-Length 必须被丢弃");
+        assert!(out.get("Range").is_none(), "Range 必须被丢弃");
+        assert!(out.get("Connection").is_none(), "Connection 必须被丢弃");
+        assert!(out.get("Transfer-Encoding").is_none());
+        assert!(out.get("Content-Encoding").is_none());
+        assert_eq!(out.get("Cookie"), Some(&"a=1".to_string()));
+    }
+
+    #[test]
+    fn sanitize_keeps_normal_headers() {
+        let mut h = HashMap::new();
+        h.insert("Cookie".to_string(), "sess=abc".to_string());
+        h.insert("Referer".to_string(), "https://we.tl/x".to_string());
+        h.insert("Authorization".to_string(), "Bearer t".to_string());
+        h.insert("User-Agent".to_string(), "Mozilla/5.0".to_string());
+        let out = sanitize_headers(&Some(h)).expect("应保留正常头");
+        assert_eq!(out.get("Cookie"), Some(&"sess=abc".to_string()));
+        assert_eq!(out.get("Referer"), Some(&"https://we.tl/x".to_string()));
+        assert_eq!(out.get("Authorization"), Some(&"Bearer t".to_string()));
+        assert_eq!(out.get("User-Agent"), Some(&"Mozilla/5.0".to_string()));
+    }
+
+    #[test]
+    fn sanitize_rejects_oversized_value() {
+        let mut h = HashMap::new();
+        h.insert("X-Evil".to_string(), "x".repeat(9000)); // > 8192
+        h.insert("Cookie".to_string(), "ok".to_string());
+        let out = sanitize_headers(&Some(h)).expect("应保留 Cookie");
+        assert!(out.get("X-Evil").is_none(), "超过 8KB 的头值必须被丢弃");
+        assert_eq!(out.get("Cookie"), Some(&"ok".to_string()));
+    }
+
+    #[test]
+    fn sanitize_none_returns_none() {
+        assert!(sanitize_headers(&None).is_none());
+    }
+
+    #[test]
+    fn sanitize_all_dropped_returns_none() {
+        let mut h = HashMap::new();
+        h.insert("Host".to_string(), "x".to_string());
+        h.insert("Range".to_string(), "bytes=1-2".to_string());
+        assert!(sanitize_headers(&Some(h)).is_none(), "全被丢弃时应返回 None（等价于旧路径）");
+    }
+
+    #[test]
+    fn sanitize_rejects_empty_value_and_overlong_key() {
+        let mut h = HashMap::new();
+        h.insert("Cookie".to_string(), "".to_string()); // 空值丢弃
+        h.insert("X".repeat(300).to_string(), "v".to_string()); // 超长键名丢弃
+        h.insert("Referer".to_string(), "https://we.tl".to_string());
+        let out = sanitize_headers(&Some(h)).expect("应保留 Referer");
+        assert!(out.get("Cookie").is_none(), "空值头必须被丢弃");
+        assert!(out.get(&"X".repeat(300)).is_none(), "超长键名必须被丢弃");
+        assert_eq!(out.get("Referer"), Some(&"https://we.tl".to_string()));
+    }
+
+    #[test]
+    fn sanitize_caps_header_count() {
+        let mut h = HashMap::new();
+        for i in 0..100 {
+            h.insert(format!("X-Custom-{}", i), "v".to_string());
+        }
+        let out = sanitize_headers(&Some(h)).expect("非空");
+        assert!(out.len() <= 64, "头数量必须被限制，got {}", out.len());
+    }
+
+    // ---- 桥接 JSON 解析兼容性（向后兼容旧调用方）----
+
+    #[test]
+    fn bridge_json_with_headers_parses_some() {
+        let body = r#"{"url":"https://cdn.example.com/file.zip","timestamp":1,"headers":{"Cookie":"a=1","Referer":"https://we.tl/x","Authorization":"Bearer t"}}"#;
+        let (u, headers) = parse_download_request(body).expect("应解析成功");
+        assert_eq!(u, "https://cdn.example.com/file.zip");
+        let h = headers.expect("headers 应为 Some");
+        assert_eq!(h.get("Cookie"), Some(&"a=1".to_string()));
+        assert_eq!(h.get("Referer"), Some(&"https://we.tl/x".to_string()));
+        assert_eq!(h.get("Authorization"), Some(&"Bearer t".to_string()));
+    }
+
+    #[test]
+    fn bridge_json_without_headers_parses_none() {
+        // 旧调用方（右键菜单 / onCreated / popup）不含 headers 字段 -> headers=None（旧分支不变）
+        let body = r#"{"url":"https://cdn.example.com/file.zip","timestamp":1}"#;
+        let (u, headers) = parse_download_request(body).expect("应解析成功");
+        assert_eq!(u, "https://cdn.example.com/file.zip");
+        assert!(headers.is_none(), "缺省 headers 时必须为 None（旧路径兼容）");
+    }
+
+    #[test]
+    fn bridge_json_missing_url_is_none() {
+        let body = r#"{"timestamp":1,"headers":{"Cookie":"a=1"}}"#;
+        assert!(parse_download_request(body).is_none(), "缺 url 必须返回 None -> 桥接回 400 bad");
+    }
+
+    #[test]
+    fn bridge_json_with_empty_headers_object_is_none() {
+        // headers 字段存在但为空对象 -> 解析后无有效头 -> None（不污染旧路径）
+        let body = r#"{"url":"https://cdn.example.com/file.zip","headers":{}}"#;
+        let (_u, headers) = parse_download_request(body).expect("应解析成功");
+        assert!(headers.is_none(), "空 headers 对象应等价 None");
     }
 }

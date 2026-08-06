@@ -1239,6 +1239,39 @@ mod tests {
             // 修复前（限速器冻结在下载启动值）total≈0，此处会失败；修复后 total>600ms。
             assert!(total > StdDuration::from_millis(600), "after switching to 1KB/s, acquires must be throttled: total={:?}", total);
         }
+
+        #[test]
+        fn test_headers_skipped_in_serialization_source_present() {
+            // P1-2 硬约束：#[serde(skip)] 的 headers 不得进入任何序列化输出
+            // （不落盘 SQLite / 不进前端事件 / 不进 get_downloads 响应）；
+            // source 为可持久化字段，必须出现在 JSON 中（无敏感信息）。
+            let mut cookie = HashMap::new();
+            cookie.insert("Cookie".to_string(), "sessionid=SUPER_SECRET; token=abc".to_string());
+            let task = DownloadTask {
+                id: "t-skip-1".to_string(),
+                url: "https://cdn.wetransfer.com/secret/file.zip".to_string(),
+                filename: "file.zip".to_string(),
+                total_size: 0,
+                downloaded_size: 0,
+                speed: 0.0,
+                status: DownloadStatus::Pending,
+                progress: 0.0,
+                thread_count: 1,
+                retry_count: 0,
+                max_retries: 3,
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                completed_at: None,
+                error: None,
+                save_path: "C:/tmp/file.zip".to_string(),
+                headers: Some(cookie),
+                source: Some("share-link".to_string()),
+            };
+            let json = serde_json::to_string(&task).expect("serialize");
+            assert!(!json.contains("\"headers\""), "headers 键不得出现在序列化结果中: {}", json);
+            assert!(!json.contains("SUPER_SECRET"), "敏感 Cookie 值不得泄露: {}", json);
+            assert!(json.contains("\"source\""), "source 字段应可持久化: {}", json);
+            assert!(json.contains("share-link"), "source 取值应保留: {}", json);
+        }
     }
 
 
