@@ -381,6 +381,14 @@ fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> 
                         if let Some(pos) = r.find("\r\n\r\n") {
                             let body = &r[pos + 4..];
                             if let Some((url, headers)) = parse_download_request(body) {
+                                // 可观测性日志（桥接到 %TEMP%/lele_http_bridge.log）：收到 /download 时打印
+                                // headers 是否有值及来源类型（带 headers=扩展 share-link 上报；无 headers=直链/右键）。
+                                let has_headers = headers.is_some();
+                                let source = if has_headers { "share-link" } else { "direct" };
+                                log_http(&format!(
+                                    "[recv] POST /download headers={} source={}",
+                                    has_headers, source
+                                ));
                                 // 修复(P0)：SSRF 防护——仅允许 http/https，拒绝私网/回环/链路本地 IP
                                 if let Err(reason) = is_url_safe(&url) {
                                     log_http(&format!("[block] {} -> {}", url, reason));
@@ -401,8 +409,9 @@ fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> 
                                             .to_string_lossy()
                                             .to_string()
                                     });
-                                match dm.create_download(url, dir, headers).await {
+                                match dm.create_download(url.clone(), dir, headers).await {
                                     Ok(t) => {
+                                        log_http(&format!("[ok] id={} url={}", t.id, url));
                                         let _ = dm.start_download(t.id.clone()).await;
                                         write_json(
                                             &mut s,
@@ -413,6 +422,7 @@ fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> 
                                         return;
                                     }
                                     Err(e) => {
+                                        log_http(&format!("[err] {} {:?}", url, e));
                                         write_json(
                                             &mut s,
                                             "400 Bad Request",

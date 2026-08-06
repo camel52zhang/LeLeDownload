@@ -64,6 +64,13 @@
     if (host === 'transfer.wetransfer.com') return true;
     if (host.endsWith('.wetransfer.net')) return true;
 
+    // --- 兜底：CloudFront / 通用签名 URL（Expires + Key-Pair-Id + Signature 三段齐全）即视为文件请求，
+    //     跨任意 host 都能抓，防止未来 CDN 子域漏抓。放在 static 排除之前，确保即使签名 URL
+    //     路径带 .json 之类也不会被误杀（签名 URL 就是文件，优先抓）。 ---
+    if (query.includes('signature=') && query.includes('keypair-id=') && query.includes('expires=')) {
+      return true;
+    }
+
     // --- 其他网盘 CDN（best-effort；content_scripts 仅注入上述站点，扩了不影响别站）
     //     仅在「带明确文件扩展名」时命中，避免误伤页面正常功能 ---
     if ((host === 'dl.dropboxusercontent.com' || host.endsWith('.dropboxusercontent.com') || host.endsWith('.mega.nz')) && FILE_EXT.test(path)) {
@@ -190,8 +197,12 @@
       chrome.runtime.sendMessage(
         { type: 'share-link', url: url, headers: headers },
         function () {
-          // 忽略 background 未就绪的 lastError，避免未捕获异常
-          if (chrome.runtime.lastError) { /* noop */ }
+          // lastError 仅在回调作用域内访问才有效；成功（无 lastError）与失败分别打日志，便于用户自诊。
+          if (chrome.runtime.lastError) {
+            console.warn('[乐乐][send] fail lastError=', chrome.runtime.lastError && chrome.runtime.lastError.message);
+          } else {
+            console.log('[乐乐][send] ok ->', url.slice(0, 90));
+          }
         }
       );
     } catch (_) { /* noop */ }
@@ -209,6 +220,11 @@
       const method = (init && init.method) || (input && input.method) || 'GET';
 
       if (url && isLikelyFileRequest(url, method)) {
+        // 可观测性日志：命中文件请求时打印 host/path 前 80 字符，便于用户自诊为何没解析出地址。
+        try {
+          const _u = new URL(url, location.href);
+          console.log('[乐乐][capture] 命中文件请求 host=' + _u.hostname + ' path=' + _u.pathname.slice(0, 80));
+        } catch (_) { /* noop */ }
         // 异步上报（不阻塞页面），并短路页面下载：返回合成空 Response
         buildHeaders(url, init)
           .then(function (headers) { reportShareLink(url, headers); })
@@ -240,6 +256,11 @@
   XMLHttpRequest.prototype.send = function () {
     const meta = this.__lele;
     if (meta && meta.url && isLikelyFileRequest(meta.url, meta.method)) {
+      // 可观测性日志：XHR 命中文件请求时打印 host/path 前 80 字符。
+      try {
+        const _u = new URL(meta.url, location.href);
+        console.log('[乐乐][capture] 命中文件请求 host=' + _u.hostname + ' path=' + _u.pathname.slice(0, 80));
+      } catch (_) { /* noop */ }
       // 捕获并上报；不调用原始 send => 页面不产生真实字节下载（避免双下载）。
       const self = this;
       const capturedUrl = meta.url;
@@ -269,5 +290,5 @@
   };
 
   // 注入确认日志（仅调试可见，不影响功能）
-  console.log('[乐乐] content-script 已注入，开始嗅探分享链接真实文件请求');
+  console.log('[乐乐] content-script 已注入 @ ' + (location.hostname || location.host || 'unknown') + '，开始嗅探分享链接真实文件请求');
 })();
