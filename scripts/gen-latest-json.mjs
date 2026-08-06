@@ -4,9 +4,12 @@
 import fs from 'fs';
 
 const d = new Date();
-const yymmdd = String(d.getFullYear()).slice(2) + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
-const semver = `1.${yymmdd}.0`;
-const exe = `LeLeDownload_v${yymmdd}_x64-setup.exe`;
+const yy = String(d.getFullYear()).slice(2);
+const mm = String(d.getMonth() + 1).padStart(2, '0');
+const dd = String(d.getDate()).padStart(2, '0');
+const yymmdd = `${yy}${mm}${dd}`;
+const semver = `${yy}.${parseInt(mm)}.${parseInt(dd)}`;
+const exe = `LeLeDownload_v${yy}.${mm}.${dd}_x64-setup.exe`;
 const sigPath = `src-tauri/target/release/bundle/nsis/${exe}.sig`;
 const sig = fs.readFileSync(sigPath, 'utf8').trim();
 const refName = process.env.GITHUB_REF_NAME || '';

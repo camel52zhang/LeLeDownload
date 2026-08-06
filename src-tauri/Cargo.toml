@@ -1,6 +1,6 @@
 [package]
 name = "lele_download"
-version = "1.260718.0"
+version = "26.8.6"
 description = "LeLe Download Manager"
 authors = ["DownloadMaster"]
 edition = "2021"

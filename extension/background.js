@@ -74,15 +74,21 @@ async function isAppOnline() {
   }
 }
 
-// 发送下载链接到桌面应用（返回是否成功）
-async function sendToLeleDownload(url) {
+// 发送下载链接到桌面应用（返回是否成功）。
+// headers 为可选：分享链接场景由 content-script 上报真实文件请求头（含 Cookie/Referer），
+// 经此透传给 App 引擎带自定义头下载；旧路径（右键/onCreated/popup）不传 headers，行为完全不变。
+async function sendToLeleDownload(url, headers) {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
+    const body = { url: url, timestamp: Date.now() };
+    if (headers && typeof headers === 'object' && Object.keys(headers).length > 0) {
+      body.headers = headers;
+    }
     const response = await fetch(APP_BASE + '/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url, timestamp: Date.now() }),
+      body: JSON.stringify(body),
       signal: controller.signal,
       cache: 'no-store'
     });
@@ -92,6 +98,34 @@ async function sendToLeleDownload(url) {
     console.log('[乐乐] 发送下载请求失败：', e);
     return false;
   }
+}
+
+// 处理 content-script 上报的「分享链接真实文件请求」：
+// 汇聚 headers（Cookie 已在 content-script 并入）→ 下发 App；成功/失败给明确提示。
+// 注意：此分支与原有 3 条触发路径（右键菜单 / downloads.onCreated / popup）完全独立，互不干扰。
+const shareLinkSentCache = Object.create(null);
+async function handleShareLink(message) {
+  const url = message && message.url;
+  const headers = message && message.headers;
+  if (!url) {
+    notify('解析失败，无法获取真实文件地址');
+    return false;
+  }
+  // 后台兜底去重（content-script 已做一层），避免 App 端重复创建任务
+  const now = Date.now();
+  if (now - (shareLinkSentCache[url] || 0) < 1500) {
+    return true;
+  }
+  shareLinkSentCache[url] = now;
+
+  const ok = await sendToLeleDownload(url, headers);
+  if (ok) {
+    notify('已发送到乐乐下载器');
+  } else {
+    const online = await isAppOnline();
+    notify(online ? '解析失败，请改用浏览器原生下载' : '请先运行乐乐下载器，再重试');
+  }
+  return ok;
 }
 
 // 统一的"接管/发送"流程：直接发送到 App，再按结果给明确反馈。
@@ -163,6 +197,13 @@ function notify(message) {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message && message.type === 'download') {
     captureUrl(message.url).then((ok) => sendResponse({ success: ok }));
+    return true; // 保持消息通道异步响应
+  }
+  // 分享链接真实文件请求（content-script 注入页面捕获后上报）：独立分支，零改动原有路径
+  if (message && message.type === 'share-link') {
+    handleShareLink(message).then((ok) => {
+      try { sendResponse({ ok: ok }); } catch (_) { /* content-script 用回调忽略响应 */ }
+    });
     return true; // 保持消息通道异步响应
   }
 });

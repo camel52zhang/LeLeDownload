@@ -118,6 +118,37 @@
       transform: scale(0.98);
     }
     
+    .download-form .takeover-btn {
+      width: 100%;
+      margin-top: 10px;
+      padding: 10px;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+      color: #fff;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    .download-form .takeover-btn:hover {
+      transform: scale(1.02);
+      box-shadow: 0 4px 12px rgba(217, 119, 6, 0.3);
+    }
+    
+    .download-form .takeover-btn:active {
+      transform: scale(0.98);
+    }
+    
+    .download-form #pageStatus {
+      margin-top: 8px;
+      font-size: 11px;
+      line-height: 1.4;
+      opacity: 0.8;
+      text-align: center;
+    }
+    
     .tips {
       font-size: 12px;
       opacity: 0.7;
@@ -186,6 +217,8 @@
     <h3>快速下载</h3>
     <input type="text" id="urlInput" placeholder="粘贴下载链接..." />
     <button id="downloadBtn">开始下载</button>
+    <button id="takeoverBtn" class="takeover-btn">接管此页面下载</button>
+    <p id="pageStatus" class="tips"></p>
     <p class="tips">右键点击链接也可快速调用乐乐下载器</p>
   </div>
   

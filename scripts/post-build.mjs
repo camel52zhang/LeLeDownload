@@ -13,7 +13,7 @@ const yy = String(now.getFullYear()).slice(2);
 const mm = String(now.getMonth() + 1).padStart(2, '0');
 const dd = String(now.getDate()).padStart(2, '0');
 const yymmdd = `${yy}${mm}${dd}`;
-const newName = `LeLeDownload_v${yymmdd}_x64-setup.exe`;
+const newName = `LeLeDownload_v${yy}.${mm}.${dd}_x64-setup.exe`;
 
 if (!fs.existsSync(nsisDir)) {
   console.log('[post-build] nsis dir not found, skip');
@@ -21,8 +21,8 @@ if (!fs.existsSync(nsisDir)) {
 }
 
 const files = fs.readdirSync(nsisDir);
-const exe = files.find(f => f.endsWith('_x64-setup.exe'));
-const sig = files.find(f => f.endsWith('_x64-setup.exe.sig'));
+const exe = files.find(f => f.startsWith('LeLeDownload_') && !f.startsWith('LeLeDownload_v') && f.endsWith('_x64-setup.exe'));
+const sig = files.find(f => f.startsWith('LeLeDownload_') && !f.startsWith('LeLeDownload_v') && f.endsWith('_x64-setup.exe.sig'));
 
 if (exe && exe !== newName) {
   fs.renameSync(path.join(nsisDir, exe), path.join(nsisDir, newName));

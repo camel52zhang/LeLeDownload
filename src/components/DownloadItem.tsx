@@ -25,6 +25,9 @@ export function DownloadItem({ task, onPause, onResume, onCancel, onRemove }: Do
   // 下载中/暂停态展示进度条；完成/失败/等待态压成单行，最大化列表密度
   const showProgress = task.status === 'downloading' || task.status === 'paused'
 
+  // 分享链接来源（需会话凭证）：打标签，提示用户本次下载使用了浏览器会话凭证
+  const isShareLink = task.source === 'share-link'
+
   const handleCopyUrl = (e: React.MouseEvent) => {
     e.stopPropagation()
     navigator.clipboard.writeText(task.url)
@@ -81,6 +84,14 @@ export function DownloadItem({ task, onPause, onResume, onCancel, onRemove }: Do
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 min-w-0">
             <h3 className="font-medium text-sm text-gray-800 truncate min-w-0">{task.filename || '未知文件'}</h3>
+            {isShareLink && (
+              <span
+                className="flex-shrink-0 whitespace-nowrap rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700"
+                title="该任务来自分享链接（WeTransfer / Google Drive 等），本次下载使用了浏览器会话凭证，仅本次有效、不保存"
+              >
+                分享链接·需会话凭证
+              </span>
+            )}
             {task.status === 'downloading' && (
               <span className="text-xs text-gray-400 flex-shrink-0 whitespace-nowrap">{formatBytes(task.downloaded_size)} / {formatBytes(task.total_size)}</span>
             )}
