@@ -47,21 +47,35 @@
     const path = u.pathname.toLowerCase();
     const query = u.search.toLowerCase();
 
+    // 常见文件扩展名（命中即视为文件请求；刻意排除静态资源/API 后缀 js/json/css/html 等）。
+    // 集中定义，供「其他网盘 CDN」与「通用启发」两处复用，避免规则漂移。
+    const FILE_EXT = /\.(zip|tar|tgz|gz|rar|7z|mp4|mov|avi|mkv|m4v|m2ts|webm|m4a|aac|mp3|wav|flac|ogg|opus|pdf|docx?|xlsx?|pptx?|epub|azw|psd|ai|dwg|dxf|png|jpe?g|gif|webp|bmp|heic|tif|sql|db|zst|exe|msi|dmg|iso|img|bin|dat|csv|txt|apk|deb|rpm|jar|war|torrent)$/i;
+
     // --- Google Drive 实际文件内容（带 confirm token 的 CDN）---
     if (host.endsWith('googleusercontent.com')) return true;
     if (host === 'drive.usercontent.google.com') return true;
     if (host.endsWith('google.com') && (query.includes('export=download') || query.includes('export=view'))) return true;
+    // GD 大文件二次确认：*.drive.google.com/uc?export=download&confirm=xxx
+    if (host.endsWith('drive.google.com') && (path.includes('/uc') || query.includes('export='))) return true;
 
     // --- WeTransfer 文件 CDN（区别于 web API 域名）---
     if (host === 'download.wetransfer.com') return true;
+    if (host === 'filedownload.wetransfer.com') return true;
+    if (host === 'transfer.wetransfer.com') return true;
     if (host.endsWith('.wetransfer.net')) return true;
+
+    // --- 其他网盘 CDN（best-effort；content_scripts 仅注入上述站点，扩了不影响别站）
+    //     仅在「带明确文件扩展名」时命中，避免误伤页面正常功能 ---
+    if ((host === 'dl.dropboxusercontent.com' || host.endsWith('.dropboxusercontent.com') || host.endsWith('.mega.nz')) && FILE_EXT.test(path)) {
+      return true;
+    }
 
     // --- 通用安全排除：API / 静态资源（绝不当作文件下载）---
     if (path.includes('/api/')) return false;
     if (/\.(json|js|css|html?|map|woff2?|ttf|eot|svg|webmanifest|xml)$/.test(path)) return false;
 
     // --- 通用启发：路径含常见文件扩展名 ---
-    if (/\.(zip|tar|tgz|gz|rar|7z|mp4|mov|avi|mkv|m4v|m2ts|mp3|wav|flac|ogg|opus|pdf|docx?|xlsx?|pptx?|png|jpe?g|gif|webp|bmp|exe|msi|dmg|iso|img|bin|dat|csv|txt|apk|deb|rpm|jar|war|torrent)$/i.test(path)) {
+    if (FILE_EXT.test(path)) {
       return true;
     }
     return false;
