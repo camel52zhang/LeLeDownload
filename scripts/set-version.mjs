@@ -1,5 +1,5 @@
 // 构建前自动把当天日期写进版本号配置，无需手动改。
-// 规则：yymmdd = 260718，semver = 1.260718.0，界面显示 v260718。
+// 规则：yy/mm/dd 格式（示例 26/08/06），semver = 26.8.6（去掉前导零，合法 semver），界面显示 v26.08.06。
 // 由 `npm run tauri:build` 自动调用。
 import fs from 'fs';
 import path from 'path';
@@ -13,7 +13,7 @@ const yy = String(now.getFullYear()).slice(2);
 const mm = String(now.getMonth() + 1).padStart(2, '0');
 const dd = String(now.getDate()).padStart(2, '0');
 const yymmdd = `${yy}${mm}${dd}`;
-const semver = `1.${yymmdd}.0`;
+const semver = `${yy}.${parseInt(mm)}.${parseInt(dd)}`;
 
 console.log(`[set-version] yymmdd=${yymmdd} semver=${semver}`);
 
@@ -37,6 +37,6 @@ fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
 
 // src/version.ts（界面显示用）
 const versionTsPath = path.join(root, 'src/version.ts');
-fs.writeFileSync(versionTsPath, `// 应用版本号：yymmdd 格式（内部 semver 为 1.<yymmdd>.0）。\n// 由 scripts/set-version.mjs 在构建时自动写入当天日期，无需手动改。\nexport const APP_VERSION = '${yymmdd}'\n`);
+fs.writeFileSync(versionTsPath, `// 应用版本号：yy.mm.dd 格式（内部 semver 为 ${yy}.${parseInt(mm)}.${parseInt(dd)}，去掉前导零）。\n// 由 scripts/set-version.mjs 在构建时自动写入当天日期，无需手动改。\nexport const APP_VERSION = '${yy}.${mm}.${dd}'\n`);
 
 console.log('[set-version] done');

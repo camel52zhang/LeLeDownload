@@ -1,3 +1,3 @@
-// 应用版本号：yymmdd 格式（内部 semver 为 1.<yymmdd>.0）。
+// 应用版本号：yy.mm.dd 格式（内部 semver 为 26.8.6，去掉前导零）。
 // 由 scripts/set-version.mjs 在构建时自动写入当天日期，无需手动改。
-export const APP_VERSION = '260718'
+export const APP_VERSION = '26.08.06'
