@@ -34,7 +34,9 @@ function App() {
     const unlistenCompleted = listen<string>('download-completed', async (event) => {
       const id = event.payload
       const completedTask = tasksRef.current.find(t => t.id === id)
-      setTasks(prev => prev.map(task => task.id === id ? { ...task, status: 'completed', progress: 100 } : task))
+      // 任务转为「已完成」时补上完成时间：优先保留后端下发的 completed_at（重载场景），
+      // 否则用当前时刻（RFC3339，与后端格式一致）兜底，保证本次会话内完成项也能显示时间。
+      setTasks(prev => prev.map(task => task.id === id ? { ...task, status: 'completed', progress: 100, completed_at: task.completed_at || new Date().toISOString() } : task))
       if (!completedTask) return
       const settings = JSON.parse(localStorage.getItem('settings') || '{}')
       if (settings.autoOpenFolder) { try { const task = await invoke<DownloadTask>('get_download', { id }); if (task?.save_path) await invoke('open_folder', { filePath: task.save_path }) } catch (e) { console.error('自动打开文件夹失败:', e) } }

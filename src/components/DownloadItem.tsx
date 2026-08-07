@@ -1,5 +1,5 @@
 import { Play, Pause, X, Trash2, CheckCircle, AlertCircle, Clock, Zap, Copy, FolderOpen } from 'lucide-react'
-import { formatBytes, formatSpeed } from '../lib/format'
+import { formatBytes, formatSpeed, formatCompletedAt } from '../lib/format'
 import { invoke } from '@tauri-apps/api/core'
 import type { DownloadTask } from '../types'
 
@@ -118,6 +118,16 @@ export function DownloadItem({ task, onPause, onResume, onCancel, onRemove }: Do
             </div>
           )}
         </div>
+
+        {/* 已完成项：右侧显示完成时间（本地时区 YYYY-MM-DD HH:mm，右对齐、与操作区相邻） */}
+        {task.status === 'completed' && task.completed_at && (
+          <span
+            className="text-xs text-gray-400 flex-shrink-0 whitespace-nowrap tabular-nums"
+            title={`完成时间：${task.completed_at}`}
+          >
+            {formatCompletedAt(task.completed_at)}
+          </span>
+        )}
 
         {/* 操作按钮：icon-only，hover 整项时更明显 */}
         <div className="flex items-center gap-0.5 flex-shrink-0">
