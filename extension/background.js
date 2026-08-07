@@ -169,14 +169,127 @@ chrome.contextMenus.onClicked.addListener((info, _tab) => {
   captureUrl(url);
 });
 
-// 自动接管：浏览器开始任何 http(s) 下载时，先确认 App 在线，
-// 在线则取消浏览器默认下载并交由乐乐下载器接管（类似 IDM 体验）。
+// ---------------------------------------------------------------------------
+// WeTransfer 原生下载接管：浏览器下载管理器抓到的
+// https://wetransfer.com/download/<slug>?id=<base64> 是 WeTransfer 的流式代理地址，
+// 鉴权令牌嵌在 URL 中。App 端引擎默认用非浏览器 UA 且不带会话 Cookie/Referer 去 GET，
+// 几乎必然被 WAF/鉴权拒绝而「接管了却下不下来正确文件」。
+// 故此处组装浏览器 UA + Referer + Origin + 会话 Cookie 头，透传给 App 引擎带自定义头下载。
+// ---------------------------------------------------------------------------
+
+// 判定是否为 WeTransfer 原生下载代理地址（host 精确为 wetransfer.com，且路径以 /download/ 开头）。
+// 既覆盖 local-bartender，也统一覆盖其它 /download/ 子路径。纯函数，便于单测。
+function isWetransferDownloadUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  let u;
+  try {
+    u = new URL(url);
+  } catch (_) {
+    return false;
+  }
+  const host = u.hostname.toLowerCase();
+  const path = u.pathname.toLowerCase();
+  return host === 'wetransfer.com' && path.indexOf('/download/') === 0;
+}
+
+// 由会话 Cookie 串组装下载请求头（纯函数，便于单测）。
+// m_wetransfer_api、_wt_session 等会话 Cookie 经此透传，模拟浏览器请求规避 WAF 拦截。
+function assembleWetransferHeaders(cookieString) {
+  const headers = {
+    'Referer': 'https://wetransfer.com/',
+    'Origin': 'https://wetransfer.com',
+    // 模仿 Chrome 浏览器的 User-Agent，规避 WeTransfer WAF 对非浏览器 UA 的拦截
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  };
+  if (cookieString) {
+    headers['Cookie'] = cookieString;
+  }
+  return headers;
+}
+
+// 用 chrome.cookies.getAll 取 wetransfer.com 的会话 Cookie，拼成 Cookie 头后组装完整下载头。
+// background service worker 无 document，故仅用 chrome.cookies.getAll（含 HttpOnly）。
+async function buildWetransferHeaders() {
+  let cookieString = '';
+  try {
+    if (typeof chrome !== 'undefined' && chrome.cookies && typeof chrome.cookies.getAll === 'function') {
+      const cks = await new Promise((resolve) => {
+        chrome.cookies.getAll({ url: 'https://wetransfer.com/' }, (cks) => {
+          if (chrome.runtime.lastError) {
+            resolve([]);
+            return;
+          }
+          resolve(cks || []);
+        });
+      });
+      const list = cks || [];
+      const map = Object.create(null);
+      for (let i = 0; i < list.length; i++) {
+        const c = list[i];
+        const pair = c.name + '=' + c.value;
+        const idx = pair.indexOf('=');
+        if (idx > 0) {
+          const name = pair.slice(0, idx).trim();
+          if (name) map[name] = pair.trim(); // 按名去重，后者覆盖前者
+        }
+      }
+      cookieString = Object.keys(map).map((k) => map[k]).join('; ');
+    }
+  } catch (_) { /* cookie 不可用时 Cookie 头为空，仍带 UA/Referer/Origin */ }
+  return assembleWetransferHeaders(cookieString);
+}
+
+// 轻量去重冷却：对 WeTransfer 下载 URL 记录最近接管时间戳，1.5s 内重复触发则跳过，
+// 防止极端情况下 content-script 的 share-link 路径与 onCreated 路径同时触发造成重复任务。
+// 返回 true 表示处于冷却期（应跳过本次接管）；返回 false 表示可接管并记录时间戳。
+const wetransferCooldownMap = new Map();
+const WETRANSFER_COOLDOWN_MS = 1500;
+function isWetransferCaptureCooling(url) {
+  const now = Date.now();
+  const last = wetransferCooldownMap.get(url) || 0;
+  if (now - last < WETRANSFER_COOLDOWN_MS) {
+    return true;
+  }
+  wetransferCooldownMap.set(url, now);
+  return false;
+}
+
+// 自动接管：浏览器开始任何 http(s) 下载时，交由乐乐下载器接管（类似 IDM 体验）。
+// WeTransfer 原生下载（/download/ 代理）额外带浏览器头，确保 App 端能真正下到正确文件。
 chrome.downloads.onCreated.addListener((item) => {
   if (!autoCapture) return;
   if (!/^https?:\/\//i.test(item.url || '')) return;
   if (/addons\.mozilla\.org|chromewebstore\.google\.com|edgedaddons\.microsoft\.com/i.test(item.url || '')) return;
 
   const filename = item.filename || (item.url || '').split('/').pop() || item.url;
+
+  // WeTransfer 原生下载：带浏览器头接管（含去重冷却）
+  if (isWetransferDownloadUrl(item.url)) {
+    console.log('[乐乐] 检测到 WeTransfer 下载，尝试带浏览器头接管：', item.url);
+    // 去重冷却：1.5s 内同一 URL 不重复接管，避免与 content-script 的 share-link 路径叠加
+    if (isWetransferCaptureCooling(item.url)) {
+      console.log('[乐乐] WeTransfer 接管冷却中，跳过重复触发：', item.url);
+      return;
+    }
+    // 组装浏览器头（UA/Referer/Origin/Cookie）后下发；组装失败则回退无头接管
+    buildWetransferHeaders().then((headers) => {
+      sendToLeleDownload(item.url, headers).then((ok) => {
+        if (ok) {
+          try {
+            chrome.downloads.cancel(item.id);
+            chrome.downloads.erase({ id: item.id });
+          } catch (_) { /* Firefox 部分版本 cancel 行为差异，忽略 */ }
+          notify('乐乐下载器已接管 WeTransfer：' + filename);
+        }
+        // 未成功（App 离线）：保持浏览器原生下载，不取消
+      });
+    }).catch((e) => {
+      console.log('[乐乐] WeTransfer 头组装失败，回退无头接管：', e);
+      sendToLeleDownload(item.url);
+    });
+    return;
+  }
+
   console.log('[乐乐] 检测到下载，尝试接管：', item.url);
   // 先尝试把链接交给 App；成功才取消浏览器默认下载，避免 App 未运行时误伤。
   sendToLeleDownload(item.url).then((ok) => {
