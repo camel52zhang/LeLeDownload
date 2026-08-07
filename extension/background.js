@@ -2,6 +2,15 @@
 // 兼容 Chrome / Edge（Chromium）与 Firefox（MV3）。
 // Firefox 同时支持 chrome.* 别名（callback 风格），因此统一用 chrome.* 命名空间即可。
 
+// 守卫：吞掉未捕获的异常/ Promise 拒绝，避免 Service Worker 被标记 invalid 而整条接管链路瘫痪。
+self.addEventListener('unhandledrejection', function (e) {
+  console.error('[乐乐] SW unhandledrejection (已吞掉以防 invalid):', e && e.reason);
+  if (e && typeof e.preventDefault === 'function') e.preventDefault();
+});
+self.addEventListener('error', function (e) {
+  console.error('[乐乐] SW error (已吞掉以防 invalid):', e && e.message);
+});
+
 const APP_BASE = 'http://127.0.0.1:45678';
 const MENU_ID = 'lele_download';
 

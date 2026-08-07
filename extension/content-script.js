@@ -62,12 +62,19 @@
     if (host === 'download.wetransfer.com') return true;
     if (host === 'filedownload.wetransfer.com') return true;
     if (host === 'transfer.wetransfer.com') return true;
-    if (host.endsWith('.wetransfer.net')) return true;
+    // 2026 实际文件域名为 *-files.wetransfer.net（如 eu-west-1-files.wetransfer.net，CloudFront/S3 签名 URL）
+    // 注意：不能用 host.endsWith('.wetransfer.net') 兜底，否则会把 ekstrom/bsp-proxy/preview-eu
+    // 等 API/预览域名也误判为文件请求，破坏页面下载初始化（导致真实文件请求发不出去）。
+    if (host.endsWith('files.wetransfer.net')) return true;
 
-    // --- 兜底：CloudFront / 通用签名 URL（Expires + Key-Pair-Id + Signature 三段齐全）即视为文件请求，
+    // --- 兜底：CloudFront / 通用签名 URL（含 signature + expires 即视为文件请求），
     //     跨任意 host 都能抓，防止未来 CDN 子域漏抓。放在 static 排除之前，确保即使签名 URL
-    //     路径带 .json 之类也不会被误杀（签名 URL 就是文件，优先抓）。 ---
-    if (query.includes('signature=') && query.includes('keypair-id=') && query.includes('expires=')) {
+    //     路径带 .json 之类也不会被误杀（签名 URL 就是文件，优先抓）。
+    //     注意：真实 WeTransfer 2026 签名 URL 只有 Expires= 与 Signature=，没有 keypair-id，
+    //     故放宽为「signature + expires 两段齐全」即可（query 已 lowercased，小写可匹配）。
+    //     但通用兜底仅对「非 wetransfer 域」生效：wetransfer 各子域（含文件 CDN *-files.wetransfer.net、
+    //     预览 preview-eu.wetransfer.net）已由上方精确白名单处理，避免把预览 PDF 误当文件下载。 ---
+    if (!host.includes('wetransfer') && query.includes('signature=') && query.includes('expires=')) {
       return true;
     }
 
@@ -82,7 +89,11 @@
     if (/\.(json|js|css|html?|map|woff2?|ttf|eot|svg|webmanifest|xml)$/.test(path)) return false;
 
     // --- 通用启发：路径含常见文件扩展名 ---
-    if (FILE_EXT.test(path)) {
+    //     注意：wetransfer 域已由上方精确白名单处理，绝不在通用扩展名匹配里命中，
+    //     否则 preview-eu.wetransfer.net 的预览 PDF（.../preview.pdf）会被误当文件下载。
+    //     真实 wetransfer 文件只来自白名单 host（download/filedownload/transfer/*-files.wetransfer.net），
+    //     故排除 wetransfer 不会漏抓真实文件。
+    if (!host.includes('wetransfer') && FILE_EXT.test(path)) {
       return true;
     }
     return false;
