@@ -5,7 +5,7 @@ use tauri::Emitter;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,6 +156,40 @@ fn sanitize_filename(name: &str) -> String {
         out = cut;
     }
     out
+}
+
+/// 下载同名文件时避免互相覆盖：若 `dir/filename` 已存在，自动改名保留全部。
+/// 例：ACM.jpg 已存在 → ACM_001.jpg；ACM_001.jpg 也已存在 → ACM_002.jpg。
+/// 序号至少 3 位零填充，超过 999 顺延更多位；遇已占用序号自动跳过。
+pub fn resolve_unique_path(dir: &str, filename: &str) -> PathBuf {
+    let dir_pb = PathBuf::from(dir);
+    let first = dir_pb.join(filename);
+    if !first.exists() {
+        return first;
+    }
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    let ext_suffix = ext.map(|e| format!(".{}", e)).unwrap_or_default();
+    let mut n: u32 = 1;
+    loop {
+        let cand = dir_pb.join(format!("{}_{:03}{}", stem, n, ext_suffix));
+        if !cand.exists() {
+            return cand;
+        }
+        n = n.saturating_add(1);
+        if n > 999_999 {
+            // 极端兜底：用纳秒时间戳避免死循环
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            return dir_pb.join(format!("{}_{}{}", stem, t, ext_suffix));
+        }
+    }
 }
 
 /// 解析 content-disposition 头：优先 RFC 5987 `filename*=UTF-8''...`（Unicode），
@@ -412,8 +446,7 @@ impl DownloadManager {
             created_at: chrono::Utc::now().to_rfc3339(),
             completed_at: None,
             error: None,
-            save_path: PathBuf::from(&save_dir)
-                .join(&filename)
+            save_path: resolve_unique_path(&save_dir, &filename)
                 .to_string_lossy()
                 .to_string(),
             headers: headers.clone(),
@@ -1180,6 +1213,60 @@ mod tests {
             let long = "x".repeat(300);
             let out = sanitize_filename(&long);
             assert!(out.len() <= 200, "len={}", out.len());
+        }
+
+        #[test]
+        fn test_resolve_unique_path_no_conflict() {
+            // 目录不存在时直接返回 dir/filename（不报错，也不凭空改名）
+            let p = resolve_unique_path("C:/nonexistent_dir_xyz", "ACM.jpg");
+            assert_eq!(p.file_name().unwrap().to_string_lossy(), "ACM.jpg");
+            assert!(p.to_string_lossy().contains("nonexistent_dir_xyz"));
+        }
+
+        #[test]
+        fn test_resolve_unique_path_renames_on_conflict() {
+            let dir = std::env::temp_dir().join("lele_test_dedup");
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::remove_file(dir.join("ACM.jpg"));
+            let _ = fs::remove_file(dir.join("ACM_001.jpg"));
+            let _ = fs::remove_file(dir.join("ACM_002.jpg"));
+            fs::write(dir.join("ACM.jpg"), b"x").unwrap();
+            let p = resolve_unique_path(dir.to_str().unwrap(), "ACM.jpg");
+            assert_eq!(p.file_name().unwrap().to_string_lossy(), "ACM_001.jpg");
+            // 已存在 _001 时，应顺延到下一个空闲序号 _002
+            fs::write(dir.join("ACM_001.jpg"), b"x").unwrap();
+            let p2 = resolve_unique_path(dir.to_str().unwrap(), "ACM.jpg");
+            assert_eq!(p2.file_name().unwrap().to_string_lossy(), "ACM_002.jpg");
+            let _ = fs::remove_file(dir.join("ACM.jpg"));
+            let _ = fs::remove_file(dir.join("ACM_001.jpg"));
+            let _ = fs::remove_file(dir.join("ACM_002.jpg"));
+        }
+
+        #[test]
+        fn test_resolve_unique_path_no_ext() {
+            let dir = std::env::temp_dir().join("lele_test_dedup2");
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::remove_file(dir.join("README"));
+            let _ = fs::remove_file(dir.join("README_001"));
+            fs::write(dir.join("README"), b"x").unwrap();
+            let p = resolve_unique_path(dir.to_str().unwrap(), "README");
+            assert_eq!(p.file_name().unwrap().to_string_lossy(), "README_001");
+            let _ = fs::remove_file(dir.join("README"));
+            let _ = fs::remove_file(dir.join("README_001"));
+        }
+
+        #[test]
+        fn test_resolve_unique_path_multi_dot_ext() {
+            let dir = std::env::temp_dir().join("lele_test_dedup3");
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::remove_file(dir.join("archive.tar.gz"));
+            let _ = fs::remove_file(dir.join("archive.tar_001.gz"));
+            fs::write(dir.join("archive.tar.gz"), b"x").unwrap();
+            let p = resolve_unique_path(dir.to_str().unwrap(), "archive.tar.gz");
+            // 与 Chrome 约定一致：序号插入在最后一个扩展名之前，保留 .tar.gz 完整
+            assert_eq!(p.file_name().unwrap().to_string_lossy(), "archive.tar_001.gz");
+            let _ = fs::remove_file(dir.join("archive.tar.gz"));
+            let _ = fs::remove_file(dir.join("archive.tar_001.gz"));
         }
 
         #[test]
