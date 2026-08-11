@@ -332,21 +332,34 @@ pub async fn open_folder(file_path: String) -> Result<(), String> {
 
     #[cfg(windows)]
     {
-        // Use explorer.exe directly with proper argument passing (no string interpolation)
-        let output = Command::new("explorer.exe")
-            .arg(&folder)
-            .output()
-            .map_err(|e| {
-                let msg = format!("Failed to open explorer: {}", e);
-                tracing::error!("{}", msg);
-                msg
-            })?;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = format!("Explorer error: {}", stderr);
+        // 先校验目标文件夹是否真实存在，给出比 explorer 弹窗更友好的错误。
+        if !Path::new(&folder).is_dir() {
+            let msg = format!("文件夹不存在或不是目录: {}", folder);
             tracing::error!("{}", msg);
             return Err(msg);
+        }
+
+        // 关键修复：explorer.exe 是 GUI 程序，退出码不可靠（成功时也可能返回非 0），
+        // 且不会向 stderr/stdout 输出任何信息。旧实现用 .output() 读取退出码并判定
+        // 失败，导致每次打开文件夹都误报 "Explorer error:"（日志中空 stderr 即为佐证）。
+        // 改用 spawn 启动（不等待、不读退出码），仅当进程无法启动（如 explorer 不在
+        // PATH）时才视为真实错误；CREATE_NO_WINDOW 避免闪现黑框。
+        match Command::new("explorer.exe")
+            .arg(&folder)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(_child) => {
+                tracing::info!("Explorer launched for folder: {}", folder);
+            }
+            Err(e) => {
+                let msg = format!("无法启动资源管理器: {}", e);
+                tracing::error!("{}", msg);
+                return Err(msg);
+            }
         }
     }
 
