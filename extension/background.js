@@ -334,3 +334,366 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 ensureMenu();
 loadSettings();
 console.log('[乐乐] 扩展已加载');
+
+// ===================== 网盘真实下载地址解析 =====================
+// 架构：App 把"分享链接+提取码"放入待办队列；本后台轮询取走，在扩展内用已登录 cookie
+// 调用各网盘接口解析出直链，仅把直链回传 App（cookie 不离开浏览器、不落盘）。
+// 说明：各网盘接口可能随官方调整变动，解析逻辑需随平台更新；本实现为 best-effort。
+
+const NETDISK_POLL_MS = 2500;
+
+function detectNetdiskPlatform(url) {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    if (h.includes('baidu')) return 'baidu';
+    if (h.includes('aliyun') || h.includes('alipan')) return 'aliyun';
+    if (h.includes('quark')) return 'quark';
+    if (h.includes('123pan') || h.includes('123912') || h.includes('123685') || h.includes('123959')) return 'pan123';
+    if (h.includes('cloud.189') || h.includes('189.cn')) return 'tianyi';
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+async function getCookieString(url) {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.cookies && chrome.cookies.getAll) {
+      const cks = await new Promise((resolve) => {
+        chrome.cookies.getAll({ url }, (cks) => {
+          if (chrome.runtime.lastError) resolve([]);
+          else resolve(cks || []);
+        });
+      });
+      const map = Object.create(null);
+      (cks || []).forEach((c) => { map[c.name] = c.name + '=' + c.value; });
+      return Object.keys(map).map((k) => map[k]).join('; ');
+    }
+  } catch (_) { /* ignore */ }
+  return '';
+}
+
+// 统一的 JSON 请求封装。
+// 【关键】MV3 Service Worker 的 fetch 受 Forbidden header 限制：
+// Cookie / User-Agent / Referer 这类头即使写进 headers 也会被浏览器静默丢弃。
+// 因此这里一律用 credentials:'include' 让浏览器自动携带目标站点的登录态 cookie
+// （manifest 已声明 <all_urls> host_permissions，扩展发起的跨域请求不受 CORS 限制）。
+// 真正需要手工带 Cookie/UA/Referer 的是「回传给 App 下载引擎的 headers」——
+// 那条链路走 Rust reqwest，不受浏览器禁止头限制，见各解析器返回值的 headers 字段。
+async function fetchJson(url, opts) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const res = await fetch(
+      url,
+      Object.assign({ signal: controller.signal, cache: 'no-store', credentials: 'include' }, opts)
+    );
+    const text = await res.text();
+    try { return JSON.parse(text); } catch (_) { throw new Error('非 JSON 响应: ' + text.slice(0, 200)); }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function bytesToSize(n) {
+  if (n === undefined || n === null || n === '') return '';
+  n = Number(n);
+  if (isNaN(n)) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(2) + ' ' + u[i];
+}
+
+// ---- 各平台解析器 ----
+
+// 123云盘：官方分享 API（公开分享可匿名；带密分享传 pwd）
+async function resolvePan123(url, pwd) {
+  const origin = new URL(url).origin;
+  const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+  const shareKey = m ? m[1] : '';
+  if (!shareKey) throw new Error('无法从链接提取分享Key');
+  const get = await fetchJson(origin + '/api/share/get', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ shareKey: shareKey, sharePwd: pwd || '', page: 1, limit: 100 }),
+  });
+  const files = (get.data && get.data.fileList && get.data.fileList.data) || [];
+  if (!files.length) throw new Error('123云盘分享内没有可下载文件，或需要密码');
+  const out = [];
+  for (const f of files) {
+    const dl = await fetchJson(origin + '/api/share/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shareKey: shareKey, sharePwd: pwd || '', fileId: f.fileId }),
+    });
+    const durl = dl.data && dl.data.DownloadURL;
+    if (!durl) throw new Error('123云盘未返回直链（可能需要登录或密码）');
+    out.push({
+      name: f.filename,
+      size: bytesToSize(f.fileSize),
+      url: durl,
+      headers: { Referer: origin + '/', 'User-Agent': navigator.userAgent },
+    });
+  }
+  return out;
+}
+
+// 夸克网盘：drive-pc.quark.cn 分享 API（需 pan.quark.cn 登录态 cookie）
+async function resolveQuark(url, pwd) {
+  const cookie = await getCookieString('https://pan.quark.cn');
+  if (!cookie) throw new Error('未检测到夸克网盘登录态，请先在浏览器登录 pan.quark.cn');
+  const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+  const pwdId = m ? m[1] : '';
+  if (!pwdId) throw new Error('无法从链接提取分享ID');
+  // 注意：不手动塞 Cookie 头（会被 MV3 丢弃），登录态由 credentials:'include' 自动携带；
+  // cookie 变量仅用于随直链回传给 App 下载引擎。
+  const headers = { 'Content-Type': 'application/json' };
+  const tokenResp = await fetchJson('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc', {
+    method: 'POST', headers, body: JSON.stringify({ pwd_id: pwdId, passcode: pwd || '', app_ver: '2.5.0' }),
+  });
+  const stoken = tokenResp.data && tokenResp.data.stoken;
+  if (!stoken) throw new Error('夸克获取 stoken 失败：' + JSON.stringify(tokenResp).slice(0, 200));
+  const detail = await fetchJson('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc', {
+    method: 'POST', headers, body: JSON.stringify({ token: stoken, pdir_fid: '0', _page: '', _size: '50', _sort: '', _dir: 'asc' }),
+  });
+  const list = (detail.data && detail.data.list) || [];
+  if (!list.length) throw new Error('夸克分享内没有文件');
+  const out = [];
+  for (const f of list) {
+    const dl = await fetchJson('https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc', {
+      method: 'POST', headers, body: JSON.stringify({ fid: [f.fid], token: stoken, pdir_fid: '0' }),
+    });
+    const durl = dl.data && dl.data.download_url;
+    if (!durl) throw new Error('夸克未返回直链');
+    // 夸克直链校验 Referer + 登录态，必须把 cookie 一并交给 App 下载引擎，否则 403。
+    out.push({
+      name: f.file_name,
+      size: bytesToSize(f.size),
+      url: durl,
+      headers: { Referer: 'https://pan.quark.cn/', 'User-Agent': navigator.userAgent, Cookie: cookie },
+    });
+  }
+  return out;
+}
+
+// 阿里云盘（alipan.com，原 aliyundrive.com）
+// 官方分享流程（与 AList aliyundrive_share 驱动一致）：
+//   1) refresh_token -> access_token          POST auth.alipan.com/v2/account/token
+//   2) share_id + 提取码 -> share_token       POST api.alipan.com/v2/share_link/get_share_token
+//   3) 列文件（须带 x-share-token 头）         POST api.alipan.com/adrive/v3/file/list
+//   4) 换直链（Authorization + x-share-token） POST api.alipan.com/v2/file/get_share_link_download_url
+// 注意：share_token 是独立换取的，不会由 get_share_by_url 返回；提取码只在第 2 步生效。
+const ALI_CANARY = 'client=web,app=share,version=v2.3.1';
+
+async function resolveAliyun(url, pwd) {
+  // refresh_token 优先从站点 cookie 读，其次读扩展本地存储（用户手动配置）
+  let refreshToken = '';
+  for (const site of ['https://www.alipan.com', 'https://www.aliyundrive.com']) {
+    const ck = await getCookieString(site);
+    const m = (ck.match(/refresh_token=([^;]+)/) || [])[1];
+    if (m) { refreshToken = decodeURIComponent(m); break; }
+  }
+  if (!refreshToken) {
+    refreshToken = await new Promise((res) => {
+      try { chrome.storage.local.get(['aliyun_refresh_token'], (r) => res((r && r.aliyun_refresh_token) || '')); }
+      catch (_) { res(''); }
+    });
+  }
+  if (!refreshToken) {
+    throw new Error('未检测到阿里云盘 refresh_token：请先在 alipan.com 登录；若仍失败，可在扩展存储手动配置 chrome.storage.local.set({aliyun_refresh_token:"..."})');
+  }
+
+  const tokenResp = await fetchJson('https://auth.alipan.com/v2/account/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+  });
+  const accessToken = tokenResp.access_token;
+  if (!accessToken) throw new Error('阿里获取 access_token 失败（refresh_token 可能已过期，请重新登录）');
+
+  // share_id 直接从分享链接提取：https://www.alipan.com/s/<shareId>
+  const sm = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+  const shareId = sm ? sm[1] : '';
+  if (!shareId) throw new Error('无法从链接提取阿里云盘 share_id');
+
+  const stBody = { share_id: shareId };
+  if (pwd) stBody.share_pwd = pwd;
+  const st = await fetchJson('https://api.alipan.com/v2/share_link/get_share_token', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(stBody),
+  });
+  const shareToken = st.share_token;
+  if (!shareToken) {
+    const code = st.code || '';
+    if (String(code).indexOf('SharePwd') >= 0) throw new Error('阿里云盘分享需要提取码，或提取码不正确');
+    throw new Error('阿里获取 share_token 失败：' + JSON.stringify(st).slice(0, 200));
+  }
+
+  const shareHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: 'Bearer ' + accessToken,
+    'x-share-token': shareToken,
+    'X-Canary': ALI_CANARY,
+  };
+
+  // 列文件（分页 marker 直到取完；单次上限 200）
+  const items = [];
+  let marker = '';
+  do {
+    const body = {
+      share_id: shareId, parent_file_id: 'root', limit: 200,
+      order_by: 'name', order_direction: 'ASC',
+      image_thumbnail_process: '', image_url_process: '', video_thumbnail_process: '',
+    };
+    if (marker) body.marker = marker;
+    const flist = await fetchJson('https://api.alipan.com/adrive/v3/file/list', {
+      method: 'POST', headers: shareHeaders, body: JSON.stringify(body),
+    });
+    (flist.items || []).forEach((x) => items.push(x));
+    marker = flist.next_marker || '';
+  } while (marker && items.length < 1000);
+
+  const files = items.filter((x) => x.type === 'file');
+  if (!files.length) throw new Error('阿里分享内没有可下载文件（仅含文件夹时暂不支持递归）');
+
+  const out = [];
+  for (const f of files) {
+    const dl = await fetchJson('https://api.alipan.com/v2/file/get_share_link_download_url', {
+      method: 'POST', headers: shareHeaders,
+      body: JSON.stringify({ share_id: shareId, file_id: f.file_id, expire_sec: 600 }),
+    });
+    const durl = dl.download_url || dl.url;
+    if (!durl) throw new Error('阿里未返回直链：' + JSON.stringify(dl).slice(0, 200));
+    out.push({
+      name: f.name,
+      size: bytesToSize(f.size),
+      url: durl,
+      headers: { Referer: 'https://www.alipan.com/', 'User-Agent': navigator.userAgent },
+    });
+  }
+  return out;
+}
+
+// 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
+async function resolveBaidu(url, pwd) {
+  const cookie = await getCookieString('https://pan.baidu.com');
+  if (!/BDUSS=/.test(cookie)) throw new Error('未检测到百度网盘登录态(BDUSS)，请先在浏览器登录');
+  const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+  const surl = m ? m[1] : '';
+  if (!surl) throw new Error('无法从链接提取 surl');
+  const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  // 同上：Cookie/UA/Referer 在 MV3 fetch 中会被丢弃，登录态靠 credentials:'include'。
+  const li = await fetchJson('https://pan.baidu.com/share/linkinfo?shareid=&uk=&surl=' + encodeURIComponent(surl), {});
+  const uk = li.uk, shareid = li.shareid;
+  if (!uk) throw new Error('百度获取 uk/shareid 失败：' + JSON.stringify(li).slice(0, 200));
+  const list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
+    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+  });
+  const files = (list.list || []);
+  if (!files.length) throw new Error('百度分享内没有文件或密码错误');
+  const out = [];
+  const ts = list.timestamp || Math.floor(Date.now() / 1000);
+  const sign = list.sign || '';
+  for (const f of files) {
+    const sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D',
+    });
+    const dlink = sd.list && sd.list[0] && sd.list[0].dlink;
+    if (!dlink) throw new Error('百度未返回 dlink：' + JSON.stringify(sd).slice(0, 200));
+    out.push({ name: f.server_filename, size: bytesToSize(f.size), url: dlink, headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie } });
+  }
+  return out;
+}
+
+// 天翼云盘：使用第三方解析 API（52api.cn），需用户在扩展存储配置 tianyi_api_key
+async function resolveTianyi(url, pwd) {
+  const key = await new Promise((resolve) => {
+    try { chrome.storage.local.get(['tianyi_api_key'], (r) => resolve((r && r.tianyi_api_key) || '')); }
+    catch (_) { resolve(''); }
+  });
+  if (!key) throw new Error('天翼解析需要 52api.cn 的 apikey：请在扩展存储中设置（chrome.storage.local.set({tianyi_api_key:"你的key"})）');
+  const api = 'https://www.52api.cn/api/189_cloud?apikey=' + encodeURIComponent(key) + '&url=' + encodeURIComponent(url) + '&pwd=' + encodeURIComponent(pwd || '');
+  const r = await fetchJson(api);
+  if (r.code !== 200 || !r.data) throw new Error('天翼解析失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+  const arr = Array.isArray(r.data) ? r.data : [r.data];
+  return arr.map((x) => ({ name: x.name || x.fileName || 'file', size: x.size ? String(x.size) : '', url: x.downloadUrl || x.url }));
+}
+
+// 分发
+async function resolveNetdisk(req) {
+  const platform = detectNetdiskPlatform(req.url) || req.platform;
+  switch (platform) {
+    case 'baidu': return await resolveBaidu(req.url, req.pwd);
+    case 'aliyun': return await resolveAliyun(req.url, req.pwd);
+    case 'quark': return await resolveQuark(req.url, req.pwd);
+    case 'pan123': return await resolvePan123(req.url, req.pwd);
+    case 'tianyi': return await resolveTianyi(req.url, req.pwd);
+    default: throw new Error('不支持的网盘平台：' + (req.url || ''));
+  }
+}
+
+// ---- 轮询 App 待解析队列并回传结果 ----
+
+let netdiskPolling = false;
+// 已在解析中的请求 id：SW 重启或轮询重入时，避免同一请求被并发解析两次
+// （App 侧要收到 result 才会把它从 pending 移除，慢解析期间会被重复捞到）。
+const netdiskInflight = new Set();
+
+async function pollNetdiskPending() {
+  if (netdiskPolling) return;
+  netdiskPolling = true;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(APP_BASE + '/api/netdisk/resolve/pending', { signal: controller.signal, cache: 'no-store' });
+    clearTimeout(timer);
+    if (!resp.ok) return;
+    const list = await resp.json();
+    if (!Array.isArray(list)) return;
+    for (const req of list) {
+      if (!req || !req.id || netdiskInflight.has(req.id)) continue;
+      netdiskInflight.add(req.id);
+      try {
+        const files = await resolveNetdisk(req);
+        await reportNetdiskResult({ id: req.id, ok: true, files: files, url: req.url });
+      } catch (e) {
+        await reportNetdiskResult({ id: req.id, ok: false, error: String((e && e.message) || e), url: req.url });
+      } finally {
+        netdiskInflight.delete(req.id);
+      }
+    }
+  } catch (e) {
+    // App 离线或网络异常，静默跳过本轮
+  } finally {
+    netdiskPolling = false;
+  }
+}
+
+async function reportNetdiskResult(payload) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    await fetch(APP_BASE + '/api/netdisk/resolve/result', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal, cache: 'no-store',
+    });
+    clearTimeout(timer);
+  } catch (_) { /* ignore */ }
+}
+
+// MV3 Service Worker 生命周期限制：SW 空闲约 30s 就会被回收，setInterval 随之失效。
+// 双保险：
+//   1) setInterval —— SW 存活期间做 2.5s 快速轮询，保证用户点「解析」后能秒级响应；
+//   2) chrome.alarms —— SW 被回收后仍能按最小周期（Chrome 限制 >=30s）唤醒 SW 兜底，
+//      唤醒后 setInterval 会随 SW 重新初始化而恢复快速轮询。
+setInterval(pollNetdiskPending, NETDISK_POLL_MS);
+pollNetdiskPending();
+
+const NETDISK_ALARM = 'lele-netdisk-poll';
+try {
+  if (typeof chrome !== 'undefined' && chrome.alarms) {
+    chrome.alarms.create(NETDISK_ALARM, { periodInMinutes: 0.5 });
+    chrome.alarms.onAlarm.addListener((a) => {
+      if (a && a.name === NETDISK_ALARM) pollNetdiskPending();
+    });
+  }
+} catch (_) { /* alarms 权限缺失时忽略，退化为仅 setInterval */ }
+

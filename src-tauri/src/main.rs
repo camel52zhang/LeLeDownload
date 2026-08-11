@@ -5,16 +5,30 @@ mod commands;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent,
+    Emitter, Manager, WindowEvent,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 pub use download::{DownloadManager, DownloadTask, DownloadStatus};
+
+// 网盘解析：App 侧暂存的「待解析」请求队列（由浏览器扩展轮询取走，在扩展内用 cookie 完成解析）。
+// cookie 不离开扩展，仅把解析出的直链回传，避免敏感凭据落盘或进入 Rust 进程。
+#[derive(Clone)]
+pub struct PendingResolve {
+    pub url: String,
+    pub pwd: Option<String>,
+    pub platform: Option<String>,
+    pub created_at: u64,
+}
+pub type NetdiskPending = Arc<Mutex<HashMap<String, PendingResolve>>>;
+pub static NETDISK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
 extern "system" { fn FreeConsole() -> i32; }
@@ -64,6 +78,10 @@ fn main() {
             app.manage(db_arc.clone());
             let dm = Arc::new(DownloadManager::new(handle.clone())?);
             app.manage(dm.clone());
+
+            // 网盘解析待办队列（App 内存态，不落盘）
+            let netdisk_pending: NetdiskPending = Arc::new(Mutex::new(HashMap::new()));
+            app.manage(netdisk_pending.clone());
 
             // 创建系统托盘：关闭窗口时最小化到托盘，而非退出程序。
             // 右键托盘菜单可「显示主窗口 / 退出」，左键点击在显示/隐藏间切换。
@@ -120,11 +138,20 @@ fn main() {
                 }
             });
 
-            std::thread::spawn(move || { if let Err(e) = run_http(dm) { tracing::error!("HTTP: {}", e); } });
+            // 注意：必须在 spawn 之前取出 AppHandle 并 clone。
+            // 若在闭包内部调用 app.handle()，闭包会捕获 &mut tauri::App（非 Send），
+            // std::thread::spawn 会因 Send 约束编译失败。
+            let app_for_http = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Err(e) = run_http(dm, app_for_http) {
+                    tracing::error!("HTTP: {}", e);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::create_download, commands::pause_download,
+            commands::create_download, commands::request_netdisk_resolve,
+            commands::pause_download,
             commands::resume_download, commands::cancel_download,
             commands::remove_download, commands::get_downloads,
             commands::get_download, commands::clear_completed,
@@ -323,7 +350,7 @@ fn read_full_request(s: &mut std::net::TcpStream) -> Option<String> {
     }
 }
 
-fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // 仅当显式设置 LELE_HTTP_TOKEN 时才强制鉴权；否则本地回环（127.0.0.1）免鉴权，
     // 以便浏览器扩展默认即可把下载任务下发到本机 App。
     let token: Option<String> = std::env::var("LELE_HTTP_TOKEN").ok();
@@ -339,6 +366,7 @@ fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> 
             Ok((mut s, _)) => {
                 let dm = dm.clone();
                 let token = token.clone();
+                let app = app.clone();
                 rt.spawn(async move {
                     let r = match read_full_request(&mut s) {
                         Some(r) => r,
@@ -374,6 +402,80 @@ fn run_http(dm: Arc<DownloadManager>) -> Result<(), Box<dyn std::error::Error>> 
 
                     if r.contains("/status") {
                         write_json(&mut s, "200 OK", "{\"s\":\"ok\",\"service\":\"lele-download\"}", origin);
+                        return;
+                    }
+
+                    // 网盘解析：扩展轮询待办队列（仅扩展 origin 可访问）
+                    if r.contains("/api/netdisk/resolve/pending") {
+                        let pending = app.state::<NetdiskPending>();
+                        // 清理僵尸条目：扩展未安装/未登录/SW 挂起时请求会一直堆积，
+                        // 超过 5 分钟未被取走结果的直接丢弃，避免内存无界增长和过期任务被重复解析。
+                        {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            pending
+                                .inner()
+                                .lock()
+                                .unwrap()
+                                .retain(|_, p| now.saturating_sub(p.created_at) < 300);
+                        }
+                        let list: Vec<serde_json::Value> = pending
+                            .inner()
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(id, p)| {
+                                serde_json::json!({
+                                    "id": id,
+                                    "url": p.url,
+                                    "pwd": p.pwd,
+                                    "platform": p.platform,
+                                })
+                            })
+                            .collect();
+                        write_json(
+                            &mut s,
+                            "200 OK",
+                            &serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()),
+                            origin,
+                        );
+                        return;
+                    }
+
+                    // 网盘解析：扩展把解析结果（直链）回传 App，App 推给前端面板
+                    if r.contains("/api/netdisk/resolve/result") {
+                        if let Some(pos) = r.find("\r\n\r\n") {
+                            let body = &r[pos + 4..];
+                            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(body) {
+                                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                                    let pending = app.state::<NetdiskPending>();
+                                    pending.inner().lock().unwrap().remove(id);
+                                }
+                                // SSRF 防护：解析结果里的直链同样来自外部（扩展/本地进程），
+                                // 与 /download 保持同一套校验，过滤掉私网/回环/非 http(s) 的 URL，
+                                // 避免前端「加入下载」时把内网地址当作网盘直链发起请求。
+                                if let Some(files) = v.get_mut("files").and_then(|x| x.as_array_mut()) {
+                                    files.retain(|f| {
+                                        f.get("url")
+                                            .and_then(|u| u.as_str())
+                                            .map(|u| is_url_safe(u).is_ok())
+                                            .unwrap_or(false)
+                                    });
+                                    if files.is_empty() {
+                                        v["ok"] = serde_json::Value::Bool(false);
+                                        v["error"] = serde_json::Value::String(
+                                            "解析结果为空或直链未通过安全校验".to_string(),
+                                        );
+                                    }
+                                }
+                                let _ = app.emit("netdisk-resolve-result", v.clone());
+                                write_json(&mut s, "200 OK", "{\"ok\":true}", origin);
+                                return;
+                            }
+                        }
+                        write_json(&mut s, "400 Bad Request", "{\"e\":\"bad\"}", origin);
                         return;
                     }
 

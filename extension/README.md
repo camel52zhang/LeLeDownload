@@ -11,6 +11,8 @@
 - **右键菜单**：在链接 / 图片 / 视频 / 音频 / 页面上右键 →「使用乐乐下载器下载」。
 - **弹窗手动添加**：点击扩展图标，粘贴链接 → 开始下载。
 - **自动接管开关**：弹窗内可实时开/关。
+- **国内网盘直链解析**：后台轮询 App 的待解析队列，用浏览器里的网盘登录态解析出
+  真实下载地址回传给 App（见下方「网盘解析」一节）。
 
 ## 前置条件
 
@@ -43,15 +45,62 @@
 - **关闭自动接管**：弹窗里取消勾选，则只在你主动右键 / 手动粘贴时才发送。
 - **查看状态**：弹窗顶部显示「服务在线 / 离线」（检测本地 45678 端口）。
 
+## 网盘解析
+
+在桌面端「网盘解析」标签页提交分享链接后，**解析工作实际由本扩展完成**：
+
+```
+App 待解析队列  ──GET /api/netdisk/resolve/pending──▶  扩展轮询取走
+                                                          │
+                                            用浏览器登录态调用网盘接口
+                                                          ▼
+App 收到直链  ◀──POST /api/netdisk/resolve/result──  仅回传直链+文件名
+```
+
+之所以这样设计：**网盘的 Cookie / Token 只能留在浏览器里**，不进桌面端进程、不落盘、不出网。
+
+| 平台 | 前置条件 |
+|------|---------|
+| 百度网盘 | 浏览器已登录（Cookie 含 BDUSS）；免费账号直链被百度限速 |
+| 阿里云盘 | 浏览器已登录 alipan.com（读 `refresh_token`），或手动配置见下 |
+| 夸克网盘 | 浏览器已登录 pan.quark.cn |
+| 123 云盘 | 公开分享免登录 |
+| 天翼云盘 | 需配置第三方解析 API Key，见下 |
+
+### 手动配置凭据
+
+在本扩展的 Service Worker 控制台（`chrome://extensions` → 本扩展 →「Service Worker」）执行：
+
+```js
+chrome.storage.local.set({ aliyun_refresh_token: '你的refresh_token' })
+chrome.storage.local.set({ tianyi_api_key: '你的52api.cn apikey' })
+```
+
+### 轮询与休眠
+
+MV3 的 Service Worker 空闲约 30 秒会被浏览器回收，`setInterval` 随之失效。
+因此采用双保险：SW 存活时用 2.5 秒快速轮询保证秒级响应；被回收后由 `chrome.alarms`
+（最小周期 30 秒）唤醒兜底。若 App 侧长时间等不到回执，60 秒后会提示解析超时。
+
 ## 目录
 
 ```
 extension/
-├── manifest.json      # MV3，含 Firefox gecko 配置
-├── background.js       # 后台：自动接管 + 右键菜单 + 与 App 通信
-├── popup.html          # 弹窗界面
-├── popup.js            # 弹窗逻辑（服务检测 / 手动添加 / 接管开关）
-└── icons/              # 16/48/128 图标
+├── manifest.json                 # MV3，含 Firefox gecko 配置
+├── background.js                 # 后台：自动接管 + 右键菜单 + 网盘解析 + 与 App 通信
+├── content-script.js             # 内容脚本：白名单站点链接识别（WeTransfer / GD 等）
+├── popup.html                    # 弹窗界面
+├── popup.js                      # 弹窗逻辑（服务检测 / 手动添加 / 接管开关）
+├── test-netdisk-resolver.mjs     # 回归测试：平台识别 + 体积格式化
+├── test-isLikelyFileRequest.mjs  # 回归测试：文件请求判定
+├── test-wetransfer-oncreated.mjs # 回归测试：WeTransfer 接管
+└── icons/                        # 16/48/128 图标
+```
+
+运行全部扩展测试：
+
+```bash
+node --test extension/*.mjs
 ```
 
 ## 说明

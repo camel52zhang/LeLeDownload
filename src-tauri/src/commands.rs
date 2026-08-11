@@ -5,11 +5,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tauri::{Manager, State};
 use tokio::sync::RwLock;
 
 use crate::download::{DownloadManager, DownloadTask};
 use crate::db::Database;
+use crate::{NetdiskPending, PendingResolve};
 
 // 用户首选下载目录的持久化文件（位于系统本地数据目录）。
 // 设置面板保存时会写入此处；桥接(扩展)路径与 create_download 默认值都从这里读取，
@@ -70,6 +72,34 @@ pub async fn create_download(
     let _ = db.write().await.insert_task(&task);
     download_manager.start_download(task.id.clone()).await?;
     Ok(task)
+}
+
+/// 提交一个「网盘分享链接解析」请求，返回请求 id。
+/// 扩展侧会轮询待办队列，在扩展内用已登录的 cookie 解析出直链后回传（cookie 不离开扩展）。
+#[tauri::command]
+pub fn request_netdisk_resolve(
+    pending: State<'_, NetdiskPending>,
+    url: String,
+    pwd: Option<String>,
+    platform: Option<String>,
+) -> Result<String, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = crate::NETDISK_SEQ.fetch_add(1, Ordering::SeqCst);
+    let id = format!("nk_{}_{}", ts, seq);
+    let created_at = ts as u64;
+    pending.lock().unwrap().insert(
+        id.clone(),
+        PendingResolve {
+            url,
+            pwd,
+            platform,
+            created_at,
+        },
+    );
+    Ok(id)
 }
 
 #[tauri::command]

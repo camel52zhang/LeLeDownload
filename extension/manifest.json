@@ -10,7 +10,8 @@
     "tabs",
     "notifications",
     "cookies",
-    "scripting"
+    "scripting",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"

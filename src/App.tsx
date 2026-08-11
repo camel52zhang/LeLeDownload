@@ -2,7 +2,7 @@
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { X } from 'lucide-react'
-import { Header, DownloadForm, DownloadItem, StatusBar, EmptyState, SettingsPanel } from './components'
+import { Header, DownloadForm, DownloadItem, StatusBar, EmptyState, SettingsPanel, NetdiskPanel } from './components'
 import type { DownloadTask } from './types'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { checkForUpdate, downloadAndInstallUpdate, getUpdate } from './lib/updater'
@@ -15,6 +15,7 @@ function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [filterStatus, setFilterStatus] = useState<'all' | 'downloading' | 'completed' | 'failed'>('all')
   const [downloadDir, setDownloadDir] = useState('')
+  const [activeTab, setActiveTab] = useState<'downloads' | 'netdisk'>('downloads')
 
   // 镜像最新任务列表，供事件回调在无闭包陷阱的情况下读取（避免把副作用写进 setState 更新函数）
   const tasksRef = useRef<DownloadTask[]>([])
@@ -102,6 +103,11 @@ function App() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50 flex flex-col">
       <Header onSettingsClick={() => setShowSettings(!showSettings)} onCheckUpdate={handleCheckUpdate} />
+      <div className="px-6 pt-2 flex items-center gap-2">
+        <button onClick={() => setActiveTab('downloads')} className={'px-4 py-1.5 text-sm rounded-full transition-colors ' + (activeTab === 'downloads' ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:bg-gray-100')}>下载列表</button>
+        <button onClick={() => setActiveTab('netdisk')} className={'px-4 py-1.5 text-sm rounded-full transition-colors ' + (activeTab === 'netdisk' ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:bg-gray-100')}>网盘解析</button>
+      </div>
+      {activeTab === 'downloads' && (<>
       <DownloadForm onAdd={addDownload} isLoading={isAdding} />
       <div className="bg-white/50 border-b border-white/20 px-6 py-1.5 flex items-center gap-4">
         <div className="flex items-center gap-2"><svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg><input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="搜索文件名或链接..." className="bg-transparent border-none text-sm text-gray-600 placeholder-gray-400 focus:outline-none w-48" />{searchQuery && <button onClick={() => setSearchQuery('')} className="text-gray-400 hover:text-gray-600"><X className="w-4 h-4" /></button>}</div>
@@ -114,6 +120,8 @@ function App() {
         {sortedTasks.length === 0 ? <EmptyState /> : <div className="w-full space-y-2">{sortedTasks.map(task => (<div key={task.id} className="flex items-center gap-2">{task.status === 'completed' && <input type="checkbox" checked={selectedIds.has(task.id)} onChange={() => handleToggleSelect(task.id)} className="w-4 h-4 rounded border-gray-300 text-indigo-600 flex-shrink-0" />}<div className="flex-1 min-w-0"><DownloadItem task={task} onPause={handlePause} onResume={handleResume} onCancel={handleCancel} onRemove={handleRemove} /></div></div>))}</div>}
       </main>
       <StatusBar totalTasks={tasks.length} downloadingCount={downloadingCount} onClearCompleted={handleClearCompleted} hasCompleted={hasCompleted} />
+      </>)}
+      {activeTab === 'netdisk' && <NetdiskPanel />}
       <SettingsPanel isOpen={showSettings} onClose={() => setShowSettings(false)} onSave={handleSaveSettings} />
     </div>
   )
