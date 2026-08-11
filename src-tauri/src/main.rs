@@ -30,6 +30,14 @@ pub struct PendingResolve {
 pub type NetdiskPending = Arc<Mutex<HashMap<String, PendingResolve>>>;
 pub static NETDISK_SEQ: AtomicU64 = AtomicU64::new(0);
 
+// 网盘解析：扩展回报结果时，把「直链 URL -> 真实文件名」暂存下来。
+// 兜底用：前端「加入下载」理论上会透传 filename，但若该参数因故没跨过 Tauri 边界到达
+// Rust 侧（例如前端/后端二次打包不一致、旧前端未传），仍可用直链 URL 反查回真实文件名，
+// 避免把百度直链末段的哈希串当成文件名存盘。不落盘、仅内存、随进程退出释放。
+#[derive(Clone, Default)]
+pub struct NetdiskFilenames(pub Arc<Mutex<HashMap<String, String>>>);
+
+
 #[cfg(windows)]
 extern "system" { fn FreeConsole() -> i32; }
 
@@ -82,6 +90,8 @@ fn main() {
             // 网盘解析待办队列（App 内存态，不落盘）
             let netdisk_pending: NetdiskPending = Arc::new(Mutex::new(HashMap::new()));
             app.manage(netdisk_pending.clone());
+            // 网盘解析：直链URL -> 真实文件名 兜底暂存表
+            app.manage(NetdiskFilenames(Arc::new(Mutex::new(HashMap::new()))));
 
             // 创建系统托盘：关闭窗口时最小化到托盘，而非退出程序。
             // 右键托盘菜单可「显示主窗口 / 退出」，左键点击在显示/隐藏间切换。
@@ -474,6 +484,22 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                             if let Some((status, resp, event)) =
                                 netdisk_result_apply(app.state::<NetdiskPending>().inner(), body)
                             {
+                                // 兜底：把「直链 URL -> 真实文件名」暂存，供 create_download
+                                // 在没收到显式 filename 时反查，避免存成哈希串。
+                                if let Some(files) = event.get("files").and_then(|x| x.as_array()) {
+                                    let store = app.state::<NetdiskFilenames>();
+                                    let mut m = store.0.lock().unwrap();
+                                    for f in files {
+                                        if let (Some(u), Some(n)) = (
+                                            f.get("url").and_then(|x| x.as_str()),
+                                            f.get("name").and_then(|x| x.as_str()),
+                                        ) {
+                                            if !n.trim().is_empty() {
+                                                m.insert(u.to_string(), n.to_string());
+                                            }
+                                        }
+                                    }
+                                }
                                 let _ = app.emit("netdisk-resolve-result", event);
                                 write_json(&mut s, &status, &resp, origin);
                                 return;

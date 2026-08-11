@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::download::{DownloadManager, DownloadTask};
 use crate::db::Database;
-use crate::{NetdiskPending, PendingResolve};
+use crate::{NetdiskFilenames, NetdiskPending, PendingResolve};
 
 // 用户首选下载目录的持久化文件（位于系统本地数据目录）。
 // 设置面板保存时会写入此处；桥接(扩展)路径与 create_download 默认值都从这里读取，
@@ -61,14 +61,36 @@ fn get_default_save_dir() -> String {
 pub async fn create_download(
     download_manager: State<'_, Arc<DownloadManager>>,
     db: State<'_, Arc<RwLock<Database>>>,
+    filenames: State<'_, NetdiskFilenames>,
     url: String,
     save_dir: Option<String>,
     headers: Option<HashMap<String, String>>,
+    filename: Option<String>,
 ) -> Result<DownloadTask, String> {
     let save_directory = save_dir.unwrap_or_else(get_default_save_dir);
-    // headers 为可选：分享链接场景由浏览器扩展上报（Cookie/Referer 等）；
-    // 前端直链触发不传 => None => 旧路径行为不变。
-    let task = download_manager.create_download(url, save_directory, headers).await?;
+    // filename 优先链：
+    //   1) 前端透传的真实文件名（网盘解析面板「加入下载」传入的 f.name）
+    //   2) 兜底：网盘直链 URL 反查暂存表（若 filename 参数因故未到达 Rust 侧）
+    //   3) 都拿不到 => 旧路径：extract_filename 按 URL 末段 / content-disposition 推导
+    let resolved_name: Option<String> = match filename {
+        Some(ref f) if !f.trim().is_empty() => Some(f.clone()),
+        _ => filenames.0.lock().unwrap().get(&url).cloned(),
+    };
+    let name_source = if filename.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        "arg"
+    } else if resolved_name.is_some() {
+        "stash"
+    } else {
+        "url"
+    };
+    tracing::info!(
+        "[create_download] filename_source={} name={:?}",
+        name_source,
+        resolved_name
+    );
+    let task = download_manager
+        .create_download(url, save_directory, headers, resolved_name)
+        .await?;
     let _ = db.write().await.insert_task(&task);
     download_manager.start_download(task.id.clone()).await?;
     Ok(task)

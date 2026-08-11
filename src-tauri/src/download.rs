@@ -158,6 +158,21 @@ fn sanitize_filename(name: &str) -> String {
     out
 }
 
+/// 选择最终文件名：
+/// - 调用方显式指定的真实文件名优先（如网盘解析拿到的服务器文件名，可能含中文/括号）；
+/// - 为空/纯空白时返回 None，由调用方回退到 URL 末段 / content-disposition 推导。
+/// 抽成纯函数便于单测，避免百度直链末段哈希串被当成文件名。
+fn pick_explicit_filename(explicit: Option<&str>) -> Option<String> {
+    explicit.filter(|s| !s.trim().is_empty()).map(|s| {
+        let cleaned = sanitize_filename(s);
+        if cleaned.is_empty() {
+            "download".to_string()
+        } else {
+            cleaned
+        }
+    })
+}
+
 /// 下载同名文件时避免互相覆盖：若 `dir/filename` 已存在，自动改名保留全部。
 /// 例：ACM.jpg 已存在 → ACM_001.jpg；ACM_001.jpg 也已存在 → ACM_002.jpg。
 /// 序号至少 3 位零填充，超过 999 顺延更多位；遇已占用序号自动跳过。
@@ -410,8 +425,16 @@ impl DownloadManager {
         url: String,
         save_dir: String,
         headers: Option<HashMap<String, String>>,
+        filename: Option<String>,
     ) -> Result<DownloadTask, String> {
-        let filename = self.extract_filename(&url, &headers).await?;
+        // 优先使用调用方显式指定的文件名（如网盘解析阶段拿到的服务器真实文件名），
+        // 否则回退到 URL 末段推导。百度网盘直链末段是哈希串（如 b9979d...）、且不返回
+        // content-disposition，直接拿末段当文件名会存成乱码；扩展在解析阶段已经拿到
+        // 真实文件名并展示在面板，这里把它透传下来最可靠。
+        let filename = match pick_explicit_filename(filename.as_deref()) {
+            Some(n) => n,
+            None => self.extract_filename(&url, &headers).await?,
+        };
 
         let save_path = PathBuf::from(&save_dir);
         fs::create_dir_all(&save_path).map_err(|e| e.to_string())?;
@@ -1213,6 +1236,23 @@ mod tests {
             let long = "x".repeat(300);
             let out = sanitize_filename(&long);
             assert!(out.len() <= 200, "len={}", out.len());
+        }
+
+        #[test]
+        fn test_pick_explicit_filename_prefers_real_name() {
+            // 网盘直链末段是哈希串，必须用解析出的真实文件名（含中文与书名号）
+            assert_eq!(
+                pick_explicit_filename(Some("【中国地域文化丛书】中州文化.pdf")),
+                Some("【中国地域文化丛书】中州文化.pdf".to_string())
+            );
+            // 空 / 纯空白 -> None，调用方回退到 URL 推导
+            assert_eq!(pick_explicit_filename(None), None);
+            assert_eq!(pick_explicit_filename(Some("   ")), None);
+            // 含非法字符会被清洗，但中文与括号保留（路径分隔符会被当作目录切分，取末段）
+            assert_eq!(
+                pick_explicit_filename(Some("a*b:.txt")),
+                Some("ab.txt".to_string())
+            );
         }
 
         #[test]
