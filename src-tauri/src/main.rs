@@ -289,6 +289,60 @@ fn is_url_safe(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+// 网盘解析：列出待解析队列（GET /api/netdisk/resolve/pending）。
+// 同时清理超过 5 分钟未被取走的僵尸条目，返回 JSON 数组字符串。
+fn netdisk_pending_list(pending: &NetdiskPending) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    pending
+        .lock()
+        .unwrap()
+        .retain(|_, p| now.saturating_sub(p.created_at) < 300);
+    let list: Vec<serde_json::Value> = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, p)| {
+            serde_json::json!({
+                "id": id,
+                "url": p.url,
+                "pwd": p.pwd,
+                "platform": p.platform,
+            })
+        })
+        .collect();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+}
+
+// 网盘解析：处理扩展回传的解析结果（POST /api/netdisk/resolve/result）。
+// 从队列移除对应 id，对直链做 SSRF 过滤；返回 (status_line, 响应体, 待 emit 事件)。
+// 解析失败 / 非 JSON 时返回 None（调用方回 400）。
+fn netdisk_result_apply(
+    pending: &NetdiskPending,
+    body: &str,
+) -> Option<(String, String, serde_json::Value)> {
+    let mut v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+        pending.lock().unwrap().remove(id);
+    }
+    if let Some(files) = v.get_mut("files").and_then(|x| x.as_array_mut()) {
+        files.retain(|f| {
+            f.get("url")
+                .and_then(|u| u.as_str())
+                .map(|u| is_url_safe(u).is_ok())
+                .unwrap_or(false)
+        });
+        if files.is_empty() {
+            v["ok"] = serde_json::Value::Bool(false);
+            v["error"] =
+                serde_json::Value::String("解析结果为空或直链未通过安全校验".to_string());
+        }
+    }
+    Some(("200 OK".to_string(), "{\"ok\":true}".to_string(), v))
+}
+
 // 把桥接请求简要记录到 %TEMP%/lele_http_bridge.log，便于排查扩展下发是否真的到达 App。
 fn log_http(line: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -408,39 +462,8 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                     // 网盘解析：扩展轮询待办队列（仅扩展 origin 可访问）
                     if r.contains("/api/netdisk/resolve/pending") {
                         let pending = app.state::<NetdiskPending>();
-                        // 清理僵尸条目：扩展未安装/未登录/SW 挂起时请求会一直堆积，
-                        // 超过 5 分钟未被取走结果的直接丢弃，避免内存无界增长和过期任务被重复解析。
-                        {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            pending
-                                .inner()
-                                .lock()
-                                .unwrap()
-                                .retain(|_, p| now.saturating_sub(p.created_at) < 300);
-                        }
-                        let list: Vec<serde_json::Value> = pending
-                            .inner()
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .map(|(id, p)| {
-                                serde_json::json!({
-                                    "id": id,
-                                    "url": p.url,
-                                    "pwd": p.pwd,
-                                    "platform": p.platform,
-                                })
-                            })
-                            .collect();
-                        write_json(
-                            &mut s,
-                            "200 OK",
-                            &serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()),
-                            origin,
-                        );
+                        let body = netdisk_pending_list(pending.inner());
+                        write_json(&mut s, "200 OK", &body, origin);
                         return;
                     }
 
@@ -448,30 +471,11 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                     if r.contains("/api/netdisk/resolve/result") {
                         if let Some(pos) = r.find("\r\n\r\n") {
                             let body = &r[pos + 4..];
-                            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(body) {
-                                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                                    let pending = app.state::<NetdiskPending>();
-                                    pending.inner().lock().unwrap().remove(id);
-                                }
-                                // SSRF 防护：解析结果里的直链同样来自外部（扩展/本地进程），
-                                // 与 /download 保持同一套校验，过滤掉私网/回环/非 http(s) 的 URL，
-                                // 避免前端「加入下载」时把内网地址当作网盘直链发起请求。
-                                if let Some(files) = v.get_mut("files").and_then(|x| x.as_array_mut()) {
-                                    files.retain(|f| {
-                                        f.get("url")
-                                            .and_then(|u| u.as_str())
-                                            .map(|u| is_url_safe(u).is_ok())
-                                            .unwrap_or(false)
-                                    });
-                                    if files.is_empty() {
-                                        v["ok"] = serde_json::Value::Bool(false);
-                                        v["error"] = serde_json::Value::String(
-                                            "解析结果为空或直链未通过安全校验".to_string(),
-                                        );
-                                    }
-                                }
-                                let _ = app.emit("netdisk-resolve-result", v.clone());
-                                write_json(&mut s, "200 OK", "{\"ok\":true}", origin);
+                            if let Some((status, resp, event)) =
+                                netdisk_result_apply(app.state::<NetdiskPending>().inner(), body)
+                            {
+                                let _ = app.emit("netdisk-resolve-result", event);
+                                write_json(&mut s, &status, &resp, origin);
                                 return;
                             }
                         }
@@ -511,7 +515,7 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                                             .to_string_lossy()
                                             .to_string()
                                     });
-                                match dm.create_download(url.clone(), dir, headers).await {
+                                match dm.create_download(url.clone(), dir, headers, None).await {
                                     Ok(t) => {
                                         log_http(&format!("[ok] id={} url={}", t.id, url));
                                         let _ = dm.start_download(t.id.clone()).await;
@@ -734,5 +738,103 @@ mod http_tests {
         let body = r#"{"url":"https://cdn.example.com/file.zip","headers":{}}"#;
         let (_u, headers) = parse_download_request(body).expect("应解析成功");
         assert!(headers.is_none(), "空 headers 对象应等价 None");
+    }
+}
+
+// 网盘解析 HTTP 桥接的冒烟测试：直接驱动真实的 netdisk_pending_list /
+// netdisk_result_apply（与 run_http 内调用的同一份实现），覆盖「挂单 → 轮询列出
+// → 回传直链 → 出队 + 推事件」全链路，以及僵尸清理与 SSRF 过滤等边角。
+#[cfg(test)]
+mod netdisk_tests {
+    use super::*;
+
+    fn make_pending() -> NetdiskPending {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn insert(pending: &NetdiskPending, id: &str, age_secs: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        pending.lock().unwrap().insert(
+            id.to_string(),
+            PendingResolve {
+                url: "https://pan.baidu.com/s/ABC".to_string(),
+                pwd: None,
+                platform: Some("baidu".to_string()),
+                created_at: now.saturating_sub(age_secs),
+            },
+        );
+    }
+
+    #[test]
+    fn pending_list_returns_inserted_item() {
+        let p = make_pending();
+        insert(&p, "nk_1", 0);
+        let body = netdisk_pending_list(&p);
+        let arr = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("应为 JSON 数组")
+            .as_array()
+            .expect("应为数组")
+            .clone();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"].as_str().unwrap(), "nk_1");
+        assert_eq!(arr[0]["url"].as_str().unwrap(), "https://pan.baidu.com/s/ABC");
+        assert_eq!(arr[0]["platform"].as_str().unwrap(), "baidu");
+    }
+
+    #[test]
+    fn pending_list_drops_zombie_entries() {
+        let p = make_pending();
+        insert(&p, "nk_old", 400); // 400s 前挂单，超过 300s 阈值
+        insert(&p, "nk_fresh", 0);
+        let arr = serde_json::from_str::<serde_json::Value>(&netdisk_pending_list(&p))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(arr.len(), 1, "僵尸条目应被清理");
+        assert_eq!(arr[0]["id"].as_str().unwrap(), "nk_fresh");
+    }
+
+    #[test]
+    fn result_apply_removes_pending_and_emits_ok() {
+        let p = make_pending();
+        insert(&p, "nk_1", 0);
+        let body = r#"{"id":"nk_1","ok":true,"files":[{"name":"a.zip","url":"https://x.com/a.zip","size":1024}]}"#;
+        let (status, resp, event) = netdisk_result_apply(&p, body).expect("应解析成功");
+        assert_eq!(status.as_str(), "200 OK");
+        assert_eq!(resp.as_str(), "{\"ok\":true}");
+        assert_eq!(event["id"].as_str().unwrap(), "nk_1");
+        assert_eq!(event["files"][0]["url"].as_str().unwrap(), "https://x.com/a.zip");
+        assert!(p.lock().unwrap().is_empty(), "回传后 pending 应被移除");
+    }
+
+    #[test]
+    fn result_apply_ssrf_filters_private_url() {
+        let p = make_pending();
+        insert(&p, "nk_1", 0);
+        let body = r#"{"id":"nk_1","ok":true,"files":[{"name":"a","url":"http://127.0.0.1:8080/a","size":1}]}"#;
+        let (_s, _r, event) = netdisk_result_apply(&p, body).unwrap();
+        let files = event["files"].as_array().unwrap();
+        assert!(files.is_empty(), "私网直链必须被过滤");
+        assert_eq!(event["ok"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn result_apply_keeps_public_url() {
+        let p = make_pending();
+        insert(&p, "nk_1", 0);
+        let body = r#"{"id":"nk_1","ok":true,"files":[{"name":"a","url":"https://cdn.example.com/a.zip","size":1}]}"#;
+        let (_s, _r, event) = netdisk_result_apply(&p, body).unwrap();
+        let files = event["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "公网直链应保留");
+    }
+
+    #[test]
+    fn result_apply_bad_json_returns_none() {
+        let p = make_pending();
+        assert!(netdisk_result_apply(&p, "not json").is_none());
     }
 }
