@@ -47,10 +47,11 @@ function pickNum(blob, key) {
 }
 
 // fetchJson 镜像 background.js：包 globalThis.fetch，非 JSON 抛错（用于支撑 baiduResolveUkShareid 策略 B）
+// 注意：与真实 fetchJson 保持一致的「[HTTP 状态码] 非 JSON 响应」报错格式；mock 的 fetch 返回值均带 status 字段以配合。
 async function fetchJson(url, opts) {
   const res = await fetch(url, opts || {});
   const text = await res.text();
-  try { return JSON.parse(text); } catch (_) { throw new Error('非 JSON 响应: ' + text.slice(0, 200)); }
+  try { return JSON.parse(text); } catch (_) { throw new Error('[HTTP ' + res.status + '] 非 JSON 响应: ' + text.slice(0, 300)); }
 }
 
 // 获取百度分享的 uk / shareid：优先页面 window.yunData，兜底 api/shareinfo
@@ -104,10 +105,10 @@ function makeFetchMock(initHtml, shareinfoJson, initUrl) {
     const u = String(url);
     if (u.includes('share/init')) {
       // initUrl 用于模拟百度 302 后的最终 URL（surl 被规范化为 1 前缀）；缺省用请求 URL
-      return { url: initUrl || u, text: async () => initHtml, ok: true };
+      return { url: initUrl || u, text: async () => initHtml, ok: true, status: 200 };
     }
     if (u.includes('api/shareinfo')) {
-      return { url: u, text: async () => JSON.stringify(shareinfoJson), ok: true };
+      return { url: u, text: async () => JSON.stringify(shareinfoJson), ok: true, status: 200 };
     }
     throw new Error('unexpected fetch url: ' + u);
   };
@@ -193,15 +194,15 @@ test('策略 B 带密分享：GET 无数据时用 POST+pwd 兜底成功', async 
   globalThis.fetch = async (url, opts) => {
     const u = String(url);
     if (u.includes('share/init')) {
-      return { text: async () => '<html><body>请登录后查看</body></html>', ok: true };
+      return { text: async () => '<html><body>请登录后查看</body></html>', ok: true, status: 200 };
     }
     if (u.includes('api/shareinfo')) {
       calls.push({ method: (opts && opts.method) || 'GET', body: (opts && opts.body) || '' });
       // GET 不返回 uk/shareid；POST 带 pwd 才返回
       if ((opts && opts.method) === 'POST') {
-        return { text: async () => JSON.stringify({ errno: 0, data: { uk: 123456, shareid: 789012 } }), ok: true };
+        return { text: async () => JSON.stringify({ errno: 0, data: { uk: 123456, shareid: 789012 } }), ok: true, status: 200 };
       }
-      return { text: async () => JSON.stringify({ errno: 0, data: {} }), ok: true };
+      return { text: async () => JSON.stringify({ errno: 0, data: {} }), ok: true, status: 200 };
     }
     throw new Error('unexpected fetch url: ' + u);
   };
@@ -267,12 +268,12 @@ test('策略 B 使用 302 规范化后的 canonical surl（1 前缀）调用 api
       return {
         url: 'https://pan.baidu.com/share/init?surl=1YuZkVISgaH_6xSLGxqoLfw&from=init',
         text: async () => '<html><body>请登录后查看</body></html>',
-        ok: true,
+        ok: true, status: 200,
       };
     }
     if (u.includes('api/shareinfo')) {
       shareinfoUrl = u;
-      return { url: u, text: async () => JSON.stringify({ errno: 0, data: { uk: 1099672802734, shareid: 55046620247 } }), ok: true };
+      return { url: u, text: async () => JSON.stringify({ errno: 0, data: { uk: 1099672802734, shareid: 55046620247 } }), ok: true, status: 200 };
     }
     throw new Error('unexpected fetch url: ' + u);
   };
@@ -334,24 +335,43 @@ async function resolveBaidu(url, pwd) {
   if (!uk || !shareid) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
-  const list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
-    credentials: 'include',
-    headers: { 'X-Requested-With': 'XMLHttpRequest' },
-  });
+  const pwdLabel = pwd ? ('pwd 已填(' + pwd.length + '位)') : 'pwd 缺失(空)';
+  let list;
+  try {
+    list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    });
+  } catch (e) {
+    throw new Error('百度 api/share/list 失败（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+  }
   const files = (list.list || []);
-  if (!files.length) throw new Error('百度分享内没有文件或密码错误');
+  if (!files.length) {
+    const en = (typeof list.errno !== 'undefined') ? list.errno : '';
+    const em = list.errmsg || list.error_msg || '';
+    throw new Error('百度分享内没有文件或密码错误' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
+  }
   const out = [];
   const ts = list.timestamp || Math.floor(Date.now() / 1000);
   const sign = list.sign || '';
   for (const f of files) {
-    const sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D' + (pwd ? '&pwd=' + encodeURIComponent(pwd) : ''),
-    });
+    let sd;
+    try {
+      sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D' + (pwd ? '&pwd=' + encodeURIComponent(pwd) : ''),
+      });
+    } catch (e) {
+      throw new Error('百度 api/sharedownload 失败（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
+    }
     const dlink = sd.list && sd.list[0] && sd.list[0].dlink;
-    if (!dlink) throw new Error('百度未返回 dlink：' + JSON.stringify(sd).slice(0, 200));
+    if (!dlink) {
+      const en = (typeof sd.errno !== 'undefined') ? sd.errno : '';
+      const em = sd.errmsg || sd.error_msg || '';
+      throw new Error('百度未返回 dlink' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + JSON.stringify(sd).slice(0, 200));
+    }
     out.push({ name: f.server_filename, size: bytesToSize(f.size), url: dlink, headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie } });
   }
   return out;
@@ -369,11 +389,11 @@ function installBaiduFlowFetchMock() {
     const u = String(url);
     calls.push({ url: u, opts: opts || {} });
     if (u.includes('share/init')) {
-      return { url: u, ok: true, text: async () => HTML_REALISTIC };
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
     }
     if (u.includes('api/share/list')) {
       return {
-        url: u, ok: true,
+        url: u, ok: true, status: 200,
         text: async () => JSON.stringify({
           errno: 0,
           list: [{ fs_id: 1, server_filename: 'a.txt', size: 10 }],
@@ -384,7 +404,7 @@ function installBaiduFlowFetchMock() {
     }
     if (u.includes('api/sharedownload')) {
       return {
-        url: u, ok: true,
+        url: u, ok: true, status: 200,
         text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }),
       };
     }
@@ -503,4 +523,60 @@ test('resolveBaidu 未检测到 BDUSS 时抛登录态错误且不发请求', asy
   );
   assert.equal(calls.length, 0, '未登录时不应发起任何网络请求');
   mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789'; // 复原，避免影响后续用例
+});
+
+// ---------------------------------------------------------------------------
+// Test G: api/share/list 返回 HTTP 404（网关把带密分享当匿名请求拒掉，HTML 体）
+//         → 诊断报错须同时带 [HTTP 404] 与 pwd 状态（URL 自带 &pwd=h7bq，故为「pwd 已填」）
+// ---------------------------------------------------------------------------
+test('resolveBaidu 当 share/list 返回 404 时诊断报含 [HTTP 404] 与 pwd 已填', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('api/share/list')) {
+      // 百度网关对未带登录态/未验证的带密分享返回 404 + HTML，触发 fetchJson 的「非 JSON 响应」分支
+      return { url: u, ok: false, status: 404, text: async () => '<html>404 Not Found</html>' };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+
+  let err;
+  await assert.rejects(() => resolveBaidu(USER_SHARE_URL, ''), (e) => { err = e; return true; });
+  assert.ok(err, '应当抛出错误');
+  assert.ok(err.message.includes('[HTTP 404]'), '诊断应带 HTTP 状态码，实际: ' + err.message);
+  assert.ok(err.message.includes('pwd 已填(4位)'), '诊断应含 pwd 已填状态（URL 自带 h7bq），实际: ' + err.message);
+  assert.ok(err.message.includes('uk=1099672802734'), '诊断应含所用 uk，实际: ' + err.message);
+  assert.ok(err.message.includes('shareid=55046620247'), '诊断应含所用 shareid，实际: ' + err.message);
+  assert.ok(err.message.includes('百度 api/share/list 失败'), '错误应被 share/list 的 try/catch 包裹，实际: ' + err.message);
+});
+
+// ---------------------------------------------------------------------------
+// Test H: api/share/list 返回 200 JSON 但 errno=-12（密码错误/链接失效）
+//         → 诊断报错须带 errno -12 与 pwd 状态
+// ---------------------------------------------------------------------------
+test('resolveBaidu 当 share/list 返回 errno -12 时诊断报含 errno 与 pwd 已填', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('api/share/list')) {
+      // 百度对密码错误返回 200 + JSON { errno:-12, errmsg:'密码错误' }，列表为空触发 !files.length 分支
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: -12, errmsg: '密码错误' }) };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+
+  let err;
+  await assert.rejects(() => resolveBaidu(USER_SHARE_URL, ''), (e) => { err = e; return true; });
+  assert.ok(err, '应当抛出错误');
+  assert.ok(err.message.includes('errno -12'), '诊断应带 errno，实际: ' + err.message);
+  assert.ok(err.message.includes('密码错误'), '诊断应带 errmsg，实际: ' + err.message);
+  assert.ok(err.message.includes('pwd 已填(4位)'), '诊断应含 pwd 已填状态，实际: ' + err.message);
+  assert.ok(err.message.includes('uk=1099672802734'), '诊断应含所用 uk，实际: ' + err.message);
+  assert.ok(err.message.includes('shareid=55046620247'), '诊断应含所用 shareid，实际: ' + err.message);
 });

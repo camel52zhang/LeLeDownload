@@ -387,7 +387,7 @@ async function fetchJson(url, opts) {
       Object.assign({ signal: controller.signal, cache: 'no-store', credentials: 'include' }, opts)
     );
     const text = await res.text();
-    try { return JSON.parse(text); } catch (_) { throw new Error('非 JSON 响应: ' + text.slice(0, 200)); }
+    try { return JSON.parse(text); } catch (_) { throw new Error('[HTTP ' + res.status + '] 非 JSON 响应: ' + text.slice(0, 300)); }
   } finally {
     clearTimeout(timer);
   }
@@ -659,24 +659,43 @@ async function resolveBaidu(url, pwd) {
   if (!uk || !shareid) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
-  const list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
-    credentials: 'include',
-    headers: { 'X-Requested-With': 'XMLHttpRequest' },
-  });
+  const pwdLabel = pwd ? ('pwd 已填(' + pwd.length + '位)') : 'pwd 缺失(空)';
+  let list;
+  try {
+    list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    });
+  } catch (e) {
+    throw new Error('百度 api/share/list 失败（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+  }
   const files = (list.list || []);
-  if (!files.length) throw new Error('百度分享内没有文件或密码错误');
+  if (!files.length) {
+    const en = (typeof list.errno !== 'undefined') ? list.errno : '';
+    const em = list.errmsg || list.error_msg || '';
+    throw new Error('百度分享内没有文件或密码错误' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
+  }
   const out = [];
   const ts = list.timestamp || Math.floor(Date.now() / 1000);
   const sign = list.sign || '';
   for (const f of files) {
-    const sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D' + (pwd ? '&pwd=' + encodeURIComponent(pwd) : ''),
-    });
+    let sd;
+    try {
+      sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D' + (pwd ? '&pwd=' + encodeURIComponent(pwd) : ''),
+      });
+    } catch (e) {
+      throw new Error('百度 api/sharedownload 失败（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
+    }
     const dlink = sd.list && sd.list[0] && sd.list[0].dlink;
-    if (!dlink) throw new Error('百度未返回 dlink：' + JSON.stringify(sd).slice(0, 200));
+    if (!dlink) {
+      const en = (typeof sd.errno !== 'undefined') ? sd.errno : '';
+      const em = sd.errmsg || sd.error_msg || '';
+      throw new Error('百度未返回 dlink' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + JSON.stringify(sd).slice(0, 200));
+    }
     out.push({ name: f.server_filename, size: bytesToSize(f.size), url: dlink, headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie } });
   }
   return out;
