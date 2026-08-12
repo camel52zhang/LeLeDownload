@@ -281,3 +281,226 @@ test('策略 B 使用 302 规范化后的 canonical surl（1 前缀）调用 api
   assert.ok(shareinfoUrl.includes('shorturl=1YuZkVISgaH_6xSLGxqoLfw'), 'api/shareinfo 必须用 canonical surl，实际: ' + shareinfoUrl);
   assert.ok(!shareinfoUrl.includes('shorturl=YuZkVISgaH_6xSLGxqoLfw'), 'api/shareinfo 不得用 bare surl，实际: ' + shareinfoUrl);
 });
+
+// ===========================================================================
+// resolveBaidu 全流程镜像 + 回归用例
+//
+// 背景（第 3 轮修复）：uk/shareid 已能取到，但 api/share/list 返回 HTTP 404
+// （HTML 响应体 → fetchJson 抛「非 JSON 响应」）。两个独立缺陷：
+//   1) api/share/list 与 api/sharedownload 未显式声明 credentials:'include'，
+//      匿名请求被百度网关以 404 拒绝（只有 share/init 带了登录态才成功）；
+//   2) 提取码丢失：用户只粘贴了含 &pwd=h7bq 的 URL，App 侧 req.pwd 为空，
+//      导致请求 URL 出现 &pwd=（空），带密分享必然取不到文件列表。
+//
+// 注意：真实 background.js 的 fetchJson 通过
+//   Object.assign({ signal, cache:'no-store', credentials:'include' }, opts)
+// 也提供了 credentials 默认值；本镜像的 fetchJson（见上）刻意**不注入该默认值**，
+// 直接透传 opts，这样下面的断言才能真正锁定「调用点显式传了 credentials」——
+// 若有人把调用点的 credentials:'include' 删掉，用例会立刻失败。
+// ===========================================================================
+
+// bytesToSize 镜像 background.js
+function bytesToSize(n) {
+  if (n === undefined || n === null || n === '') return '';
+  n = Number(n);
+  if (isNaN(n)) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(2) + ' ' + u[i];
+}
+
+// getCookieString 的可控 mock：真实实现读 chrome.cookies，此处用变量模拟登录态
+let mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+async function getCookieString(_url) {
+  return mockCookie;
+}
+
+// resolveBaidu 镜像 background.js（与 lines 643-683 一致）
+async function resolveBaidu(url, pwd) {
+  const cookie = await getCookieString('https://pan.baidu.com');
+  if (!/BDUSS=/.test(cookie)) throw new Error('未检测到百度网盘登录态(BDUSS)，请先在浏览器登录');
+  const u = new URL(url);
+  let surl = (u.searchParams.get('surl') || '').trim();
+  if (!surl) {
+    const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+    surl = m ? m[1] : '';
+  }
+  if (!surl) throw new Error('无法从链接提取 surl（请使用 pan.baidu.com 的分享链接）');
+  // 链接里可能直接带 &pwd= 提取码；优先用调用方传入的，其次从 URL 取
+  pwd = (pwd || '').trim() || (u.searchParams.get('pwd') || '').trim() || '';
+  const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  const { uk, shareid } = await baiduResolveUkShareid(surl, pwd);
+  if (!uk || !shareid) {
+    throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
+  }
+  const list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
+    credentials: 'include',
+    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+  });
+  const files = (list.list || []);
+  if (!files.length) throw new Error('百度分享内没有文件或密码错误');
+  const out = [];
+  const ts = list.timestamp || Math.floor(Date.now() / 1000);
+  const sign = list.sign || '';
+  for (const f of files) {
+    const sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D' + (pwd ? '&pwd=' + encodeURIComponent(pwd) : ''),
+    });
+    const dlink = sd.list && sd.list[0] && sd.list[0].dlink;
+    if (!dlink) throw new Error('百度未返回 dlink：' + JSON.stringify(sd).slice(0, 200));
+    out.push({ name: f.server_filename, size: bytesToSize(f.size), url: dlink, headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie } });
+  }
+  return out;
+}
+
+// 用户实际粘贴的链接：surl 与提取码都在 URL 里，调用方 req.pwd 为空
+const USER_SHARE_URL = 'https://pan.baidu.com/share/init?surl=YuZkVISgaH_6xSLGxqoLfw&pwd=h7bq';
+
+// 全流程 fetch mock：记录每次调用的 URL 与 options，供断言 credentials / pwd
+// init → HTML_REALISTIC（share_uk=1099672802734, shareid=55046620247）
+// api/share/list → 1 个文件；api/sharedownload → dlink
+function installBaiduFlowFetchMock() {
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u, opts: opts || {} });
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('api/share/list')) {
+      return {
+        url: u, ok: true,
+        text: async () => JSON.stringify({
+          errno: 0,
+          list: [{ fs_id: 1, server_filename: 'a.txt', size: 10 }],
+          timestamp: 123,
+          sign: 's',
+        }),
+      };
+    }
+    if (u.includes('api/sharedownload')) {
+      return {
+        url: u, ok: true,
+        text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }),
+      };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+  return calls;
+}
+
+// 便捷取用：按 URL 关键字找到那次调用
+function findCall(calls, needle) {
+  return calls.find((c) => c.url.includes(needle));
+}
+
+// ---------------------------------------------------------------------------
+// Test A: 调用方 pwd 为空时，必须从 URL 的 &pwd= 兜底提取，并带进 api/share/list
+//         （回归：此前 pwd 为空 → 请求出现 &pwd= → 带密分享 404 / 空列表）
+// ---------------------------------------------------------------------------
+test('resolveBaidu 在 pwd 为空时从 URL 提取提取码并带入 api/share/list', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = installBaiduFlowFetchMock();
+
+  const out = await resolveBaidu(USER_SHARE_URL, ''); // 调用方 req.pwd 为空
+
+  const listCall = findCall(calls, 'api/share/list');
+  assert.ok(listCall, '应发起 api/share/list 请求');
+  assert.ok(listCall.url.includes('pwd=h7bq'), 'api/share/list 必须携带从 URL 提取的 pwd=h7bq，实际: ' + listCall.url);
+  assert.ok(!/[?&]pwd=(&|$)/.test(listCall.url), 'api/share/list 不得出现空 pwd 参数，实际: ' + listCall.url);
+  // uk/shareid 仍取自 yunData 的 share_uk / shareid
+  assert.ok(listCall.url.includes('uk=1099672802734'), 'api/share/list 应带 share_uk');
+  assert.ok(listCall.url.includes('shareid=55046620247'), 'api/share/list 应带 shareid');
+  assert.equal(out.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Test B: api/share/list 与 api/sharedownload 必须带 credentials:'include'
+//         （回归：匿名请求被百度网关以 404 + HTML 拒绝 → 「非 JSON 响应」）
+// ---------------------------------------------------------------------------
+test('resolveBaidu 的 share/list 与 sharedownload 均带 credentials:include', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = installBaiduFlowFetchMock();
+
+  await resolveBaidu(USER_SHARE_URL, '');
+
+  const listCall = findCall(calls, 'api/share/list');
+  const sdCall = findCall(calls, 'api/sharedownload');
+  assert.ok(listCall, '应发起 api/share/list 请求');
+  assert.ok(sdCall, '应发起 api/sharedownload 请求');
+  assert.equal(listCall.opts.credentials, 'include', 'api/share/list 必须显式带 credentials:include（否则百度返回 404 HTML）');
+  assert.equal(sdCall.opts.credentials, 'include', 'api/sharedownload 必须显式带 credentials:include（否则百度返回 404 HTML）');
+  // share/init 早已带登录态，回归时一并锁定
+  const initCall = findCall(calls, 'share/init');
+  assert.equal(initCall.opts.credentials, 'include', 'share/init 必须保持 credentials:include');
+  // sharedownload 仍是 POST，且提取码进 body（带密分享必需）
+  assert.equal(sdCall.opts.method, 'POST');
+  assert.ok(sdCall.opts.body.includes('pwd=h7bq'), 'sharedownload body 应携带提取码，实际: ' + sdCall.opts.body);
+  assert.ok(sdCall.opts.body.includes('fid_list=%5B1%5D'), 'sharedownload body 应携带 fid_list');
+});
+
+// ---------------------------------------------------------------------------
+// Test C: 成功流程返回带 dlink 的文件列表（含下载引擎所需的 Cookie/UA/Referer 头）
+// ---------------------------------------------------------------------------
+test('resolveBaidu 成功流程返回带 dlink 的文件', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  installBaiduFlowFetchMock();
+
+  const out = await resolveBaidu(USER_SHARE_URL, '');
+
+  assert.equal(out.length, 1, '应解析出 1 个文件');
+  assert.equal(out[0].name, 'a.txt');
+  assert.equal(out[0].url, 'https://d.pcs.baidu.com/dl/a.txt');
+  assert.equal(out[0].size, '10.00 B');
+  // 直链由 Rust 侧下载，不受浏览器禁止头限制，必须回传 Cookie/UA/Referer
+  assert.ok(/BDUSS=/.test(out[0].headers.Cookie), '回传 headers 必须含 BDUSS Cookie');
+  assert.equal(out[0].headers.Referer, 'https://pan.baidu.com/');
+  assert.ok(out[0].headers['User-Agent'].includes('Chrome/'), '回传 headers 必须含浏览器 UA');
+});
+
+// ---------------------------------------------------------------------------
+// Test D: 调用方显式传入的 pwd 优先于 URL 中的 pwd（避免兜底逻辑反向覆盖用户输入）
+// ---------------------------------------------------------------------------
+test('resolveBaidu 优先使用调用方传入的 pwd，其次才取 URL 中的 pwd', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = installBaiduFlowFetchMock();
+
+  await resolveBaidu(USER_SHARE_URL, '  zzzz  '); // 带首尾空格，应被 trim
+
+  const listCall = findCall(calls, 'api/share/list');
+  assert.ok(listCall.url.includes('pwd=zzzz'), '应优先用调用方传入的 pwd 并 trim，实际: ' + listCall.url);
+  assert.ok(!listCall.url.includes('pwd=h7bq'), 'URL 中的 pwd 不得覆盖调用方传入值');
+});
+
+// ---------------------------------------------------------------------------
+// Test E: 无提取码的公开分享，body 不应追加空的 &pwd=
+// ---------------------------------------------------------------------------
+test('resolveBaidu 公开分享（无 pwd）时 sharedownload body 不追加空 pwd', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = installBaiduFlowFetchMock();
+
+  await resolveBaidu('https://pan.baidu.com/s/1YuZkVISgaH_6xSLGxqoLfw', '');
+
+  const sdCall = findCall(calls, 'api/sharedownload');
+  assert.ok(!sdCall.opts.body.includes('pwd='), '无提取码时不得追加 pwd 参数，实际: ' + sdCall.opts.body);
+  assert.equal(sdCall.opts.credentials, 'include', '公开分享同样需要登录态');
+});
+
+// ---------------------------------------------------------------------------
+// Test F: 未登录（cookie 无 BDUSS）时给出明确错误，不发起任何 API 请求
+// ---------------------------------------------------------------------------
+test('resolveBaidu 未检测到 BDUSS 时抛登录态错误且不发请求', async () => {
+  mockCookie = 'STOKEN=xyz789';
+  const calls = installBaiduFlowFetchMock();
+
+  await assert.rejects(
+    () => resolveBaidu(USER_SHARE_URL, ''),
+    /未检测到百度网盘登录态\(BDUSS\)/,
+  );
+  assert.equal(calls.length, 0, '未登录时不应发起任何网络请求');
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789'; // 复原，避免影响后续用例
+});

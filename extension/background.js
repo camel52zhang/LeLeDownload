@@ -650,6 +650,8 @@ async function resolveBaidu(url, pwd) {
     surl = m ? m[1] : '';
   }
   if (!surl) throw new Error('无法从链接提取 surl（请使用 pan.baidu.com 的分享链接）');
+  // 链接里可能直接带 &pwd= 提取码；优先用调用方传入的，其次从 URL 取
+  pwd = (pwd || '').trim() || (u.searchParams.get('pwd') || '').trim() || '';
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   // 同上：Cookie/UA/Referer 在 MV3 fetch 中会被丢弃，登录态靠 credentials:'include'。
   // 百度已停用 share/linkinfo（返回 errno -7），改为抓取分享页 window.yunData，并兼容 api/shareinfo 兜底。
@@ -658,6 +660,7 @@ async function resolveBaidu(url, pwd) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
   const list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
+    credentials: 'include',
     headers: { 'X-Requested-With': 'XMLHttpRequest' },
   });
   const files = (list.list || []);
@@ -668,8 +671,9 @@ async function resolveBaidu(url, pwd) {
   for (const f of files) {
     const sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D',
+      body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D' + (pwd ? '&pwd=' + encodeURIComponent(pwd) : ''),
     });
     const dlink = sd.list && sd.list[0] && sd.list[0].dlink;
     if (!dlink) throw new Error('百度未返回 dlink：' + JSON.stringify(sd).slice(0, 200));
