@@ -714,12 +714,13 @@ async function resolveBaidu(url, pwd) {
   // bdstoken 是 cookie 登录态签发的 CSRF 令牌（匿名页为空）；list 需要它，且它是「登录态是否注入成功」的诊断信号
   const bdstTk = pageBd ? '&bdstoken=' + encodeURIComponent(pageBd) : '';
   const bdstLabel = pageBd ? 'bdstoken 已填(' + pageBd.length + '位)' : 'bdstoken 缺失(空，登录态未注入)';
-  // 百度带密分享：list 之前必须先 api/share/verify 换 BDCLND cookie，否则网关直接返回
-  // 404 HTML 页面（非 JSON 响应）。verify 成功会把 BDCLND 写入浏览器 cookie jar，
-  // 紧接着的 list 通过 credentials:'include' 自动带上该 cookie 走通。公开分享(pwd 空)跳过。
+  // 第 8 轮：百度真实端点是 /share/verify 与 /share/list（无 /api/ 前缀，/api/share/* 路径不存在 → 404）。
+  // 带密分享流程：POST /share/verify 返回 {errno:0, randsk}，randsk 即 BDCLND/sekey 令牌，
+  // 必须作为 sekey 参数 + is_from_web=1 传给 /share/list。公开分享(pwd 空)跳过 verify，sekey 为空。
+  let sekey = '';
   if (pwd) {
     try {
-      const verify = await fetchJson('https://pan.baidu.com/api/share/verify?shareid=' + shareid + '&uk=' + uk + signTs + bdstTk, {
+      const verify = await fetchJson('https://pan.baidu.com/share/verify?shareid=' + shareid + '&uk=' + uk + signTs + bdstTk, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
@@ -730,19 +731,20 @@ async function resolveBaidu(url, pwd) {
       if (ven !== '' && Number(ven) !== 0) {
         throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
       }
+      sekey = (verify && verify.randsk) ? String(verify.randsk) : '';
     } catch (e) {
       if (/百度提取码错误/.test(e.message)) throw e;
-      throw new Error('百度 api/share/verify 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+      throw new Error('百度 share/verify 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
     }
   }
   let list;
   try {
-    list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/' + signTs + bdstTk, {
+    list = await fetchJson('https://pan.baidu.com/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/' + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey) + signTs + bdstTk, {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
   } catch (e) {
-    throw new Error('百度 api/share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+    throw new Error('百度 share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
   }
   const files = (list.list || []);
   if (!files.length) {
