@@ -571,6 +571,66 @@ async function resolveAliyun(url, pwd) {
   return out;
 }
 
+// 从分享页 HTML 提取 window.yunData 完整对象字面量（手动括号匹配，兼容字符串内花括号）
+function extractYunData(html) {
+  const idx = html.indexOf('window.yunData');
+  if (idx < 0) return '';
+  const eq = html.indexOf('=', idx);
+  if (eq < 0) return '';
+  const i = html.indexOf('{', eq);
+  if (i < 0) return '';
+  let depth = 0;
+  for (let j = i; j < html.length; j++) {
+    const c = html[j];
+    if (c === '"' || c === "'") {
+      const q = c; j++;
+      // 注意：每个字符都必须推进 j，否则遇到非转义字符会死循环（字符串里几乎所有字符都不是反斜杠）
+      while (j < html.length && html[j] !== q) { if (html[j] === '\\') j++; j++; }
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) return html.slice(i, j + 1); }
+  }
+  return '';
+}
+// 从 yunData 文本里按 key 取数字值（兼容 "uk":123 与 uk:123 两种写法）
+function pickNum(blob, key) {
+  // 兼容 key 带引号（"uk":123）与不带引号（uk:123）两种写法：key 与分隔符之间允许一个可选引号
+  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + '\\s*"?\\s*[:=]\\s*"?(\\d+)"?'));
+  return m ? m[1] : '';
+}
+// 获取百度分享的 uk / shareid：优先页面 window.yunData，兜底 api/shareinfo
+async function baiduResolveUkShareid(surl, pwd) {
+  let uk = '', shareid = '';
+  // 策略 A：分享页 window.yunData（百度已停用 share/linkinfo，返回 errno -7）
+  try {
+    const res = await fetch('https://pan.baidu.com/share/init?surl=' + encodeURIComponent(surl), {
+      credentials: 'include', cache: 'no-store',
+    });
+    const yd = extractYunData(await res.text());
+    if (yd) { uk = pickNum(yd, 'uk'); shareid = pickNum(yd, 'shareid'); }
+  } catch (_) {}
+  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试）
+  if (!uk || !shareid) {
+    try {
+      const url = 'https://pan.baidu.com/api/shareinfo?shorturl=' + encodeURIComponent(surl) + '&sub=1';
+      let li = await fetchJson(url, {});
+      let d = (li && li.data) || li || {};
+      uk = uk || String(d.uk || ''); shareid = shareid || String(d.shareid || '');
+      if ((!uk || !shareid) && pwd) {
+        li = await fetchJson(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'pwd=' + encodeURIComponent(pwd),
+        });
+        d = (li && li.data) || li || {};
+        uk = uk || String(d.uk || ''); shareid = shareid || String(d.shareid || '');
+      }
+    } catch (_) {}
+  }
+  return { uk, shareid };
+}
+
 // 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
 async function resolveBaidu(url, pwd) {
   const cookie = await getCookieString('https://pan.baidu.com');
@@ -584,9 +644,11 @@ async function resolveBaidu(url, pwd) {
   if (!surl) throw new Error('无法从链接提取 surl（请使用 pan.baidu.com 的分享链接）');
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   // 同上：Cookie/UA/Referer 在 MV3 fetch 中会被丢弃，登录态靠 credentials:'include'。
-  const li = await fetchJson('https://pan.baidu.com/share/linkinfo?shareid=&uk=&surl=' + encodeURIComponent(surl), {});
-  const uk = li.uk, shareid = li.shareid;
-  if (!uk) throw new Error('百度获取 uk/shareid 失败：' + JSON.stringify(li).slice(0, 200));
+  // 百度已停用 share/linkinfo（返回 errno -7），改为抓取分享页 window.yunData，并兼容 api/shareinfo 兜底。
+  const { uk, shareid } = await baiduResolveUkShareid(surl, pwd);
+  if (!uk || !shareid) {
+    throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
+  }
   const list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
     headers: { 'X-Requested-With': 'XMLHttpRequest' },
   });
