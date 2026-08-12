@@ -731,26 +731,42 @@ async function resolveBaidu(url, pwd) {
       if (ven !== '' && Number(ven) !== 0) {
         throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
       }
+      // 第 9 轮：randsk 是 URL 编码的，页面 JS 用 decodeURIComponent 解码后作为 sekey 传 list，
+      // 我们须解码后由 encodeURIComponent 组装 URL（保持解码形态到达服务器），否则双重编码 → errno 2 参数错误。
       sekey = (verify && verify.randsk) ? String(verify.randsk) : '';
+      if (sekey) { try { sekey = decodeURIComponent(sekey); } catch (_) {} }
+      else {
+        // 兜底：verify 成功时百度 Set-Cookie BDCLND=<randsk>，直接从 cookie 读
+        try {
+          const ck = await getCookieString('https://pan.baidu.com');
+          const m = ck.match(/BDCLND=([^;]+)/);
+          if (m) sekey = decodeURIComponent(m[1]);
+        } catch (_) {}
+      }
+      // verify 已 Set-Cookie BDCLND：刷新 DNR 注入头，让 list 请求也带上 BDCLND cookie
+      await ensureBaiduAuthHeaders();
     } catch (e) {
       if (/百度提取码错误/.test(e.message)) throw e;
       throw new Error('百度 share/verify 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
     }
   }
+  const sekeyLabel = sekey ? ('sekey 已填(' + sekey.length + '位)') : 'sekey 缺失(空)';
   let list;
   try {
-    list = await fetchJson('https://pan.baidu.com/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/' + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey) + signTs + bdstTk, {
+    // 有 sekey（带密分享已验证）时 list 不再传 pwd（sekey 即密码凭证，两者同传会触发参数错误 errno 2）
+    const listPwdQ = sekey ? '' : ('&pwd=' + encodeURIComponent(pwd || ''));
+    list = await fetchJson('https://pan.baidu.com/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0' + listPwdQ + '&dir=/' + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey) + signTs + bdstTk, {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
   } catch (e) {
-    throw new Error('百度 share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+    throw new Error('百度 share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', ' + sekeyLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
   }
   const files = (list.list || []);
   if (!files.length) {
     const en = (typeof list.errno !== 'undefined') ? list.errno : '';
-    const em = list.errmsg || list.error_msg || '';
-    throw new Error('百度分享内没有文件或密码错误' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
+    const em = list.show_msg || list.errmsg || list.error_msg || '';
+    throw new Error('百度分享内没有文件或密码错误' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', ' + sekeyLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
   }
   const out = [];
   const ts = list.timestamp || Math.floor(Date.now() / 1000);

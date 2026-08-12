@@ -407,26 +407,42 @@ async function resolveBaidu(url, pwd) {
       if (ven !== '' && Number(ven) !== 0) {
         throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
       }
+      // 第 9 轮：randsk 是 URL 编码的，页面 JS 用 decodeURIComponent 解码后作为 sekey 传 list，
+      // 我们须解码后由 encodeURIComponent 组装 URL（保持解码形态到达服务器），否则双重编码 → errno 2 参数错误。
       sekey = (verify && verify.randsk) ? String(verify.randsk) : '';
+      if (sekey) { try { sekey = decodeURIComponent(sekey); } catch (_) {} }
+      else {
+        // 兜底：verify 成功时百度 Set-Cookie BDCLND=<randsk>，直接从 cookie 读
+        try {
+          const ck = await getCookieString('https://pan.baidu.com');
+          const m = ck.match(/BDCLND=([^;]+)/);
+          if (m) sekey = decodeURIComponent(m[1]);
+        } catch (_) {}
+      }
+      // verify 已 Set-Cookie BDCLND：刷新 DNR 注入头，让 list 请求也带上 BDCLND cookie
+      await ensureBaiduAuthHeaders();
     } catch (e) {
       if (/百度提取码错误/.test(e.message)) throw e;
       throw new Error('百度 share/verify 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
     }
   }
+  const sekeyLabel = sekey ? ('sekey 已填(' + sekey.length + '位)') : 'sekey 缺失(空)';
   let list;
   try {
-    list = await fetchJson('https://pan.baidu.com/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/' + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey) + signTs + bdstTk, {
+    // 有 sekey（带密分享已验证）时 list 不再传 pwd（sekey 即密码凭证，两者同传会触发参数错误 errno 2）
+    const listPwdQ = sekey ? '' : ('&pwd=' + encodeURIComponent(pwd || ''));
+    list = await fetchJson('https://pan.baidu.com/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0' + listPwdQ + '&dir=/' + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey) + signTs + bdstTk, {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
   } catch (e) {
-    throw new Error('百度 share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+    throw new Error('百度 share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', ' + sekeyLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
   }
   const files = (list.list || []);
   if (!files.length) {
     const en = (typeof list.errno !== 'undefined') ? list.errno : '';
-    const em = list.errmsg || list.error_msg || '';
-    throw new Error('百度分享内没有文件或密码错误' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
+    const em = list.show_msg || list.errmsg || list.error_msg || '';
+    throw new Error('百度分享内没有文件或密码错误' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', ' + sekeyLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
   }
   const out = [];
   const ts = list.timestamp || Math.floor(Date.now() / 1000);
@@ -503,19 +519,24 @@ function findCall(calls, needle) {
 }
 
 // ---------------------------------------------------------------------------
-// Test A: 调用方 pwd 为空时，必须从 URL 的 &pwd= 兜底提取，并带进 api/share/list
-//         （回归：此前 pwd 为空 → 请求出现 &pwd= → 带密分享 404 / 空列表）
+// Test A: 调用方 pwd 为空时，必须从 URL 的 &pwd= 兜底提取，并带进 share/verify；
+//         第 9 轮：验证成功后 list 以 sekey 作为密码凭证，不再传 pwd（两者同传触发参数错误）
+//         （回归：此前 pwd 为空 → 带密分享 404 / 空列表）
 // ---------------------------------------------------------------------------
-test('resolveBaidu 在 pwd 为空时从 URL 提取提取码并带入 api/share/list', async () => {
+test('resolveBaidu 在 pwd 为空时从 URL 提取提取码并带入 share/verify', async () => {
   mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
   const calls = installBaiduFlowFetchMock();
 
   const out = await resolveBaidu(USER_SHARE_URL, ''); // 调用方 req.pwd 为空
 
+  const verifyCall = findCall(calls, 'share/verify');
+  assert.ok(verifyCall, '应发起 share/verify 请求');
+  assert.ok(verifyCall.opts.body.includes('pwd=h7bq'), 'share/verify body 必须携带从 URL 提取的 pwd=h7bq，实际: ' + verifyCall.opts.body);
   const listCall = findCall(calls, 'share/list');
-  assert.ok(listCall, '应发起 api/share/list 请求');
-  assert.ok(listCall.url.includes('pwd=h7bq'), 'api/share/list 必须携带从 URL 提取的 pwd=h7bq，实际: ' + listCall.url);
-  assert.ok(!/[?&]pwd=(&|$)/.test(listCall.url), 'api/share/list 不得出现空 pwd 参数，实际: ' + listCall.url);
+  assert.ok(listCall, '应发起 share/list 请求');
+  // 第 9 轮：verify 返回 randsk → sekey 已填 → list 以 sekey 作凭证，不带 pwd
+  assert.ok(listCall.url.includes('sekey=SEKRAND123'), 'share/list 必须带 sekey（密码凭证），实际: ' + listCall.url);
+  assert.ok(!/[?&]pwd=/.test(listCall.url), 'share/list 带 sekey 时不得再传 pwd 参数（否则参数错误 errno 2），实际: ' + listCall.url);
   // uk/shareid 仍取自 yunData 的 share_uk / shareid
   assert.ok(listCall.url.includes('uk=1099672802734'), 'api/share/list 应带 share_uk');
   assert.ok(listCall.url.includes('shareid=55046620247'), 'api/share/list 应带 shareid');
@@ -568,6 +589,7 @@ test('resolveBaidu 成功流程返回带 dlink 的文件', async () => {
 
 // ---------------------------------------------------------------------------
 // Test D: 调用方显式传入的 pwd 优先于 URL 中的 pwd（避免兜底逻辑反向覆盖用户输入）
+//         （第 9 轮：pwd 进 verify body；list 以 sekey 作凭证不再传 pwd）
 // ---------------------------------------------------------------------------
 test('resolveBaidu 优先使用调用方传入的 pwd，其次才取 URL 中的 pwd', async () => {
   mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
@@ -575,9 +597,9 @@ test('resolveBaidu 优先使用调用方传入的 pwd，其次才取 URL 中的 
 
   await resolveBaidu(USER_SHARE_URL, '  zzzz  '); // 带首尾空格，应被 trim
 
-  const listCall = findCall(calls, 'share/list');
-  assert.ok(listCall.url.includes('pwd=zzzz'), '应优先用调用方传入的 pwd 并 trim，实际: ' + listCall.url);
-  assert.ok(!listCall.url.includes('pwd=h7bq'), 'URL 中的 pwd 不得覆盖调用方传入值');
+  const verifyCall = findCall(calls, 'share/verify');
+  assert.ok(verifyCall.opts.body.includes('pwd=zzzz'), '应优先用调用方传入的 pwd 并 trim 进 verify body，实际: ' + verifyCall.opts.body);
+  assert.ok(!verifyCall.opts.body.includes('pwd=h7bq'), 'URL 中的 pwd 不得覆盖调用方传入值');
 });
 
 // ---------------------------------------------------------------------------
@@ -721,6 +743,8 @@ test('resolveBaidu 带密分享：先 api/share/verify 成功再 list 返回 dli
   assert.ok(!listCall.url.includes('/api/share/list'), 'list 端点不应带 /api/ 前缀，实际: ' + listCall.url);
   assert.ok(listCall.url.includes('sekey=SEKRAND123'), 'list URL 必须带 verify 返回的 sekey，实际: ' + listCall.url);
   assert.ok(listCall.url.includes('is_from_web=1'), 'list URL 必须带 is_from_web=1，实际: ' + listCall.url);
+  // 第 9 轮：带 sekey 时 list 不得再传 pwd（两者同传 → 参数错误 errno 2）
+  assert.ok(!/[?&]pwd=/.test(listCall.url), 'list URL 带 sekey 时不得含 pwd 参数，实际: ' + listCall.url);
 });
 
 // ---------------------------------------------------------------------------
@@ -886,4 +910,72 @@ test('ensureBaiduAuthHeaders 通过 DNR 注入含 BDUSS 的 Cookie 与 Referer �
   } finally {
     delete globalThis.chrome;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Test P: 第 9 轮核心回归 —— verify 返回的 randsk 是 URL 编码的（含 %2B 等），
+//         页面 JS 先 decodeURIComponent 再作为 sekey 传 list；我们必须解码后由
+//         encodeURIComponent 组装（保证到达服务器的是解码形态），否则双重编码 → errno 2。
+//         此处断言 list URL 中的 sekey 参数值等于解码-再编码后的正确形态。
+// ---------------------------------------------------------------------------
+test('resolveBaidu 对 URL 编码的 randsk 解码后再作为 sekey 传给 list', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const ENC_RANDSK = 'HDMEW87YHzI%2BlDvU%2FLNq%2FDjCHrtKnEhNMJFkUbl%2FYIU%3D';
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u, opts: opts || {} });
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('share/verify')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, randsk: ENC_RANDSK }) };
+    }
+    if (u.includes('share/list')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ fs_id: 1, server_filename: 'a.txt', size: 10 }], timestamp: 123, sign: 's' }) };
+    }
+    if (u.includes('api/sharedownload')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }) };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+  const out = await resolveBaidu(USER_SHARE_URL, '');
+  assert.equal(out.length, 1, '应解析出 1 个文件');
+  const listCall = calls.find((c) => c.url.includes('share/list'));
+  assert.ok(listCall, '应发起 share/list');
+  // 解码后再编码 → 原编码串；若直接双重编码会出现 %252B
+  assert.ok(listCall.url.includes('sekey=' + ENC_RANDSK), 'sekey 应为解码后重编码的正确形态，实际: ' + listCall.url);
+  assert.ok(!listCall.url.includes('%252B'), '不得出现双重编码 %252B，实际: ' + listCall.url);
+});
+
+// ---------------------------------------------------------------------------
+// Test Q: 第 9 轮兜底 —— verify 未返回 randsk 时，从 BDCLND cookie（verify 成功时
+//         Set-Cookie 的 randsk 值）提取 sekey，保证带密分享仍能带 sekey 调 list。
+// ---------------------------------------------------------------------------
+test('resolveBaidu verify 无 randsk 时从 BDCLND cookie 兜底提取 sekey', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789; BDCLND=HDMEW87YHzI%2BlDvU%2FLNq%2FDjCHrtKnEhNMJFkUbl%2FYIU%3D';
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u, opts: opts || {} });
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('share/verify')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0 }) }; // 无 randsk
+    }
+    if (u.includes('share/list')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ fs_id: 1, server_filename: 'a.txt', size: 10 }], timestamp: 123, sign: 's' }) };
+    }
+    if (u.includes('api/sharedownload')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }) };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+  const out = await resolveBaidu(USER_SHARE_URL, '');
+  assert.equal(out.length, 1, '应解析出 1 个文件');
+  const listCall = calls.find((c) => c.url.includes('share/list'));
+  assert.ok(listCall.url.includes('sekey=HDMEW87YHzI%2BlDvU'), '应从 BDCLND cookie 兜底提取 sekey，实际: ' + listCall.url);
+  assert.ok(listCall.url.includes('is_from_web=1'), '兜底 sekey 也应带 is_from_web=1');
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789'; // 复原
 });
