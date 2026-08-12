@@ -336,6 +336,26 @@ async function resolveBaidu(url, pwd) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
   const pwdLabel = pwd ? ('pwd 已填(' + pwd.length + '位)') : 'pwd 缺失(空)';
+  // 百度带密分享：list 之前必须先 api/share/verify 换 BDCLND cookie，否则网关直接返回
+  // 404 HTML 页面（非 JSON 响应）。公开分享(pwd 空)跳过。
+  if (pwd) {
+    try {
+      const verify = await fetchJson('https://pan.baidu.com/api/share/verify?shareid=' + shareid + '&uk=' + uk, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+        body: 'pwd=' + encodeURIComponent(pwd),
+      });
+      const ven = (typeof verify.errno !== 'undefined') ? verify.errno : '';
+      const vem = verify.errmsg || verify.error_msg || '';
+      if (ven !== '' && Number(ven) !== 0) {
+        throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（pwd 已填(' + pwd.length + '位), uk=' + uk + ', shareid=' + shareid + '）');
+      }
+    } catch (e) {
+      if (/百度提取码错误/.test(e.message)) throw e;
+      throw new Error('百度 api/share/verify 失败（pwd 已填(' + pwd.length + '位), uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+    }
+  }
   let list;
   try {
     list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
@@ -390,6 +410,13 @@ function installBaiduFlowFetchMock() {
     calls.push({ url: u, opts: opts || {} });
     if (u.includes('share/init')) {
       return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('api/share/verify')) {
+      // 第 5 轮新增：带密分享 list 前必须先 verify 换 BDCLND，默认返回成功（errno:0）
+      return {
+        url: u, ok: true, status: 200,
+        text: async () => JSON.stringify({ errno: 0 }),
+      };
     }
     if (u.includes('api/share/list')) {
       return {
@@ -536,6 +563,10 @@ test('resolveBaidu 当 share/list 返回 404 时诊断报含 [HTTP 404] 与 pwd 
     if (u.includes('share/init')) {
       return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
     }
+    if (u.includes('api/share/verify')) {
+      // 第 5 轮：verify 先于 list 执行；此处让 verify 成功（errno:0），以复现后续 list 404 的网关拒绝
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0 }) };
+    }
     if (u.includes('api/share/list')) {
       // 百度网关对未带登录态/未验证的带密分享返回 404 + HTML，触发 fetchJson 的「非 JSON 响应」分支
       return { url: u, ok: false, status: 404, text: async () => '<html>404 Not Found</html>' };
@@ -564,6 +595,10 @@ test('resolveBaidu 当 share/list 返回 errno -12 时诊断报含 errno 与 pwd
     if (u.includes('share/init')) {
       return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
     }
+    if (u.includes('api/share/verify')) {
+      // 第 5 轮：verify 先于 list 执行；此处让 verify 成功，以复现后续 list 返回 errno -12 的分支
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0 }) };
+    }
     if (u.includes('api/share/list')) {
       // 百度对密码错误返回 200 + JSON { errno:-12, errmsg:'密码错误' }，列表为空触发 !files.length 分支
       return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: -12, errmsg: '密码错误' }) };
@@ -579,4 +614,104 @@ test('resolveBaidu 当 share/list 返回 errno -12 时诊断报含 errno 与 pwd
   assert.ok(err.message.includes('pwd 已填(4位)'), '诊断应含 pwd 已填状态，实际: ' + err.message);
   assert.ok(err.message.includes('uk=1099672802734'), '诊断应含所用 uk，实际: ' + err.message);
   assert.ok(err.message.includes('shareid=55046620247'), '诊断应含所用 shareid，实际: ' + err.message);
+});
+
+// ---------------------------------------------------------------------------
+// Test I: 第 5 轮核心回归 —— 带密分享完整链路：先 verify（pwd=h7bq）→ 成功（errno:0）
+//         → 随后 list 与 sharedownload 走通，返回带 dlink 的文件；verify 必须被调用 1 次。
+// ---------------------------------------------------------------------------
+test('resolveBaidu 带密分享：先 api/share/verify 成功再 list 返回 dlink', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u, opts: opts || {}, method: (opts && opts.method) || 'GET', body: (opts && opts.body) || '' });
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('api/share/verify')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0 }) };
+    }
+    if (u.includes('api/share/list')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ fs_id: 1, server_filename: 'a.txt', size: 10 }], timestamp: 123, sign: 's' }) };
+    }
+    if (u.includes('api/sharedownload')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }) };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+
+  const out = await resolveBaidu(USER_SHARE_URL, ''); // URL 自带 &pwd=h7bq
+  assert.equal(out.length, 1, '应解析出 1 个文件');
+  assert.equal(out[0].url, 'https://d.pcs.baidu.com/dl/a.txt');
+
+  const verifyCall = calls.find((c) => c.url.includes('api/share/verify'));
+  assert.ok(verifyCall, '带密分享必须先调用 api/share/verify');
+  assert.equal(verifyCall.method, 'POST', 'verify 必须是 POST');
+  assert.ok(verifyCall.body.includes('pwd=h7bq'), 'verify body 应携带提取码，实际: ' + verifyCall.body);
+  assert.ok(verifyCall.url.includes('shareid=55046620247'), 'verify URL 应带 shareid');
+  assert.ok(verifyCall.url.includes('uk=1099672802734'), 'verify URL 应带 uk');
+  const listCall = calls.find((c) => c.url.includes('api/share/list'));
+  assert.ok(listCall, 'verify 成功后必须继续调用 api/share/list');
+});
+
+// ---------------------------------------------------------------------------
+// Test J: 提取码错误 —— verify 返回 errno -9 → 清晰报错，且 list 不得被调用
+// ---------------------------------------------------------------------------
+test('resolveBaidu 提取码错误时 verify 返回 errno -9 并报错，不再调 list', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u });
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('api/share/verify')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: -9, errmsg: '提取码错误' }) };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+
+  let err;
+  await assert.rejects(() => resolveBaidu(USER_SHARE_URL, ''), (e) => { err = e; return true; });
+  assert.ok(err, '应当抛出错误');
+  assert.ok(err.message.includes('百度提取码错误'), '应报「百度提取码错误」，实际: ' + err.message);
+  assert.ok(err.message.includes('errno -9'), '诊断应带 errno -9，实际: ' + err.message);
+  assert.ok(err.message.includes('提取码错误'), '诊断应带 errmsg，实际: ' + err.message);
+  assert.ok(err.message.includes('pwd 已填(4位)'), '诊断应含 pwd 已填状态，实际: ' + err.message);
+  assert.ok(err.message.includes('uk=1099672802734'), '诊断应含所用 uk，实际: ' + err.message);
+  assert.ok(err.message.includes('shareid=55046620247'), '诊断应含所用 shareid，实际: ' + err.message);
+  // list 绝不被调用
+  const listCall = calls.find((c) => c.url.includes('api/share/list'));
+  assert.ok(!listCall, '提取码错误时不应继续调用 api/share/list');
+});
+
+// ---------------------------------------------------------------------------
+// Test K: 公开分享（无 pwd）→ 跳过 verify，直接 list；verify 不得被调用
+// ---------------------------------------------------------------------------
+test('resolveBaidu 公开分享（无 pwd）时跳过 verify 直接 list', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u });
+    if (u.includes('share/init')) {
+      return { url: u, ok: true, status: 200, text: async () => HTML_REALISTIC };
+    }
+    if (u.includes('api/share/list')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ fs_id: 1, server_filename: 'a.txt', size: 10 }], timestamp: 123, sign: 's' }) };
+    }
+    if (u.includes('api/sharedownload')) {
+      return { url: u, ok: true, status: 200, text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }) };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+
+  const out = await resolveBaidu('https://pan.baidu.com/s/1YuZkVISgaH_6xSLGxqoLfw', '');
+  assert.equal(out.length, 1, '公开分享应解析出 1 个文件');
+  const verifyCall = calls.find((c) => c.url.includes('api/share/verify'));
+  assert.ok(!verifyCall, '公开分享（无 pwd）不得调用 api/share/verify');
+  const listCall = calls.find((c) => c.url.includes('api/share/list'));
+  assert.ok(listCall, '公开分享应直接调用 api/share/list');
 });

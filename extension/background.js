@@ -660,6 +660,27 @@ async function resolveBaidu(url, pwd) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
   const pwdLabel = pwd ? ('pwd 已填(' + pwd.length + '位)') : 'pwd 缺失(空)';
+  // 百度带密分享：list 之前必须先 api/share/verify 换 BDCLND cookie，否则网关直接返回
+  // 404 HTML 页面（非 JSON 响应）。verify 成功会把 BDCLND 写入浏览器 cookie jar，
+  // 紧接着的 list 通过 credentials:'include' 自动带上该 cookie 走通。公开分享(pwd 空)跳过。
+  if (pwd) {
+    try {
+      const verify = await fetchJson('https://pan.baidu.com/api/share/verify?shareid=' + shareid + '&uk=' + uk, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+        body: 'pwd=' + encodeURIComponent(pwd),
+      });
+      const ven = (typeof verify.errno !== 'undefined') ? verify.errno : '';
+      const vem = verify.errmsg || verify.error_msg || '';
+      if (ven !== '' && Number(ven) !== 0) {
+        throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（pwd 已填(' + pwd.length + '位), uk=' + uk + ', shareid=' + shareid + '）');
+      }
+    } catch (e) {
+      if (/百度提取码错误/.test(e.message)) throw e;
+      throw new Error('百度 api/share/verify 失败（pwd 已填(' + pwd.length + '位), uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+    }
+  }
   let list;
   try {
     list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
