@@ -573,12 +573,9 @@ async function resolveAliyun(url, pwd) {
 
 // 从分享页 HTML 提取 window.yunData 完整对象字面量（手动括号匹配，兼容字符串内花括号）
 function extractYunData(html) {
-  const idx = html.indexOf('window.yunData');
-  if (idx < 0) return '';
-  const eq = html.indexOf('=', idx);
-  if (eq < 0) return '';
-  const i = html.indexOf('{', eq);
-  if (i < 0) return '';
+  const m = html.match(/window\.yunData\s*=\s*\{/);
+  if (!m) return '';
+  const i = m.index + m[0].length - 1; // 定位到 '{'
   let depth = 0;
   for (let j = i; j < html.length; j++) {
     const c = html[j];
@@ -596,7 +593,7 @@ function extractYunData(html) {
 // 从 yunData 文本里按 key 取数字值（兼容 "uk":123 与 uk:123 两种写法）
 function pickNum(blob, key) {
   // 兼容 key 带引号（"uk":123）与不带引号（uk:123）两种写法：key 与分隔符之间允许一个可选引号
-  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + '\\s*"?\\s*[:=]\\s*"?(\\d+)"?'));
+  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + '\\s*["\']?\\s*[:=]\\s*["\']?\\s*(\\d+)'));
   return m ? m[1] : '';
 }
 // 获取百度分享的 uk / shareid：优先页面 window.yunData，兜底 api/shareinfo
@@ -608,15 +605,25 @@ async function baiduResolveUkShareid(surl, pwd) {
       credentials: 'include', cache: 'no-store',
     });
     const yd = extractYunData(await res.text());
-    if (yd) { uk = pickNum(yd, 'uk'); shareid = pickNum(yd, 'shareid'); }
+    if (yd) {
+      // 分享所有者 uk 在 share_uk 字段（uk 是当前登录用户，未登录时为 '0'，不可用）；单/双引号都要兼容
+      uk = pickNum(yd, 'share_uk') || pickNum(yd, 'uk');
+      shareid = pickNum(yd, 'shareid');
+    }
+    // 百度对新短链会 302 规范化成 1 前缀的 canonical surl，api/shareinfo 必须用它否则 404
+    try {
+      const cs = new URL(res.url).searchParams.get('surl');
+      if (cs) surl = cs;
+    } catch (_) {}
   } catch (_) {}
-  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试）
+  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试），必须用规范化后的 canonical surl
   if (!uk || !shareid) {
     try {
       const url = 'https://pan.baidu.com/api/shareinfo?shorturl=' + encodeURIComponent(surl) + '&sub=1';
       let li = await fetchJson(url, {});
       let d = (li && li.data) || li || {};
-      uk = uk || String(d.uk || ''); shareid = shareid || String(d.shareid || '');
+      uk = uk || String(d.share_uk || d.uk || '');
+      shareid = shareid || String(d.shareid || '');
       if ((!uk || !shareid) && pwd) {
         li = await fetchJson(url, {
           method: 'POST',
@@ -624,7 +631,8 @@ async function baiduResolveUkShareid(surl, pwd) {
           body: 'pwd=' + encodeURIComponent(pwd),
         });
         d = (li && li.data) || li || {};
-        uk = uk || String(d.uk || ''); shareid = shareid || String(d.shareid || '');
+        uk = uk || String(d.share_uk || d.uk || '');
+        shareid = shareid || String(d.shareid || '');
       }
     } catch (_) {}
   }

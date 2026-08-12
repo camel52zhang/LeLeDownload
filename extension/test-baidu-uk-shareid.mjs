@@ -21,12 +21,9 @@ import assert from 'node:assert/strict';
 
 // 从分享页 HTML 提取 window.yunData 完整对象字面量（手动括号匹配，兼容字符串内花括号）
 function extractYunData(html) {
-  const idx = html.indexOf('window.yunData');
-  if (idx < 0) return '';
-  const eq = html.indexOf('=', idx);
-  if (eq < 0) return '';
-  const i = html.indexOf('{', eq);
-  if (i < 0) return '';
+  const m = html.match(/window\.yunData\s*=\s*\{/);
+  if (!m) return '';
+  const i = m.index + m[0].length - 1; // 定位到 '{'
   let depth = 0;
   for (let j = i; j < html.length; j++) {
     const c = html[j];
@@ -42,10 +39,10 @@ function extractYunData(html) {
   return '';
 }
 
-// 从 yunData 文本里按 key 取数字值（兼容 "uk":123 与 uk:123 两种写法）
+// 从 yunData 文本里按 key 取数字值（兼容 "uk":123 / uk:123 / uk:'0' / uk:"0" 各种写法）
 function pickNum(blob, key) {
-  // 兼容 key 带引号（"uk":123）与不带引号（uk:123）两种写法：key 与分隔符之间允许一个可选引号
-  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + '\\s*"?\\s*[:=]\\s*"?(\\d+)"?'));
+  // key 与分隔符之间、分隔符与值之间均允许一个可选引号（单或双），以兼容不同来源页面
+  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + '\\s*["\']?\\s*[:=]\\s*["\']?\\s*(\\d+)'));
   return m ? m[1] : '';
 }
 
@@ -65,15 +62,24 @@ async function baiduResolveUkShareid(surl, pwd) {
       credentials: 'include', cache: 'no-store',
     });
     const yd = extractYunData(await res.text());
-    if (yd) { uk = pickNum(yd, 'uk'); shareid = pickNum(yd, 'shareid'); }
+    if (yd) {
+      // 分享所有者 uk 在 share_uk 字段（uk 是当前登录用户，未登录时为 '0'，不可用）；单/双引号都要兼容
+      uk = pickNum(yd, 'share_uk') || pickNum(yd, 'uk');
+      shareid = pickNum(yd, 'shareid');
+    }
+    // 百度对新短链会 302 规范化成 1 前缀的 canonical surl，api/shareinfo 必须用它否则 404
+    try {
+      const cs = new URL(res.url).searchParams.get('surl');
+      if (cs) surl = cs;
+    } catch (_) {}
   } catch (_) {}
-  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试）
+  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试），必须用规范化后的 canonical surl
   if (!uk || !shareid) {
     try {
       const url = 'https://pan.baidu.com/api/shareinfo?shorturl=' + encodeURIComponent(surl) + '&sub=1';
       let li = await fetchJson(url, {});
       let d = (li && li.data) || li || {};
-      uk = uk || String(d.uk || ''); shareid = shareid || String(d.shareid || '');
+      uk = uk || String(d.share_uk || d.uk || ''); shareid = shareid || String(d.shareid || '');
       if ((!uk || !shareid) && pwd) {
         li = await fetchJson(url, {
           method: 'POST',
@@ -81,7 +87,7 @@ async function baiduResolveUkShareid(surl, pwd) {
           body: 'pwd=' + encodeURIComponent(pwd),
         });
         d = (li && li.data) || li || {};
-        uk = uk || String(d.uk || ''); shareid = shareid || String(d.shareid || '');
+        uk = uk || String(d.share_uk || d.uk || ''); shareid = shareid || String(d.shareid || '');
       }
     } catch (_) {}
   }
@@ -93,14 +99,15 @@ async function baiduResolveUkShareid(surl, pwd) {
 //   - share/init 返回给定的分享页 HTML
 //   - api/shareinfo 返回给定的 JSON（GET/POST 统一；如需区分可改用记录型 mock）
 // ---------------------------------------------------------------------------
-function makeFetchMock(initHtml, shareinfoJson) {
+function makeFetchMock(initHtml, shareinfoJson, initUrl) {
   return async (url) => {
     const u = String(url);
     if (u.includes('share/init')) {
-      return { text: async () => initHtml, ok: true };
+      // initUrl 用于模拟百度 302 后的最终 URL（surl 被规范化为 1 前缀）；缺省用请求 URL
+      return { url: initUrl || u, text: async () => initHtml, ok: true };
     }
     if (u.includes('api/shareinfo')) {
-      return { text: async () => JSON.stringify(shareinfoJson), ok: true };
+      return { url: u, text: async () => JSON.stringify(shareinfoJson), ok: true };
     }
     throw new Error('unexpected fetch url: ' + u);
   };
@@ -216,4 +223,61 @@ test('yunData 与 shareinfo 均无 uk/shareid 时返回空值', async () => {
   );
   const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', '');
   assert.deepStrictEqual(r, { uk: '', shareid: '' });
+});
+
+// ===========================================================================
+// 回归用例：真实百度分享页（单引号 uk + share_uk 字段）
+//   之前 pickNum 只认双引号，导致 uk:'0' 取不到 → 抛 errno -7；
+//   且分享所有者 uk 在 share_uk，而非当前用户的 uk。
+// ===========================================================================
+const HTML_REALISTIC = [
+  '<!doctype html><html><head>',
+  "<script>window.yunData={skinName:'white', neglect:1, bdstoken:'', uk:'0', loginstate:'0', share_uk:\"1099672802734\", shareid:\"55046620247\"};</script>",
+  '</head><body>分享页面</body></html>',
+].join('\n');
+
+test('pickNum 兼容单引号包裹的值（uk:\'0\' 返回 0，share_uk 返回真值）', () => {
+  const yd = extractYunData(HTML_REALISTIC);
+  assert.ok(yd.length > 0, '应抽出 yunData 字面量');
+  // 之前单引号值取不到，这里必须取到
+  assert.equal(pickNum(yd, 'uk'), '0', '单引号包裹的 uk 必须取到');
+  assert.equal(pickNum(yd, 'share_uk'), '1099672802734', 'share_uk 必须取到');
+  assert.equal(pickNum(yd, 'shareid'), '55046620247', 'shareid 必须取到');
+});
+
+test('真实分享页（单引号 + share_uk）策略 A 以 share_uk 作为 uk', async () => {
+  globalThis.fetch = makeFetchMock(
+    HTML_REALISTIC,
+    { errno: 0, data: { uk: 999, shareid: 888 } }, // 与 yunData 不一致，证明未被使用
+  );
+  const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', 'h7bq');
+  assert.deepStrictEqual(r, { uk: '1099672802734', shareid: '55046620247' });
+});
+
+// ===========================================================================
+// 回归用例：策略 B 必须用规范化后的 canonical surl（1 前缀）
+//   之前直接传 bare surl 调用 api/shareinfo 会 404；百度对 ?surl=bare 会 302 成 1 前缀。
+// ===========================================================================
+test('策略 B 使用 302 规范化后的 canonical surl（1 前缀）调用 api/shareinfo', async () => {
+  let shareinfoUrl = '';
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.includes('share/init')) {
+      // 模拟百度 302 重定向后的最终 URL：surl 被规范化为 1 前缀
+      return {
+        url: 'https://pan.baidu.com/share/init?surl=1YuZkVISgaH_6xSLGxqoLfw&from=init',
+        text: async () => '<html><body>请登录后查看</body></html>',
+        ok: true,
+      };
+    }
+    if (u.includes('api/shareinfo')) {
+      shareinfoUrl = u;
+      return { url: u, text: async () => JSON.stringify({ errno: 0, data: { uk: 1099672802734, shareid: 55046620247 } }), ok: true };
+    }
+    throw new Error('unexpected fetch url: ' + u);
+  };
+  const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', 'h7bq');
+  assert.deepStrictEqual(r, { uk: '1099672802734', shareid: '55046620247' });
+  assert.ok(shareinfoUrl.includes('shorturl=1YuZkVISgaH_6xSLGxqoLfw'), 'api/shareinfo 必须用 canonical surl，实际: ' + shareinfoUrl);
+  assert.ok(!shareinfoUrl.includes('shorturl=YuZkVISgaH_6xSLGxqoLfw'), 'api/shareinfo 不得用 bare surl，实际: ' + shareinfoUrl);
 });
