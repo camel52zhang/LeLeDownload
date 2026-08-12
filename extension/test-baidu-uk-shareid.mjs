@@ -61,7 +61,7 @@ async function fetchJson(url, opts) {
 
 // 获取百度分享的 uk / shareid：优先页面 window.yunData，兜底 api/shareinfo
 async function baiduResolveUkShareid(surl, pwd) {
-  let uk = '', shareid = '', sign = '', timestamp = '';
+  let uk = '', shareid = '', sign = '', timestamp = '', bdstoken = '';
   // 策略 A：分享页 window.yunData（百度已停用 share/linkinfo，返回 errno -7）
   try {
     const res = await fetch('https://pan.baidu.com/share/init?surl=' + encodeURIComponent(surl), {
@@ -75,6 +75,8 @@ async function baiduResolveUkShareid(surl, pwd) {
       // 百度 api/share/list 与 api/share/verify 必须带分享页 yunData 的 sign/timestamp 反爬令牌，否则网关 404
       sign = pickStr(yd, 'sign');
       timestamp = pickNum(yd, 'timestamp');
+      // bdstoken 由百度按 cookie 登录态签发（匿名页面为空），api/share/list 需要它
+      bdstoken = pickStr(yd, 'bdstoken');
     }
     // 百度对新短链会 302 规范化成 1 前缀的 canonical surl，api/shareinfo 必须用它否则 404
     try {
@@ -90,6 +92,7 @@ async function baiduResolveUkShareid(surl, pwd) {
       let d = (li && li.data) || li || {};
       uk = uk || String(d.share_uk || d.uk || ''); shareid = shareid || String(d.shareid || '');
       sign = sign || String(d.sign || ''); timestamp = timestamp || String(d.timestamp || '');
+      bdstoken = bdstoken || String(d.bdstoken || '');
       if ((!uk || !shareid) && pwd) {
         li = await fetchJson(url, {
           method: 'POST',
@@ -99,10 +102,11 @@ async function baiduResolveUkShareid(surl, pwd) {
         d = (li && li.data) || li || {};
         uk = uk || String(d.share_uk || d.uk || ''); shareid = shareid || String(d.shareid || '');
       sign = sign || String(d.sign || ''); timestamp = timestamp || String(d.timestamp || '');
+      bdstoken = bdstoken || String(d.bdstoken || '');
       }
     } catch (_) {}
   }
-  return { uk, shareid, sign, timestamp };
+  return { uk, shareid, sign, timestamp, bdstoken };
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +185,7 @@ test('baiduResolveUkShareid 优先采用分享页 yunData（策略 A）', async 
     { errno: 0, data: { uk: 111, shareid: 222 } }, // 与 yunData 不一致，用于证明未被使用
   );
   const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', 'h7bq');
-  assert.deepStrictEqual(r, { uk: '123456', shareid: '789012', sign: '', timestamp: '' });
+  assert.deepStrictEqual(r, { uk: '123456', shareid: '789012', sign: '', timestamp: '', bdstoken: '' });
 });
 
 // ---------------------------------------------------------------------------
@@ -193,7 +197,7 @@ test('baiduResolveUkShareid 页面无 yunData 时回退 api/shareinfo（策略 B
     { errno: 0, data: { uk: 123456, shareid: 789012 } },
   );
   const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', 'h7bq');
-  assert.deepStrictEqual(r, { uk: '123456', shareid: '789012', sign: '', timestamp: '' });
+  assert.deepStrictEqual(r, { uk: '123456', shareid: '789012', sign: '', timestamp: '', bdstoken: '' });
 });
 
 // ---------------------------------------------------------------------------
@@ -217,7 +221,7 @@ test('策略 B 带密分享：GET 无数据时用 POST+pwd 兜底成功', async 
     throw new Error('unexpected fetch url: ' + u);
   };
   const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', 'h7bq');
-  assert.deepStrictEqual(r, { uk: '123456', shareid: '789012', sign: '', timestamp: '' });
+  assert.deepStrictEqual(r, { uk: '123456', shareid: '789012', sign: '', timestamp: '', bdstoken: '' });
   // 应至少发起一次 POST 且 body 携带 pwd
   const post = calls.find((c) => c.method === 'POST');
   assert.ok(post, '应发起 api/shareinfo 的 POST 请求');
@@ -233,7 +237,7 @@ test('yunData 与 shareinfo 均无 uk/shareid 时返回空值', async () => {
     { errno: -1, data: {} },
   );
   const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', '');
-  assert.deepStrictEqual(r, { uk: '', shareid: '', sign: '', timestamp: '' });
+  assert.deepStrictEqual(r, { uk: '', shareid: '', sign: '', timestamp: '', bdstoken: '' });
 });
 
 // ===========================================================================
@@ -243,7 +247,7 @@ test('yunData 与 shareinfo 均无 uk/shareid 时返回空值', async () => {
 // ===========================================================================
 const HTML_REALISTIC = [
   '<!doctype html><html><head>',
-  "<script>window.yunData={skinName:'white', neglect:1, bdstoken:'', uk:'0', loginstate:'0', share_uk:\"1099672802734\", shareid:\"55046620247\", sign:'abc123signvalue', timestamp:1700000000};</script>",
+  "<script>window.yunData={skinName:'white', neglect:1, bdstoken:'0a12ed2b48a8b5283720da5a71613887', uk:'0', loginstate:'0', share_uk:\"1099672802734\", shareid:\"55046620247\", sign:'abc123signvalue', timestamp:1700000000};</script>",
   '</head><body>分享页面</body></html>',
 ].join('\n');
 
@@ -262,7 +266,7 @@ test('真实分享页（单引号 + share_uk）策略 A 以 share_uk 作为 uk',
     { errno: 0, data: { uk: 999, shareid: 888 } }, // 与 yunData 不一致，证明未被使用
   );
   const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', 'h7bq');
-  assert.deepStrictEqual(r, { uk: '1099672802734', shareid: '55046620247', sign: 'abc123signvalue', timestamp: '1700000000' });
+  assert.deepStrictEqual(r, { uk: '1099672802734', shareid: '55046620247', sign: 'abc123signvalue', timestamp: '1700000000', bdstoken: '0a12ed2b48a8b5283720da5a71613887' });
 });
 
 // ===========================================================================
@@ -288,7 +292,7 @@ test('策略 B 使用 302 规范化后的 canonical surl（1 前缀）调用 api
     throw new Error('unexpected fetch url: ' + u);
   };
   const r = await baiduResolveUkShareid('YuZkVISgaH_6xSLGxqoLfw', 'h7bq');
-  assert.deepStrictEqual(r, { uk: '1099672802734', shareid: '55046620247', sign: '', timestamp: '' });
+  assert.deepStrictEqual(r, { uk: '1099672802734', shareid: '55046620247', sign: '', timestamp: '', bdstoken: '' });
   assert.ok(shareinfoUrl.includes('shorturl=1YuZkVISgaH_6xSLGxqoLfw'), 'api/shareinfo 必须用 canonical surl，实际: ' + shareinfoUrl);
   assert.ok(!shareinfoUrl.includes('shorturl=YuZkVISgaH_6xSLGxqoLfw'), 'api/shareinfo 不得用 bare surl，实际: ' + shareinfoUrl);
 });
@@ -327,8 +331,40 @@ async function getCookieString(_url) {
   return mockCookie;
 }
 
+// ensureBaiduAuthHeaders 镜像 background.js：SW 跨域 fetch 带不上 SameSite=Lax 登录 cookie，
+// 百度当匿名 → list/verify 404。用 DNR 会话规则显式注入 Cookie/Referer 头。
+// 测试环境无 chrome → 静默降级；Test O 会注入 mock chrome 验证规则内容。
+let BAIDU_AUTH_RULE_ID = 5001;
+async function ensureBaiduAuthHeaders() {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.declarativeNetRequest ||
+        typeof chrome.declarativeNetRequest.updateSessionRules !== 'function') return;
+    const cookie = await getCookieString('https://pan.baidu.com');
+    if (!cookie) return;
+    const rules = [{
+      id: BAIDU_AUTH_RULE_ID,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [
+          { header: 'Cookie', operation: 'set', value: cookie },
+          { header: 'Referer', operation: 'set', value: 'https://pan.baidu.com/' },
+        ],
+      },
+      condition: {
+        urlFilter: '||pan.baidu.com/',
+        resourceTypes: ['xmlhttprequest'],
+      },
+    }];
+    await chrome.declarativeNetRequest.updateSessionRules({ addRules: rules, removeRuleIds: [BAIDU_AUTH_RULE_ID] });
+  } catch (_) { /* DNR 不可用/被拒时静默降级为匿名请求 */ }
+}
+
 // resolveBaidu 镜像 background.js（与 lines 643-683 一致）
 async function resolveBaidu(url, pwd) {
+  // 第 7 轮：SW 跨域 fetch 带不上 SameSite=Lax 登录 cookie → 百度当匿名 → list/verify 404。
+  // 先用 DNR 会话规则给 pan.baidu.com 请求显式注入 Cookie/Referer（需在页面抓取之前）。
+  await ensureBaiduAuthHeaders();
   const cookie = await getCookieString('https://pan.baidu.com');
   if (!/BDUSS=/.test(cookie)) throw new Error('未检测到百度网盘登录态(BDUSS)，请先在浏览器登录');
   const u = new URL(url);
@@ -341,7 +377,7 @@ async function resolveBaidu(url, pwd) {
   // 链接里可能直接带 &pwd= 提取码；优先用调用方传入的，其次从 URL 取
   pwd = (pwd || '').trim() || (u.searchParams.get('pwd') || '').trim() || '';
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  const { uk, shareid, sign: pageSign, timestamp: pageTs } = await baiduResolveUkShareid(surl, pwd);
+  const { uk, shareid, sign: pageSign, timestamp: pageTs, bdstoken: pageBd } = await baiduResolveUkShareid(surl, pwd);
   if (!uk || !shareid) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
@@ -351,11 +387,14 @@ async function resolveBaidu(url, pwd) {
     ? '&sign=' + encodeURIComponent(pageSign) + '&timestamp=' + encodeURIComponent(pageTs)
     : '';
   const signLabel = (pageSign && pageTs) ? ('sign 已填(' + pageSign.length + '位)') : 'sign/timestamp 缺失(空)';
+  // bdstoken 是 cookie 登录态签发的 CSRF 令牌（匿名页为空）；list 需要它，且它是「登录态是否注入成功」的诊断信号
+  const bdstTk = pageBd ? '&bdstoken=' + encodeURIComponent(pageBd) : '';
+  const bdstLabel = pageBd ? 'bdstoken 已填(' + pageBd.length + '位)' : 'bdstoken 缺失(空，登录态未注入)';
   // 百度带密分享：list 之前必须先 api/share/verify 换 BDCLND cookie，否则网关直接返回
   // 404 HTML 页面（非 JSON 响应）。公开分享(pwd 空)跳过。
   if (pwd) {
     try {
-      const verify = await fetchJson('https://pan.baidu.com/api/share/verify?shareid=' + shareid + '&uk=' + uk + signTs, {
+      const verify = await fetchJson('https://pan.baidu.com/api/share/verify?shareid=' + shareid + '&uk=' + uk + signTs + bdstTk, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
@@ -364,21 +403,21 @@ async function resolveBaidu(url, pwd) {
       const ven = (typeof verify.errno !== 'undefined') ? verify.errno : '';
       const vem = verify.errmsg || verify.error_msg || '';
       if (ven !== '' && Number(ven) !== 0) {
-        throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（' + pwdLabel + ', ' + signLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
+        throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
       }
     } catch (e) {
       if (/百度提取码错误/.test(e.message)) throw e;
-      throw new Error('百度 api/share/verify 失败（' + pwdLabel + ', ' + signLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+      throw new Error('百度 api/share/verify 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
     }
   }
   let list;
   try {
-    list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/' + signTs, {
+    list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/' + signTs + bdstTk, {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
   } catch (e) {
-    throw new Error('百度 api/share/list 失败（' + pwdLabel + ', ' + signLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+    throw new Error('百度 api/share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
   }
   const files = (list.list || []);
   if (!files.length) {
@@ -782,4 +821,54 @@ test('resolveBaidu 公开分享（无 pwd）时跳过 verify 直接 list', async
   assert.ok(!verifyCall, '公开分享（无 pwd）不得调用 api/share/verify');
   const listCall = calls.find((c) => c.url.includes('api/share/list'));
   assert.ok(listCall, '公开分享应直接调用 api/share/list');
+});
+
+// ---------------------------------------------------------------------------
+// Test N: 第 7 轮核心回归 —— 页面 bdstoken（cookie 登录态签发）必须拼进
+//         api/share/verify 与 api/share/list 的 query。缺 bdstoken = 匿名请求，
+//         百度网关对这两个端点直接返 [HTTP 404] 非 JSON（第 5/6 轮真实现象）。
+// ---------------------------------------------------------------------------
+test('resolveBaidu 把页面 bdstoken 拼进 verify 与 list 的 URL', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  const calls = installBaiduFlowFetchMock(); // HTML_REALISTIC 已含 bdstoken
+  const out = await resolveBaidu(USER_SHARE_URL, '');
+  assert.equal(out.length, 1, '应解析出 1 个文件');
+
+  const verifyCall = calls.find((c) => c.url.includes('api/share/verify'));
+  const listCall = calls.find((c) => c.url.includes('api/share/list'));
+  assert.ok(verifyCall && verifyCall.url.includes('bdstoken=0a12ed2b48a8b5283720da5a71613887'),
+    'verify URL 必须含页面 bdstoken，实际: ' + (verifyCall && verifyCall.url));
+  assert.ok(listCall && listCall.url.includes('bdstoken=0a12ed2b48a8b5283720da5a71613887'),
+    'list URL 必须含页面 bdstoken，实际: ' + (listCall && listCall.url));
+});
+
+// ---------------------------------------------------------------------------
+// Test O: 第 7 轮辅助函数 —— ensureBaiduAuthHeaders 必须通过 DNR 会话规则
+//         给 pan.baidu.com 请求注入含 BDUSS 的 Cookie 头 + Referer 头
+//         （MV3 fetch 无法手动设置这两个头，只能靠 DNR modifyHeaders）。
+// ---------------------------------------------------------------------------
+test('ensureBaiduAuthHeaders 通过 DNR 注入含 BDUSS 的 Cookie 与 Referer 头', async () => {
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
+  let captured = null;
+  globalThis.chrome = {
+    declarativeNetRequest: {
+      updateSessionRules: async (o) => { captured = o; },
+    },
+    runtime: {},
+  };
+  try {
+    await ensureBaiduAuthHeaders();
+    assert.ok(captured, '应调用 updateSessionRules 注入规则');
+    const rule = captured.addRules[0];
+    assert.ok(rule, '应添加一条 DNR 规则');
+    assert.equal(rule.action.type, 'modifyHeaders');
+    const cookieHdr = rule.action.requestHeaders.find((h) => h.header === 'Cookie');
+    assert.ok(cookieHdr, '规则必须设置 Cookie 请求头');
+    assert.ok(cookieHdr.value.includes('BDUSS=abc123deadbeef'), 'Cookie 头必须含 BDUSS，实际: ' + cookieHdr.value);
+    const ref = rule.action.requestHeaders.find((h) => h.header === 'Referer');
+    assert.ok(ref && ref.value === 'https://pan.baidu.com/', '规则必须设置 Referer=https://pan.baidu.com/');
+    assert.equal(rule.condition.urlFilter, '||pan.baidu.com/', '规则应匹配 pan.baidu.com');
+  } finally {
+    delete globalThis.chrome;
+  }
 });
