@@ -596,9 +596,14 @@ function pickNum(blob, key) {
   const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + '\\s*["\']?\\s*[:=]\\s*["\']?\\s*(\\d+)'));
   return m ? m[1] : '';
 }
+// 从 yunData 文本里按 key 取字符串值（兼容 "sign":"abc" 与 sign:'abc' 两种写法）
+function pickStr(blob, key) {
+  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + "\\s*[:=]\\s*[\"']([^\"']*)[\"']"));
+  return m ? m[1] : '';
+}
 // 获取百度分享的 uk / shareid：优先页面 window.yunData，兜底 api/shareinfo
 async function baiduResolveUkShareid(surl, pwd) {
-  let uk = '', shareid = '';
+  let uk = '', shareid = '', sign = '', timestamp = '';
   // 策略 A：分享页 window.yunData（百度已停用 share/linkinfo，返回 errno -7）
   try {
     const res = await fetch('https://pan.baidu.com/share/init?surl=' + encodeURIComponent(surl), {
@@ -609,6 +614,9 @@ async function baiduResolveUkShareid(surl, pwd) {
       // 分享所有者 uk 在 share_uk 字段（uk 是当前登录用户，未登录时为 '0'，不可用）；单/双引号都要兼容
       uk = pickNum(yd, 'share_uk') || pickNum(yd, 'uk');
       shareid = pickNum(yd, 'shareid');
+      // 百度 api/share/list 与 api/share/verify 必须带分享页 yunData 的 sign/timestamp 反爬令牌，否则网关 404
+      sign = pickStr(yd, 'sign');
+      timestamp = pickNum(yd, 'timestamp');
     }
     // 百度对新短链会 302 规范化成 1 前缀的 canonical surl，api/shareinfo 必须用它否则 404
     try {
@@ -624,6 +632,8 @@ async function baiduResolveUkShareid(surl, pwd) {
       let d = (li && li.data) || li || {};
       uk = uk || String(d.share_uk || d.uk || '');
       shareid = shareid || String(d.shareid || '');
+      sign = sign || String(d.sign || '');
+      timestamp = timestamp || String(d.timestamp || '');
       if ((!uk || !shareid) && pwd) {
         li = await fetchJson(url, {
           method: 'POST',
@@ -636,7 +646,7 @@ async function baiduResolveUkShareid(surl, pwd) {
       }
     } catch (_) {}
   }
-  return { uk, shareid };
+  return { uk, shareid, sign, timestamp };
 }
 
 // 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
@@ -655,17 +665,22 @@ async function resolveBaidu(url, pwd) {
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   // 同上：Cookie/UA/Referer 在 MV3 fetch 中会被丢弃，登录态靠 credentials:'include'。
   // 百度已停用 share/linkinfo（返回 errno -7），改为抓取分享页 window.yunData，并兼容 api/shareinfo 兜底。
-  const { uk, shareid } = await baiduResolveUkShareid(surl, pwd);
+  const { uk, shareid, sign: pageSign, timestamp: pageTs } = await baiduResolveUkShareid(surl, pwd);
   if (!uk || !shareid) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
   const pwdLabel = pwd ? ('pwd 已填(' + pwd.length + '位)') : 'pwd 缺失(空)';
+  // 百度 api/share/list 与 api/share/verify 必须带分享页 yunData 的 sign/timestamp 反爬令牌，缺则网关 404
+  const signTs = (pageSign && pageTs)
+    ? '&sign=' + encodeURIComponent(pageSign) + '&timestamp=' + encodeURIComponent(pageTs)
+    : '';
+  const signLabel = (pageSign && pageTs) ? ('sign 已填(' + pageSign.length + '位)') : 'sign/timestamp 缺失(空)';
   // 百度带密分享：list 之前必须先 api/share/verify 换 BDCLND cookie，否则网关直接返回
   // 404 HTML 页面（非 JSON 响应）。verify 成功会把 BDCLND 写入浏览器 cookie jar，
   // 紧接着的 list 通过 credentials:'include' 自动带上该 cookie 走通。公开分享(pwd 空)跳过。
   if (pwd) {
     try {
-      const verify = await fetchJson('https://pan.baidu.com/api/share/verify?shareid=' + shareid + '&uk=' + uk, {
+      const verify = await fetchJson('https://pan.baidu.com/api/share/verify?shareid=' + shareid + '&uk=' + uk + signTs, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
@@ -674,21 +689,21 @@ async function resolveBaidu(url, pwd) {
       const ven = (typeof verify.errno !== 'undefined') ? verify.errno : '';
       const vem = verify.errmsg || verify.error_msg || '';
       if (ven !== '' && Number(ven) !== 0) {
-        throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（pwd 已填(' + pwd.length + '位), uk=' + uk + ', shareid=' + shareid + '）');
+        throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（' + pwdLabel + ', ' + signLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
       }
     } catch (e) {
       if (/百度提取码错误/.test(e.message)) throw e;
-      throw new Error('百度 api/share/verify 失败（pwd 已填(' + pwd.length + '位), uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+      throw new Error('百度 api/share/verify 失败（' + pwdLabel + ', ' + signLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
     }
   }
   let list;
   try {
-    list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/', {
+    list = await fetchJson('https://pan.baidu.com/api/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0&pwd=' + encodeURIComponent(pwd || '') + '&dir=/' + signTs, {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
   } catch (e) {
-    throw new Error('百度 api/share/list 失败（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
+    throw new Error('百度 api/share/list 失败（' + pwdLabel + ', ' + signLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
   }
   const files = (list.list || []);
   if (!files.length) {
