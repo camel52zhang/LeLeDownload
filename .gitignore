@@ -49,3 +49,6 @@ src-tauri/LeLeDownload_1.0.0_x64-setup.exe
 
 # Keep the local cargo patch (build dependency) but ignore its build output
 vpatch/*/target/
+
+# 桌面端打包用的扩展副本由 build.mjs 从项目根 extension/ 自动同步生成，勿入库（避免陈旧副本）
+src-tauri/extension/
