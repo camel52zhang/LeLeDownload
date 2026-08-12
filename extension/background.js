@@ -753,9 +753,11 @@ async function resolveBaidu(url, pwd) {
   const sekeyLabel = sekey ? ('sekey 已填(' + sekey.length + '位)') : 'sekey 缺失(空)';
   let list;
   try {
-    // 有 sekey（带密分享已验证）时 list 不再传 pwd（sekey 即密码凭证，两者同传会触发参数错误 errno 2）
+    // 第 10 轮：/share/list 新端点严格校验参数，页面自身只传 web/uk/shareid/dir/is_from_web/sekey，
+    // 多余的 channel/clienttype/order/desc/showempty/bdstoken/sign 会触发 errno 2「啊哦，链接出错了」。
+    // 有 sekey（带密分享已验证）时不再传 pwd（sekey 即密码凭证，两者同传也触发参数错误）。
     const listPwdQ = sekey ? '' : ('&pwd=' + encodeURIComponent(pwd || ''));
-    list = await fetchJson('https://pan.baidu.com/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0' + listPwdQ + '&dir=/' + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey) + signTs + bdstTk, {
+    list = await fetchJson('https://pan.baidu.com/share/list?web=1&uk=' + uk + '&shareid=' + shareid + '&dir=/' + listPwdQ + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey), {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });

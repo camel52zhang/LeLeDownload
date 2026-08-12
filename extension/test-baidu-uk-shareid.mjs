@@ -429,9 +429,11 @@ async function resolveBaidu(url, pwd) {
   const sekeyLabel = sekey ? ('sekey 已填(' + sekey.length + '位)') : 'sekey 缺失(空)';
   let list;
   try {
-    // 有 sekey（带密分享已验证）时 list 不再传 pwd（sekey 即密码凭证，两者同传会触发参数错误 errno 2）
+    // 第 10 轮：/share/list 新端点严格校验参数，页面自身只传 web/uk/shareid/dir/is_from_web/sekey，
+    // 多余的 channel/clienttype/order/desc/showempty/bdstoken/sign 会触发 errno 2「啊哦，链接出错了」。
+    // 有 sekey（带密分享已验证）时不再传 pwd（sekey 即密码凭证，两者同传也触发参数错误）。
     const listPwdQ = sekey ? '' : ('&pwd=' + encodeURIComponent(pwd || ''));
-    list = await fetchJson('https://pan.baidu.com/share/list?channel=chunlei&clienttype=0&web=1&uk=' + uk + '&shareid=' + shareid + '&order=asc&desc=0&showempty=0' + listPwdQ + '&dir=/' + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey) + signTs + bdstTk, {
+    list = await fetchJson('https://pan.baidu.com/share/list?web=1&uk=' + uk + '&shareid=' + shareid + '&dir=/' + listPwdQ + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey), {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
@@ -732,11 +734,11 @@ test('resolveBaidu 带密分享：先 api/share/verify 成功再 list 返回 dli
   assert.ok(verifyCall.url.includes('uk=1099672802734'), 'verify URL 应带 uk');
   const listCall = calls.find((c) => c.url.includes('share/list'));
   assert.ok(listCall, 'verify 成功后必须继续调用 api/share/list');
-  // 第 6 轮回归：verify 与 list 的 URL 必须带分享页 yunData 的 sign/timestamp，否则百度网关 404
+  // 第 6 轮回归：verify URL 带 page sign/timestamp（verify 保留）；第 10 轮：list 极简化，不带 sign/timestamp
   assert.ok(verifyCall.url.includes('sign=abc123signvalue'), 'verify URL 必须带 page sign，实际: ' + verifyCall.url);
   assert.ok(verifyCall.url.includes('timestamp=1700000000'), 'verify URL 必须带 page timestamp，实际: ' + verifyCall.url);
-  assert.ok(listCall.url.includes('sign=abc123signvalue'), 'list URL 必须带 page sign，实际: ' + listCall.url);
-  assert.ok(listCall.url.includes('timestamp=1700000000'), 'list URL 必须带 page timestamp，实际: ' + listCall.url);
+  assert.ok(!listCall.url.includes('sign='), 'list URL 不得带 sign 参数（第 10 轮极简化，否则 errno 2），实际: ' + listCall.url);
+  assert.ok(!listCall.url.includes('timestamp='), 'list URL 不得带 timestamp 参数（第 10 轮极简化），实际: ' + listCall.url);
   // 第 8 轮回归：百度真实端点是 /share/verify 与 /share/list（无 /api/ 前缀，/api/share/* 不存在 → 404），
   // 且带密分享 list 必须带 verify 返回的 sekey（randsk）与 is_from_web=1
   assert.ok(!verifyCall.url.includes('/api/share/verify'), 'verify 端点不应带 /api/ 前缀，实际: ' + verifyCall.url);
@@ -748,11 +750,10 @@ test('resolveBaidu 带密分享：先 api/share/verify 成功再 list 返回 dli
 });
 
 // ---------------------------------------------------------------------------
-// Test L: 第 6 轮核心回归 —— 分享页 yunData 同时提供 sign/timestamp 时，
-//         resolveBaidu 必须把二者拼进 api/share/verify 与 api/share/list 的 query，
-//         否则百度网关对这两个端点返回 [HTTP 404] 非 JSON（本回合真实问题）。
+// Test L: 第 10 轮核心回归 —— /share/list 极简化：verify 可带 page sign/timestamp，
+//         但 list 只允许 web/uk/shareid/dir/is_from_web/sekey（多余参数触发 errno 2）。
 // ---------------------------------------------------------------------------
-test('resolveBaidu 把 page sign/timestamp 拼进 verify 与 list 的 URL', async () => {
+test('resolveBaidu 把 page sign/timestamp 拼进 verify 但 list 极简化不带多余参数', async () => {
   mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
   const calls = installBaiduFlowFetchMock(); // HTML_REALISTIC 已含 sign/timestamp
   const out = await resolveBaidu(USER_SHARE_URL, '');
@@ -762,8 +763,15 @@ test('resolveBaidu 把 page sign/timestamp 拼进 verify 与 list 的 URL', asyn
   const listCall = calls.find((c) => c.url.includes('share/list'));
   assert.ok(verifyCall && verifyCall.url.includes('sign=abc123signvalue') && verifyCall.url.includes('timestamp=1700000000'),
     'verify URL 必须含 page sign 与 timestamp，实际: ' + (verifyCall && verifyCall.url));
-  assert.ok(listCall && listCall.url.includes('sign=abc123signvalue') && listCall.url.includes('timestamp=1700000000'),
-    'list URL 必须含 page sign 与 timestamp，实际: ' + (listCall && listCall.url));
+  // list 极简化：不得带 sign/timestamp/channel/clienttype/order/showempty/bdstoken
+  assert.ok(listCall, '应发起 share/list');
+  assert.ok(!listCall.url.includes('sign=') && !listCall.url.includes('timestamp='),
+    'list URL 不得含 sign/timestamp（极简化），实际: ' + listCall.url);
+  assert.ok(!listCall.url.includes('channel=') && !listCall.url.includes('clienttype='),
+    'list URL 不得含 channel/clienttype（极简化），实际: ' + listCall.url);
+  assert.ok(!listCall.url.includes('order=') && !listCall.url.includes('showempty=') && !listCall.url.includes('desc='),
+    'list URL 不得含 order/showempty/desc（极简化），实际: ' + listCall.url);
+  assert.ok(!listCall.url.includes('bdstoken='), 'list URL 不得含 bdstoken（极简化），实际: ' + listCall.url);
 });
 
 // ---------------------------------------------------------------------------
@@ -864,7 +872,7 @@ test('resolveBaidu 公开分享（无 pwd）时跳过 verify 直接 list', async
 //         api/share/verify 与 api/share/list 的 query。缺 bdstoken = 匿名请求，
 //         百度网关对这两个端点直接返 [HTTP 404] 非 JSON（第 5/6 轮真实现象）。
 // ---------------------------------------------------------------------------
-test('resolveBaidu 把页面 bdstoken 拼进 verify 与 list 的 URL', async () => {
+test('resolveBaidu 把页面 bdstoken 拼进 verify 但 list 极简化不带 bdstoken', async () => {
   mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789';
   const calls = installBaiduFlowFetchMock(); // HTML_REALISTIC 已含 bdstoken
   const out = await resolveBaidu(USER_SHARE_URL, '');
@@ -874,8 +882,9 @@ test('resolveBaidu 把页面 bdstoken 拼进 verify 与 list 的 URL', async () 
   const listCall = calls.find((c) => c.url.includes('share/list'));
   assert.ok(verifyCall && verifyCall.url.includes('bdstoken=0a12ed2b48a8b5283720da5a71613887'),
     'verify URL 必须含页面 bdstoken，实际: ' + (verifyCall && verifyCall.url));
-  assert.ok(listCall && listCall.url.includes('bdstoken=0a12ed2b48a8b5283720da5a71613887'),
-    'list URL 必须含页面 bdstoken，实际: ' + (listCall && listCall.url));
+  // 第 10 轮：list 极简化，不得带 bdstoken（多余参数触发 errno 2）
+  assert.ok(listCall && !listCall.url.includes('bdstoken='),
+    'list URL 不得含 bdstoken（极简化），实际: ' + (listCall && listCall.url));
   // 第 8 轮回归：list 必须带 verify 返回的 sekey 与 is_from_web=1
   assert.ok(listCall && listCall.url.includes('sekey=SEKRAND123') && listCall.url.includes('is_from_web=1'),
     'list URL 必须含 sekey=SEKRAND123 与 is_from_web=1，实际: ' + (listCall && listCall.url));
