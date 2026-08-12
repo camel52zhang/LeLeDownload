@@ -575,9 +575,13 @@ async function resolveAliyun(url, pwd) {
 async function resolveBaidu(url, pwd) {
   const cookie = await getCookieString('https://pan.baidu.com');
   if (!/BDUSS=/.test(cookie)) throw new Error('未检测到百度网盘登录态(BDUSS)，请先在浏览器登录');
-  const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
-  const surl = m ? m[1] : '';
-  if (!surl) throw new Error('无法从链接提取 surl');
+  const u = new URL(url);
+  let surl = (u.searchParams.get('surl') || '').trim();
+  if (!surl) {
+    const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+    surl = m ? m[1] : '';
+  }
+  if (!surl) throw new Error('无法从链接提取 surl（请使用 pan.baidu.com 的分享链接）');
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   // 同上：Cookie/UA/Referer 在 MV3 fetch 中会被丢弃，登录态靠 credentials:'include'。
   const li = await fetchJson('https://pan.baidu.com/share/linkinfo?shareid=&uk=&surl=' + encodeURIComponent(surl), {});

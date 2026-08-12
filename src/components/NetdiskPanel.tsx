@@ -130,6 +130,7 @@ export function NetdiskPanel() {
         url: f.url,
         saveDir: undefined,
         headers: f.headers || null,
+        filename: f.name,
       })
       alert(`已加入下载：${f.name}`)
     } catch (e) {

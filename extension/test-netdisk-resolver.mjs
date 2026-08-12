@@ -37,6 +37,18 @@ function bytesToSize(n) {
   return n.toFixed(2) + ' ' + u[i];
 }
 
+// 从百度分享链接中提取 surl：优先取查询参数 surl（新短链 /share/init?surl=xxx），
+// 取不到再回退到路径 /s/<code>（旧长链 /s/1xxx）。与 background.js resolveBaidu 内联逻辑一致。
+function extractBaiduSurl(url) {
+  const u = new URL(url);
+  let surl = (u.searchParams.get('surl') || '').trim();
+  if (!surl) {
+    const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+    surl = m ? m[1] : '';
+  }
+  return surl;
+}
+
 // ---------------------------------------------------------------------------
 // detectNetdiskPlatform
 // ---------------------------------------------------------------------------
@@ -98,4 +110,44 @@ test('缺失或非法的 size 降级为空串，绝不渲染 NaN', () => {
 
 test('超过 TB 时封顶在 TB 单位，不会越界读到 undefined', () => {
   assert.equal(bytesToSize(Math.pow(1024, 5)), '1024.00 TB');
+});
+
+// ---------------------------------------------------------------------------
+// extractBaiduSurl（百度 surl 提取，回归测试）
+// ---------------------------------------------------------------------------
+test('百度新短链 ?surl= 优先被提取', () => {
+  assert.equal(
+    extractBaiduSurl('https://pan.baidu.com/share/init?surl=YuZkVISgaH_6xSLGxqoLfw&pwd=h7bq'),
+    'YuZkVISgaH_6xSLGxqoLfw',
+  );
+});
+
+test('百度旧长链 /s/<code> 仍能提取', () => {
+  assert.equal(
+    extractBaiduSurl('https://pan.baidu.com/s/1YuZkVISgaH_6xSLGxqoLfw'),
+    '1YuZkVISgaH_6xSLGxqoLfw',
+  );
+});
+
+test('两种格式同时存在时查询参数优先于路径', () => {
+  assert.equal(
+    extractBaiduSurl('https://pan.baidu.com/share/init?surl=SHORT&pwd=x/s/1OLDCODE'),
+    'SHORT',
+  );
+});
+
+test('既无查询参数也无路径段时返回空串（由 resolveBaidu 抛错）', () => {
+  assert.equal(extractBaiduSurl('https://pan.baidu.com/disk/home'), '');
+  assert.equal(extractBaiduSurl('https://pan.baidu.com/share/init?pwd=h7bq'), '');
+});
+
+test('yun.baidu.com 域名同样支持两种格式', () => {
+  assert.equal(
+    extractBaiduSurl('https://yun.baidu.com/share/init?surl=YuZkVISgaH_6xSLGxqoLfw'),
+    'YuZkVISgaH_6xSLGxqoLfw',
+  );
+  assert.equal(
+    extractBaiduSurl('https://yun.baidu.com/s/1YuZkVISgaH_6xSLGxqoLfw'),
+    '1YuZkVISgaH_6xSLGxqoLfw',
+  );
 });
