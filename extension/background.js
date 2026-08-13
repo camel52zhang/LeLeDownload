@@ -710,11 +710,51 @@ async function baiduGetSign(apiShorturl) {
 }
 
 // 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
-// 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
+// 提取码验证：先 /share/verify 拿到 randsk（即 BDCLND 令牌）并写入 cookie，
+// 否则 api/sharedownload 会返回 errno 9019 needverify。
+// 关键 MV3 坑：SW fetch 响应里的 Set-Cookie(BDCLND) 不会回写到 chrome.cookies 可见的 jar，
+// 导致后续靠 credentials:'include' 自然携带、或重新 getCookieString 都拿不到 BDCLND → 9019 死循环。
+// 因此 verify 后显式 chrome.cookies.set 把 BDCLND 桥接进 jar，再刷新 DNR 注入头一起带上。
+async function baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp) {
+  const signTs = (sign && timestamp)
+    ? '&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp)
+    : '';
+  try {
+    const v = await fetchJson('https://pan.baidu.com/share/verify?shareid=' + shareid + '&uk=' + uk + signTs + '&web=1', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+      body: 'pwd=' + encodeURIComponent(pwd || ''),
+    });
+    const ven = (v && typeof v.errno !== 'undefined') ? Number(v.errno) : '';
+    if (ven !== '' && ven !== 0) {
+      // verify 失败（如提取码错误）不在此抛错，交给 sharedownload 阶段给更清晰诊断
+      return '';
+    }
+    let randsk = (v && v.randsk) ? String(v.randsk) : '';
+    if (randsk) {
+      try { randsk = decodeURIComponent(randsk); } catch (_) { /* 已解码则原样使用 */ }
+      // 显式桥接进 cookie jar（MV3 SW 的 Set-Cookie 不回写 jar 的坑）
+      try {
+        if (typeof chrome !== 'undefined' && chrome.cookies && chrome.cookies.set) {
+          await new Promise((res) => {
+            chrome.cookies.set({ url: 'https://pan.baidu.com', name: 'BDCLND', value: randsk, path: '/', secure: true }, () => res());
+          });
+        }
+      } catch (_) { /* 写入失败则依赖 credentials:'include' 自然携带 */ }
+      // 刷新 DNR 注入头，使后续请求带上 BDCLND（与 BDUSS 一起）
+      await ensureBaiduAuthHeaders();
+    }
+    return randsk;
+  } catch (_) {
+    return '';
+  }
+}
+
 async function resolveBaidu(url, pwd) {
   // MV3 SW 跨域 fetch 带不上 SameSite=Lax 登录 cookie → 用 DNR 会话规则显式注入 Cookie/Referer
   await ensureBaiduAuthHeaders();
-  const cookie = await getCookieString('https://pan.baidu.com');
+  let cookie = await getCookieString('https://pan.baidu.com');
   const u = new URL(url);
   let surl = (u.searchParams.get('surl') || '').trim();
   let apiShorturl = '';
@@ -735,17 +775,26 @@ async function resolveBaidu(url, pwd) {
   pwd = (pwd || '').trim() || (u.searchParams.get('pwd') || '').trim() || '';
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+  const safeDecode = (s) => { try { return decodeURIComponent(s); } catch (_) { return s; } };
+
   // 1) 列表（wxlist）。/s/、/e/ 用 bare shorturl；?surl= 用 1 前缀
   const { list, uk, shareid, seckey } = await baiduWxList(apiShorturl, pwd);
   // seckey 是 URL 编码的，解码后作为 sekey 传 sharedownload（避免双重编码触发参数错误）
-  const sekey = seckey ? (() => { try { return decodeURIComponent(seckey); } catch (_) { return seckey; } })() : '';
+  const sekey = seckey ? safeDecode(seckey) : '';
 
   // 2) 令牌（tplconfig 取 sign/timestamp）
   const { sign, timestamp } = await baiduGetSign(apiShorturl);
 
+  // 3) 提取码验证：带密分享先 verify 设置 BDCLND cookie，避免 sharedownload 9019
+  if (pwd) {
+    await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
+    // 刷新回传给下载引擎的 cookie（含 BDCLND），供 Rust reqwest 取直链
+    cookie = await getCookieString('https://pan.baidu.com');
+  }
+
   const out = [];
   for (const f of list) {
-    // 3) 直链（sharedownload）
+    // 4) 直链（sharedownload）
     const extra = JSON.stringify({ sekey });
     const body = 'encrypt=0&extra=' + encodeURIComponent(extra) +
       '&fid_list=' + encodeURIComponent('[' + f.fs_id + ']') +
@@ -765,23 +814,20 @@ async function resolveBaidu(url, pwd) {
       throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
     }
     let en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
-    // errno 9019：需先 /share/verify 刷新登录态再重试一次
+    // errno 9019 needverify：verify 刷新 BDCLND 后再用 randsk 作 sekey 重试一次
     if (en === 9019) {
-      try {
-        await fetchJson('https://pan.baidu.com/share/verify?shareid=' + shareid + '&uk=' + uk + '&web=1', {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
-          body: 'pwd=' + encodeURIComponent(pwd || ''),
-        });
-      } catch (_) {}
-      await ensureBaiduAuthHeaders();
+      const randsk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
+      const retrySekey = randsk ? randsk : sekey;
+      const extra2 = JSON.stringify({ sekey: retrySekey });
+      const body2 = 'encrypt=0&extra=' + encodeURIComponent(extra2) +
+        '&fid_list=' + encodeURIComponent('[' + f.fs_id + ']') +
+        '&primaryid=' + shareid + '&uk=' + uk + '&product=share&type=nolimit';
       try {
         sd = await fetchJson(dlUrl, {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body,
+          body: body2,
         });
       } catch (e) {
         throw new Error('百度 api/sharedownload 重试失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
