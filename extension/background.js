@@ -636,175 +636,169 @@ function pickStr(blob, key) {
 //   pageUrl     —— 应抓取的分享页。/s/ 短链抓 https://pan.baidu.com/s/<surl>（新版页，yunData 含 share_uk/shareid，
 //                 但不含 sign/timestamp）；?surl= 旧链抓 https://pan.baidu.com/share/init?surl=（旧版页，yunData 含 sign/timestamp）。
 //   apiShorturl —— api/shareinfo 用的规范化 shorturl（/s/ 链即 surl 本身；?surl= 旧链需 1 前缀）。由调用方按链接类型算好传入。
-async function baiduResolveUkShareid(pageUrl, apiShorturl, pwd) {
-  let uk = '', shareid = '', sign = '', timestamp = '', bdstoken = '';
-  // 策略 A：分享页 window.yunData（百度已停用 share/linkinfo，返回 errno -7）
+// 列表：wxlist。返回 { list, uk, shareid, seckey }
+// 参考 baiduwp-php / 94list / tychxn / LinkSwift / kdown.moiu.cn：
+// 2024 年后的 /s/、/e/ 新短链不再走 /share/list + /share/verify + window.yunData，
+// 而是 wxlist（列表）+ tplconfig（sign/timestamp 令牌）+ sharedownload（直链）。
+// POST https://pan.baidu.com/share/wxlist?channel=weixin&version=2.2.2&clienttype=25&web=1
+// body: shorturl=<surl>&dir=&root=1&pwd=<pwd>&page=1&num=1000&order=time
+//   -> { errno:0, data:{ uk, shareid, seckey, list:[...] } }
+//   /s/、/e/ 用 bare shorturl（不加前缀）；?surl= 旧链用 '1'+CODE。
+// errno 语义：2 = 链接失效/不存在；-9/-10/-12 = 提取码错误。
+async function baiduWxList(apiShorturl, pwd) {
+  const body = 'shorturl=' + encodeURIComponent(apiShorturl) +
+    '&dir=&root=1&pwd=' + encodeURIComponent(pwd || '') +
+    '&page=1&num=1000&order=time';
+  let res;
   try {
-    const res = await fetch(pageUrl, {
-      credentials: 'include', cache: 'no-store',
+    res = await fetchJson('https://pan.baidu.com/share/wxlist?channel=weixin&version=2.2.2&clienttype=25&web=1', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest',
+        'User-Agent': 'netdisk',
+        'Referer': 'https://pan.baidu.com/disk/home',
+      },
+      body,
     });
-    const yd = extractYunData(await res.text());
-    if (yd) {
-      // 分享所有者 uk 在 share_uk 字段（uk 是当前登录用户，未登录时为 '0'，不可用）；单/双引号都要兼容
-      uk = pickNum(yd, 'share_uk') || pickNum(yd, 'uk');
-      shareid = pickNum(yd, 'shareid');
-      // 旧版 ?surl= 分享页 yunData 含 sign/timestamp 反爬令牌（/share/list、/share/verify 需要，缺则网关 404）；
-      // 新版 /s/ 分享页 yunData 已不含这两个字段，实测 verify 不带也能过、list 由 BDCLND cookie 判定，故缺失即不附加。
-      sign = pickStr(yd, 'sign');
-      timestamp = pickNum(yd, 'timestamp');
-      // bdstoken 由百度按 cookie 登录态签发（匿名页面为空），api/share/list 需要它
-      bdstoken = pickStr(yd, 'bdstoken');
-    }
-  } catch (_) {}
-  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试），用规范化后的 canonical shorturl
-  if (!uk || !shareid) {
-    try {
-      const url = 'https://pan.baidu.com/api/shareinfo?shorturl=' + encodeURIComponent(apiShorturl) + '&sub=1';
-      let li = await fetchJson(url, {});
-      let d = (li && li.data) || li || {};
-      uk = uk || String(d.share_uk || d.uk || '');
-      shareid = shareid || String(d.shareid || '');
-      sign = sign || String(d.sign || '');
-      timestamp = timestamp || String(d.timestamp || '');
-      bdstoken = bdstoken || String(d.bdstoken || '');
-      if ((!uk || !shareid) && pwd) {
-        li = await fetchJson(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'pwd=' + encodeURIComponent(pwd),
-        });
-        d = (li && li.data) || li || {};
-        uk = uk || String(d.share_uk || d.uk || '');
-        shareid = shareid || String(d.shareid || '');
-      }
-    } catch (_) {}
+  } catch (e) {
+    throw new Error('百度 wxlist 请求失败（shorturl=' + apiShorturl + '）：' + e.message);
   }
-  return { uk, shareid, sign, timestamp, bdstoken };
+  const en = (typeof res.errno !== 'undefined') ? Number(res.errno) : '';
+  const d = res.data || {};
+  if (en !== '' && en !== 0) {
+    if (en === 2) throw new Error('百度分享链接无效或已失效（errno 2）：' + apiShorturl);
+    if (en === -9 || en === -10 || en === -12) {
+      throw new Error('百度提取码错误（errno ' + en + (res.errmsg ? ': ' + res.errmsg : '') + '）（pwd=' + (pwd || '(空)') + ', shorturl=' + apiShorturl + '）');
+    }
+    throw new Error('百度 wxlist 失败（errno ' + en + (res.errmsg ? ': ' + res.errmsg : '') + '）（shorturl=' + apiShorturl + '）');
+  }
+  const list = (d.list || []);
+  const uk = String(d.uk || '');
+  const shareid = String(d.shareid || '');
+  // seckey 由百度返回（URL 编码形态），稍后 sharedownload 前 decodeURIComponent 再传
+  const seckey = (d.seckey != null) ? String(d.seckey) : '';
+  if (!uk || !shareid) {
+    throw new Error('百度 wxlist 未返回 uk/shareid（链接可能已失效或提取码不正确）：' + apiShorturl);
+  }
+  if (!list.length) {
+    throw new Error('百度分享内没有文件（errno ' + en + (res.errmsg ? ': ' + res.errmsg : '') + '）（shorturl=' + apiShorturl + '）');
+  }
+  return { list, uk, shareid, seckey };
+}
+
+// 令牌：tplconfig 取 sign/timestamp（sharedownload 反爬令牌）。
+// GET https://pan.baidu.com/share/tplconfig?fields=sign,timestamp&channel=chunlei&web=1&app_id=250528&clienttype=0&surl=<surl>
+//   -> data.sign / data.timestamp（页面 JS 也是从这里取，非本地盐值算法）。
+// 失败不致命，返回空让 sharedownload 阶段再报错。
+async function baiduGetSign(apiShorturl) {
+  let res;
+  try {
+    res = await fetchJson('https://pan.baidu.com/share/tplconfig?fields=sign,timestamp&channel=chunlei&web=1&app_id=250528&clienttype=0&surl=' + encodeURIComponent(apiShorturl), {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    });
+  } catch (_) {
+    return { sign: '', timestamp: '' };
+  }
+  const d = (res && res.data) || {};
+  return {
+    sign: d.sign != null ? String(d.sign) : '',
+    timestamp: d.timestamp != null ? String(d.timestamp) : '',
+  };
 }
 
 // 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
+// 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
 async function resolveBaidu(url, pwd) {
-  // 第 7 轮：SW 跨域 fetch 带不上 SameSite=Lax 登录 cookie → 百度当匿名 → list/verify 404。
-  // 先用 DNR 会话规则给 pan.baidu.com 请求显式注入 Cookie/Referer（需在页面抓取之前）。
+  // MV3 SW 跨域 fetch 带不上 SameSite=Lax 登录 cookie → 用 DNR 会话规则显式注入 Cookie/Referer
   await ensureBaiduAuthHeaders();
   const cookie = await getCookieString('https://pan.baidu.com');
-  if (!/BDUSS=/.test(cookie)) throw new Error('未检测到百度网盘登录态(BDUSS)，请先在浏览器登录');
   const u = new URL(url);
   let surl = (u.searchParams.get('surl') || '').trim();
-  let pageUrl = '', apiShorturl = '';
+  let apiShorturl = '';
   if (surl) {
-    // ?surl=xxx 或 /wap/init?surl=xxx 旧版短链：分享页用 share/init，api/shareinfo 需 1 前缀（参考 kdown.moiu.cn parser.js 规则）
-    pageUrl = 'https://pan.baidu.com/share/init?surl=' + encodeURIComponent(surl);
+    // ?surl=xxx 旧版短链：api 用 1 前缀（kdown.moiu.cn parser.js 规则）
     apiShorturl = '1' + surl;
   } else {
     const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
-    if (m) { surl = m[1]; pageUrl = 'https://pan.baidu.com/s/' + surl; apiShorturl = surl; }
+    if (m) { surl = m[1]; apiShorturl = surl; }
     else {
       // /e/ 企业分享：同 /s/ 处理（kdown 将 /e/ 规范化为 /s/）
       const m2 = url.match(/\/e\/([A-Za-z0-9_-]+)/);
-      if (m2) { surl = m2[1]; pageUrl = 'https://pan.baidu.com/s/' + surl; apiShorturl = surl; }
+      if (m2) { surl = m2[1]; apiShorturl = surl; }
     }
   }
   if (!surl) throw new Error('无法从链接提取 surl（请使用 pan.baidu.com 的分享链接）');
   // 链接里可能直接带 &pwd= 提取码；优先用调用方传入的，其次从 URL 取
   pwd = (pwd || '').trim() || (u.searchParams.get('pwd') || '').trim() || '';
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  // 同上：Cookie/UA/Referer 在 MV3 fetch 中会被丢弃，登录态靠 credentials:'include'。
-  // 百度已停用 share/linkinfo（返回 errno -7），改为抓取分享页 window.yunData，并兼容 api/shareinfo 兜底。
-  // 第 11 轮：/s/ 短链（如 /s/1ip_a56KjUknFNYLI22KVpA）之前错抓成 share/init?surl=（那是 ?surl= 旧链专属页），
-  // 导致 yunData 取不到、api/shareinfo 又返回 errno -7 → 卡在「获取 uk/shareid 失败」。
-  // 修复：按链接类型选对分享页（/s/ 抓 s/<surl>，?surl= 抓 share/init?surl=），二者 yunData 都能取到 uk/shareid。
-  const { uk, shareid, sign: pageSign, timestamp: pageTs, bdstoken: pageBd } = await baiduResolveUkShareid(pageUrl, apiShorturl, pwd);
-  if (!uk || !shareid) {
-    throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
-  }
-  const pwdLabel = pwd ? ('pwd 已填(' + pwd.length + '位)') : 'pwd 缺失(空)';
-  // 百度 api/share/list 与 api/share/verify 必须带分享页 yunData 的 sign/timestamp 反爬令牌，缺则网关 404
-  const signTs = (pageSign && pageTs)
-    ? '&sign=' + encodeURIComponent(pageSign) + '&timestamp=' + encodeURIComponent(pageTs)
-    : '';
-  const signLabel = (pageSign && pageTs) ? ('sign 已填(' + pageSign.length + '位)') : 'sign/timestamp 缺失(空)';
-  // bdstoken 是 cookie 登录态签发的 CSRF 令牌（匿名页为空）；list 需要它，且它是「登录态是否注入成功」的诊断信号
-  const bdstTk = pageBd ? '&bdstoken=' + encodeURIComponent(pageBd) : '';
-  const bdstLabel = pageBd ? 'bdstoken 已填(' + pageBd.length + '位)' : 'bdstoken 缺失(空，登录态未注入)';
-  // 第 8 轮：百度真实端点是 /share/verify 与 /share/list（无 /api/ 前缀，/api/share/* 路径不存在 → 404）。
-  // 带密分享流程：POST /share/verify 返回 {errno:0, randsk}，randsk 即 BDCLND/sekey 令牌，
-  // 必须作为 sekey 参数 + is_from_web=1 传给 /share/list。公开分享(pwd 空)跳过 verify，sekey 为空。
-  let sekey = '';
-  if (pwd) {
-    try {
-      const verify = await fetchJson('https://pan.baidu.com/share/verify?shareid=' + shareid + '&uk=' + uk + signTs + bdstTk, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
-        body: 'pwd=' + encodeURIComponent(pwd),
-      });
-      const ven = (typeof verify.errno !== 'undefined') ? verify.errno : '';
-      const vem = verify.errmsg || verify.error_msg || '';
-      if (ven !== '' && Number(ven) !== 0) {
-        throw new Error('百度提取码错误' + (vem ? '（errno ' + ven + ': ' + vem + '）' : '（errno ' + ven + '）') + '（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
-      }
-      // 第 9 轮：randsk 是 URL 编码的，页面 JS 用 decodeURIComponent 解码后作为 sekey 传 list，
-      // 我们须解码后由 encodeURIComponent 组装 URL（保持解码形态到达服务器），否则双重编码 → errno 2 参数错误。
-      sekey = (verify && verify.randsk) ? String(verify.randsk) : '';
-      if (sekey) { try { sekey = decodeURIComponent(sekey); } catch (_) {} }
-      else {
-        // 兜底：verify 成功时百度 Set-Cookie BDCLND=<randsk>，直接从 cookie 读
-        try {
-          const ck = await getCookieString('https://pan.baidu.com');
-          const m = ck.match(/BDCLND=([^;]+)/);
-          if (m) sekey = decodeURIComponent(m[1]);
-        } catch (_) {}
-      }
-      // verify 已 Set-Cookie BDCLND：刷新 DNR 注入头，让 list 请求也带上 BDCLND cookie
-      await ensureBaiduAuthHeaders();
-    } catch (e) {
-      if (/百度提取码错误/.test(e.message)) throw e;
-      throw new Error('百度 share/verify 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
-    }
-  }
-  const sekeyLabel = sekey ? ('sekey 已填(' + sekey.length + '位)') : 'sekey 缺失(空)';
-  let list;
-  try {
-    // 第 10 轮：/share/list 新端点严格校验参数，页面自身只传 web/uk/shareid/dir/is_from_web/sekey，
-    // 多余的 channel/clienttype/order/desc/showempty/bdstoken/sign 会触发 errno 2「啊哦，链接出错了」。
-    // 有 sekey（带密分享已验证）时不再传 pwd（sekey 即密码凭证，两者同传也触发参数错误）。
-    const listPwdQ = sekey ? '' : ('&pwd=' + encodeURIComponent(pwd || ''));
-    list = await fetchJson('https://pan.baidu.com/share/list?web=1&uk=' + uk + '&shareid=' + shareid + '&dir=/' + listPwdQ + '&is_from_web=' + (sekey ? '1' : '0') + '&sekey=' + encodeURIComponent(sekey), {
-      credentials: 'include',
-      headers: { 'X-Requested-With': 'XMLHttpRequest' },
-    });
-  } catch (e) {
-    throw new Error('百度 share/list 失败（' + pwdLabel + ', ' + signLabel + ', ' + bdstLabel + ', ' + sekeyLabel + ', uk=' + uk + ', shareid=' + shareid + '）：' + e.message);
-  }
-  const files = (list.list || []);
-  if (!files.length) {
-    const en = (typeof list.errno !== 'undefined') ? list.errno : '';
-    const em = list.show_msg || list.errmsg || list.error_msg || '';
-    throw new Error('百度分享内没有文件或密码错误' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', ' + sekeyLabel + ', uk=' + uk + ', shareid=' + shareid + '）');
-  }
+
+  // 1) 列表（wxlist）。/s/、/e/ 用 bare shorturl；?surl= 用 1 前缀
+  const { list, uk, shareid, seckey } = await baiduWxList(apiShorturl, pwd);
+  // seckey 是 URL 编码的，解码后作为 sekey 传 sharedownload（避免双重编码触发参数错误）
+  const sekey = seckey ? (() => { try { return decodeURIComponent(seckey); } catch (_) { return seckey; } })() : '';
+
+  // 2) 令牌（tplconfig 取 sign/timestamp）
+  const { sign, timestamp } = await baiduGetSign(apiShorturl);
+
   const out = [];
-  const ts = list.timestamp || Math.floor(Date.now() / 1000);
-  const sign = list.sign || '';
-  for (const f of files) {
+  for (const f of list) {
+    // 3) 直链（sharedownload）
+    const extra = JSON.stringify({ sekey });
+    const body = 'encrypt=0&extra=' + encodeURIComponent(extra) +
+      '&fid_list=' + encodeURIComponent('[' + f.fs_id + ']') +
+      '&primaryid=' + shareid + '&uk=' + uk + '&product=share&type=nolimit';
+    const dlUrl = 'https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=12' +
+      (sign ? '&sign=' + encodeURIComponent(sign) : '') +
+      (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '') + '&web=1';
     let sd;
     try {
-      sd = await fetchJson('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&web=1&sign=' + encodeURIComponent(sign) + '&timestamp=' + ts, {
+      sd = await fetchJson(dlUrl, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'encrypt=0&product=share&uk=' + uk + '&primaryid=' + shareid + '&fid_list=%5B' + f.fs_id + '%5D' + (pwd ? '&pwd=' + encodeURIComponent(pwd) : ''),
+        body,
       });
     } catch (e) {
-      throw new Error('百度 api/sharedownload 失败（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
+      throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
+    }
+    let en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
+    // errno 9019：需先 /share/verify 刷新登录态再重试一次
+    if (en === 9019) {
+      try {
+        await fetchJson('https://pan.baidu.com/share/verify?shareid=' + shareid + '&uk=' + uk + '&web=1', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+          body: 'pwd=' + encodeURIComponent(pwd || ''),
+        });
+      } catch (_) {}
+      await ensureBaiduAuthHeaders();
+      try {
+        sd = await fetchJson(dlUrl, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+        });
+      } catch (e) {
+        throw new Error('百度 api/sharedownload 重试失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
+      }
+      en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
     }
     const dlink = sd.list && sd.list[0] && sd.list[0].dlink;
     if (!dlink) {
-      const en = (typeof sd.errno !== 'undefined') ? sd.errno : '';
       const em = sd.errmsg || sd.error_msg || '';
-      throw new Error('百度未返回 dlink' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（' + pwdLabel + ', uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + JSON.stringify(sd).slice(0, 200));
+      throw new Error('百度未返回 dlink' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + JSON.stringify(sd).slice(0, 200));
     }
-    out.push({ name: f.server_filename, size: bytesToSize(f.size), url: dlink, headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie } });
+    out.push({
+      name: f.server_filename,
+      size: bytesToSize(f.size),
+      url: dlink,
+      headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie },
+    });
   }
   return out;
 }
