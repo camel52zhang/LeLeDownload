@@ -632,11 +632,15 @@ function pickStr(blob, key) {
   return m ? m[1] : '';
 }
 // 获取百度分享的 uk / shareid：优先页面 window.yunData，兜底 api/shareinfo
-async function baiduResolveUkShareid(surl, pwd) {
+// 形参：
+//   pageUrl     —— 应抓取的分享页。/s/ 短链抓 https://pan.baidu.com/s/<surl>（新版页，yunData 含 share_uk/shareid，
+//                 但不含 sign/timestamp）；?surl= 旧链抓 https://pan.baidu.com/share/init?surl=（旧版页，yunData 含 sign/timestamp）。
+//   apiShorturl —— api/shareinfo 用的规范化 shorturl（/s/ 链即 surl 本身；?surl= 旧链需 1 前缀）。由调用方按链接类型算好传入。
+async function baiduResolveUkShareid(pageUrl, apiShorturl, pwd) {
   let uk = '', shareid = '', sign = '', timestamp = '', bdstoken = '';
   // 策略 A：分享页 window.yunData（百度已停用 share/linkinfo，返回 errno -7）
   try {
-    const res = await fetch('https://pan.baidu.com/share/init?surl=' + encodeURIComponent(surl), {
+    const res = await fetch(pageUrl, {
       credentials: 'include', cache: 'no-store',
     });
     const yd = extractYunData(await res.text());
@@ -644,22 +648,18 @@ async function baiduResolveUkShareid(surl, pwd) {
       // 分享所有者 uk 在 share_uk 字段（uk 是当前登录用户，未登录时为 '0'，不可用）；单/双引号都要兼容
       uk = pickNum(yd, 'share_uk') || pickNum(yd, 'uk');
       shareid = pickNum(yd, 'shareid');
-      // 百度 api/share/list 与 api/share/verify 必须带分享页 yunData 的 sign/timestamp 反爬令牌，否则网关 404
+      // 旧版 ?surl= 分享页 yunData 含 sign/timestamp 反爬令牌（/share/list、/share/verify 需要，缺则网关 404）；
+      // 新版 /s/ 分享页 yunData 已不含这两个字段，实测 verify 不带也能过、list 由 BDCLND cookie 判定，故缺失即不附加。
       sign = pickStr(yd, 'sign');
       timestamp = pickNum(yd, 'timestamp');
       // bdstoken 由百度按 cookie 登录态签发（匿名页面为空），api/share/list 需要它
       bdstoken = pickStr(yd, 'bdstoken');
     }
-    // 百度对新短链会 302 规范化成 1 前缀的 canonical surl，api/shareinfo 必须用它否则 404
-    try {
-      const cs = new URL(res.url).searchParams.get('surl');
-      if (cs) surl = cs;
-    } catch (_) {}
   } catch (_) {}
-  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试），必须用规范化后的 canonical surl
+  // 策略 B：api/shareinfo 兜底（带密分享传 pwd 重试），用规范化后的 canonical shorturl
   if (!uk || !shareid) {
     try {
-      const url = 'https://pan.baidu.com/api/shareinfo?shorturl=' + encodeURIComponent(surl) + '&sub=1';
+      const url = 'https://pan.baidu.com/api/shareinfo?shorturl=' + encodeURIComponent(apiShorturl) + '&sub=1';
       let li = await fetchJson(url, {});
       let d = (li && li.data) || li || {};
       uk = uk || String(d.share_uk || d.uk || '');
@@ -691,9 +691,19 @@ async function resolveBaidu(url, pwd) {
   if (!/BDUSS=/.test(cookie)) throw new Error('未检测到百度网盘登录态(BDUSS)，请先在浏览器登录');
   const u = new URL(url);
   let surl = (u.searchParams.get('surl') || '').trim();
-  if (!surl) {
+  let pageUrl = '', apiShorturl = '';
+  if (surl) {
+    // ?surl=xxx 或 /wap/init?surl=xxx 旧版短链：分享页用 share/init，api/shareinfo 需 1 前缀（参考 kdown.moiu.cn parser.js 规则）
+    pageUrl = 'https://pan.baidu.com/share/init?surl=' + encodeURIComponent(surl);
+    apiShorturl = '1' + surl;
+  } else {
     const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
-    surl = m ? m[1] : '';
+    if (m) { surl = m[1]; pageUrl = 'https://pan.baidu.com/s/' + surl; apiShorturl = surl; }
+    else {
+      // /e/ 企业分享：同 /s/ 处理（kdown 将 /e/ 规范化为 /s/）
+      const m2 = url.match(/\/e\/([A-Za-z0-9_-]+)/);
+      if (m2) { surl = m2[1]; pageUrl = 'https://pan.baidu.com/s/' + surl; apiShorturl = surl; }
+    }
   }
   if (!surl) throw new Error('无法从链接提取 surl（请使用 pan.baidu.com 的分享链接）');
   // 链接里可能直接带 &pwd= 提取码；优先用调用方传入的，其次从 URL 取
@@ -701,7 +711,10 @@ async function resolveBaidu(url, pwd) {
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   // 同上：Cookie/UA/Referer 在 MV3 fetch 中会被丢弃，登录态靠 credentials:'include'。
   // 百度已停用 share/linkinfo（返回 errno -7），改为抓取分享页 window.yunData，并兼容 api/shareinfo 兜底。
-  const { uk, shareid, sign: pageSign, timestamp: pageTs, bdstoken: pageBd } = await baiduResolveUkShareid(surl, pwd);
+  // 第 11 轮：/s/ 短链（如 /s/1ip_a56KjUknFNYLI22KVpA）之前错抓成 share/init?surl=（那是 ?surl= 旧链专属页），
+  // 导致 yunData 取不到、api/shareinfo 又返回 errno -7 → 卡在「获取 uk/shareid 失败」。
+  // 修复：按链接类型选对分享页（/s/ 抓 s/<surl>，?surl= 抓 share/init?surl=），二者 yunData 都能取到 uk/shareid。
+  const { uk, shareid, sign: pageSign, timestamp: pageTs, bdstoken: pageBd } = await baiduResolveUkShareid(pageUrl, apiShorturl, pwd);
   if (!uk || !shareid) {
     throw new Error('百度获取 uk/shareid 失败（链接可能已失效或提取码不正确，errno -7）：' + surl);
   }
