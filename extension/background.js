@@ -657,7 +657,7 @@ async function baiduWxList(apiShorturl, pwd) {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'X-Requested-With': 'XMLHttpRequest',
-        'User-Agent': 'netdisk',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 7.1.1; MI 6 Build/NMF26X; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/57.0.2987.132 MQQBrowser/6.2 TBS/043807 Mobile Safari/537.36 MicroMessenger/6.6.1.1220(0x26060135) NetType/4G Language/zh_CN',
         'Referer': 'https://pan.baidu.com/disk/home',
       },
       body,
@@ -785,59 +785,69 @@ async function resolveBaidu(url, pwd) {
   // 2) 令牌（tplconfig 取 sign/timestamp）
   const { sign, timestamp } = await baiduGetSign(apiShorturl);
 
-  // 3) 提取码验证：带密分享先 verify 设置 BDCLND cookie，避免 sharedownload 9019
-  if (pwd) {
-    await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
-    // 刷新回传给下载引擎的 cookie（含 BDCLND），供 Rust reqwest 取直链
-    cookie = await getCookieString('https://pan.baidu.com');
-  }
-
+  // 直链（sharedownload）：严格对齐可工作的参考实现 netdisk-resolver
+  //   params: channel=chunlei&clienttype=0&app_id=250528&sign&timestamp&web=1
+  //   body:   encrypt=0&product=share&primaryid=<id>&shareid=<id>&uk=<uk>&fid_list=[fs_id](紧凑JSON)&extra={"sekey":<seckey>}
+  //   headers: Referer=share/link?shareid=<id>&uk=<uk> + X-Requested-With
+  // wxlist 返回的 seckey 即带密分享的验证令牌，无需先 /share/verify；
+  // 仅当返回 errno 9019 needverify 时才补 verify（取 BDCLND 桥接进 cookie jar）并用 randsk 重试。
   const out = [];
+  let triedVerify = false;
+  let lastRandsk = '';
   for (const f of list) {
-    // 4) 直链（sharedownload）
-    const extra = JSON.stringify({ sekey });
-    const body = 'encrypt=0&extra=' + encodeURIComponent(extra) +
-      '&fid_list=' + encodeURIComponent('[' + f.fs_id + ']') +
-      '&primaryid=' + shareid + '&uk=' + uk + '&product=share&type=nolimit';
-    const dlUrl = 'https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=12' +
-      (sign ? '&sign=' + encodeURIComponent(sign) : '') +
-      (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '') + '&web=1';
-    let sd;
-    try {
-      sd = await fetchJson(dlUrl, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body,
-      });
-    } catch (e) {
-      throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
-    }
-    let en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
-    // errno 9019 needverify：verify 刷新 BDCLND 后再用 randsk 作 sekey 重试一次
-    if (en === 9019) {
-      const randsk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
-      const retrySekey = randsk ? randsk : sekey;
-      const extra2 = JSON.stringify({ sekey: retrySekey });
-      const body2 = 'encrypt=0&extra=' + encodeURIComponent(extra2) +
-        '&fid_list=' + encodeURIComponent('[' + f.fs_id + ']') +
-        '&primaryid=' + shareid + '&uk=' + uk + '&product=share&type=nolimit';
+    let dlink = '';
+    let lastErr = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const curSekey = attempt === 0 ? sekey : (lastRandsk || sekey);
+      const extra = JSON.stringify({ sekey: curSekey });
+      const body = 'encrypt=0'
+        + '&product=share'
+        + '&primaryid=' + shareid
+        + '&shareid=' + shareid
+        + '&uk=' + uk
+        + '&fid_list=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
+        + (curSekey ? '&extra=' + encodeURIComponent(extra) : '');
+      const dlUrl = 'https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&app_id=250528'
+        + (sign ? '&sign=' + encodeURIComponent(sign) : '')
+        + (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '')
+        + '&web=1';
+      let sd;
       try {
         sd = await fetchJson(dlUrl, {
           method: 'POST',
           credentials: 'include',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: body2,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://pan.baidu.com/share/link?shareid=' + shareid + '&uk=' + uk,
+          },
+          body,
         });
       } catch (e) {
-        throw new Error('百度 api/sharedownload 重试失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
+        throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
       }
-      en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
+      const en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
+      if (en === 9019 && !triedVerify) {
+        // 补验证：/share/verify 取 randsk（即 BDCLND 令牌）桥接进 cookie jar 后重试
+        triedVerify = true;
+        const randsk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
+        if (randsk) {
+          lastRandsk = randsk;
+          // 验证后刷新 cookie（含 BDCLND），供本文件及下载引擎使用
+          const newCookie = await getCookieString('https://pan.baidu.com');
+          if (newCookie) cookie = newCookie;
+        }
+        continue; // 用 randsk 作 sekey 重试一次
+      }
+      const dl = sd.list && sd.list[0] && sd.list[0].dlink;
+      if (dl) { dlink = dl; break; }
+      lastErr = (typeof en !== 'undefined' && en !== '') ? ('errno ' + en + (sd.errmsg ? ': ' + sd.errmsg : '')) : '无 dlink';
+      if (en !== 9019) {
+        throw new Error('百度未返回 dlink（' + lastErr + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + JSON.stringify(sd).slice(0, 200));
+      }
     }
-    const dlink = sd.list && sd.list[0] && sd.list[0].dlink;
     if (!dlink) {
-      const em = sd.errmsg || sd.error_msg || '';
-      throw new Error('百度未返回 dlink' + (en !== '' ? '（errno ' + en + (em ? ': ' + em : '') + '）' : '') + '（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + JSON.stringify(sd).slice(0, 200));
+      throw new Error('百度未返回 dlink（' + (lastErr || '未知错误') + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）');
     }
     out.push({
       name: f.server_filename,
