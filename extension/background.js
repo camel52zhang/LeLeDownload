@@ -685,22 +685,100 @@ async function resolveQuark(url, pwd) {
 // 注意：share_token 是独立换取的，不会由 get_share_by_url 返回；提取码只在第 2 步生效。
 const ALI_CANARY = 'client=web,app=share,version=v2.3.1';
 
-async function resolveAliyun(url, pwd) {
-  // refresh_token 优先从站点 cookie 读，其次读扩展本地存储（用户手动配置）
-  let refreshToken = '';
-  for (const site of ['https://www.alipan.com', 'https://www.aliyundrive.com']) {
-    const ck = await getCookieString(site);
-    const m = (ck.match(/refresh_token=([^;]+)/) || [])[1];
-    if (m) { refreshToken = decodeURIComponent(m); break; }
+// 读取 alipan.com 登录态中的 refresh_token（页面上下文执行，注入 content-script）。
+// 必须 self-contained：只用 localStorage / JSON，不得引用 SW 作用域变量；
+// 整体 try/catch 永不 throw（executeScript 注入函数 throw 会被吞成 result:null，SW 无法区分错误）。
+function readAliyunToken() {
+  try {
+    const raw = localStorage.getItem('token');
+    if (!raw) {
+      return { ok: false, step: 'local-storage-empty', reason: '可能未登录 alipan.com' };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return { ok: false, step: 'json-parse', reason: String(e) };
+    }
+    const refreshToken = parsed.refresh_token != null ? parsed.refresh_token : parsed.refreshToken;
+    if (refreshToken == null || refreshToken === '') {
+      return { ok: false, step: 'field-missing', reason: 'token 中无 refresh_token' };
+    }
+    return { ok: true, value: String(refreshToken) };
+  } catch (err) {
+    return { ok: false, step: 'exception', reason: String(err) };
   }
-  if (!refreshToken) {
-    refreshToken = await new Promise((res) => {
-      try { chrome.storage.local.get(['aliyun_refresh_token'], (r) => res((r && r.aliyun_refresh_token) || '')); }
-      catch (_) { res(''); }
+}
+
+// 找一个已打开的 alipan.com / aliyundrive.com 标签页；没有则返回 null（由调用方临时开一个）
+async function getAliyunPageTab() {
+  try {
+    const tabs = await chrome.tabs.query({
+      url: [
+        'https://www.alipan.com/*',
+        'https://alipan.com/*',
+        'https://www.aliyundrive.com/*',
+        'https://aliyundrive.com/*',
+      ],
     });
+    return tabs && tabs.length ? tabs[0].id : null;
+  } catch (_) {
+    return null;
   }
+}
+
+// 协调获取阿里云盘 refresh_token：
+//   优先复用已打开的 alipan.com 标签页注入读取登录态；
+//   若无则临时开一个后台标签页，注入读取后立刻关闭（永不泄漏已打开的用户页面）；
+//   兜底读 chrome.storage.local.aliyun_refresh_token（用户手动配置）。
+// 本函数永不抛错，失败返回 ''。
+async function getAliyunRefreshToken() {
+  if (typeof chrome === 'undefined' || !chrome.tabs || !chrome.scripting) return '';
+  let tabId = null;
+  let tempTabId = null;
+  try {
+    tabId = await getAliyunPageTab();
+    if (tabId == null) {
+      const created = await chrome.tabs.create({ url: 'https://www.alipan.com/', active: false });
+      tempTabId = created;
+      tabId = created.id;
+      await waitTabComplete(created.id);
+    }
+    // 等 SPA 稳定，避免注入时页面仍在跳转导致执行上下文被销毁（表现为 result:null）
+    await new Promise((r) => setTimeout(r, 1200));
+    for (let i = 0; i < 2; i++) {
+      const inj = await chrome.scripting.executeScript({ target: { tabId }, func: readAliyunToken });
+      const r = inj && inj[0] && inj[0].result;
+      if (r && r.ok && r.value) {
+        return r.value;
+      }
+      console.log('[ali] readAliyunToken attempt', i, '=', JSON.stringify(r));
+    }
+  } catch (e) {
+    console.log('[ali] getAliyunRefreshToken error:', String((e && e.message) || e));
+  } finally {
+    if (tempTabId != null) {
+      try { await chrome.tabs.remove(tempTabId.id); } catch (_) {}
+    }
+  }
+  // 兜底：用户手动配置
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+      const stored = await new Promise((res) => {
+        try {
+          chrome.storage.local.get(['aliyun_refresh_token'], (rr) => res((rr && rr.aliyun_refresh_token) || ''));
+        } catch (_) { res(''); }
+      });
+      if (stored) return stored;
+    }
+  } catch (_) {}
+  return '';
+}
+
+async function resolveAliyun(url, pwd) {
+  const refreshToken = await getAliyunRefreshToken();
   if (!refreshToken) {
-    throw new Error('未检测到阿里云盘 refresh_token：请先在 alipan.com 登录；若仍失败，可在扩展存储手动配置 chrome.storage.local.set({aliyun_refresh_token:"..."})');
+    throw new Error('未检测到阿里云盘 refresh_token：请先在 alipan.com 登录（扩展会自动读取登录态）；若仍失败，可在扩展存储手动配置 chrome.storage.local.set({aliyun_refresh_token:"..."})');
   }
 
   const tokenResp = await fetchJson('https://auth.alipan.com/v2/account/token', {
