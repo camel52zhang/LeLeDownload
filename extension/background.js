@@ -474,28 +474,41 @@ async function resolvePan123(url, pwd) {
 // 把请求注入到 pan.quark.cn 标签页内执行：Origin 自动为 pan.quark.cn 且自动携带
 // 登录态 cookie，CORS 通过。（注意 fetchJson 是 SW 全局函数，content script 内不可用，
 // 故注入函数内一律用原生 fetch。）
-async function quarkApiFetch(pwdId, pwd) {
-  const headers = { 'Content-Type': 'application/json' };
+// cookie 由 SW 侧读取 pan.quark.cn 登录态后传入（含 httpOnly），页面 fetch 显式带 Cookie，
+// 确保 drive-pc.quark.cn 的 download 接口能拿到登录态（匿名 401 require login）。
+async function quarkApiFetch(pwdId, pwd, cookie) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Origin': 'https://pan.quark.cn',
+    'Referer': 'https://pan.quark.cn/',
+  };
+  if (cookie) headers['Cookie'] = cookie;
+  // 1) 取分享 stoken（匿名亦可，带提取码时传 passcode）
   const tokenResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc', {
     method: 'POST', headers, body: JSON.stringify({ pwd_id: pwdId, passcode: pwd || '', app_ver: '2.5.0' }),
   });
   const tokenJson = await tokenResp.json();
   const stoken = tokenJson.data && tokenJson.data.stoken;
-  if (!stoken) throw new Error('夸克获取 stoken 失败：' + JSON.stringify(tokenJson).slice(0, 200));
-  const detailResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc', {
-    method: 'POST', headers, body: JSON.stringify({ token: stoken, pdir_fid: '0', _page: '', _size: '50', _sort: '', _dir: 'asc' }),
-  });
+  if (!stoken) throw new Error('夸克获取 stoken 失败(' + tokenResp.status + ')：' + JSON.stringify(tokenJson).slice(0, 200));
+  // 2) 列文件：detail 为 GET，pwd_id + stoken 放 query（POST 会 405 Method Not Allowed）
+  const detailQs = '?pr=ucpro&fr=pc&pwd_id=' + encodeURIComponent(pwdId) + '&stoken=' + encodeURIComponent(stoken) + '&pdir_fid=0&_page=&_size=50&_sort=&_dir=asc';
+  const detailResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail' + detailQs, { method: 'GET', headers });
   const detailJson = await detailResp.json();
   const list = (detailJson.data && detailJson.data.list) || [];
-  if (!list.length) throw new Error('夸克分享内没有文件');
+  if (!list.length) throw new Error('夸克分享内没有文件(' + detailResp.status + ')：' + JSON.stringify(detailJson).slice(0, 200));
+  // 3) 逐文件换直链：download 为 POST，字段名是 fids（非 fid_list），并带 share_fid_token
   const out = [];
   for (const f of list) {
     const dlResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc', {
-      method: 'POST', headers, body: JSON.stringify({ fid_list: [f.fid], stoken: stoken, pdir_fid: '0' }),
+      method: 'POST', headers,
+      body: JSON.stringify({ fids: [f.fid], stoken: stoken, pdir_fid: '0', share_fid_token: f.share_fid_token }),
     });
     const dlJson = await dlResp.json();
-    const durl = dlJson.data && dlJson.data.download_url;
-    if (!durl) throw new Error('夸克未返回直链：' + JSON.stringify(dlJson).slice(0, 200));
+    const dl = dlJson.data || {};
+    let durl = dl.download_url;
+    if (!durl && dl.list && dl.list[0]) durl = dl.list[0].download_url;
+    if (!durl && Array.isArray(dl) && dl[0]) durl = dl[0].download_url;
+    if (!durl) throw new Error('夸克未返回直链(' + dlResp.status + ')：' + JSON.stringify(dlJson).slice(0, 200));
     out.push({ name: f.file_name, size: f.size, url: durl });
   }
   return out;
@@ -543,10 +556,11 @@ async function resolveQuark(url, pwd) {
     const res = await chrome.scripting.executeScript({
       target: { tabId },
       func: quarkApiFetch,
-      args: [pwdId, pwd || ''],
+      args: [pwdId, pwd || '', cookie],
     });
+    console.log('[quark] inject result=', JSON.stringify(res && res[0] && res[0].result).slice(0, 400));
     const files = (res && res[0] && res[0].result) || [];
-    if (!files.length) throw new Error('夸克解析返回空');
+    if (!files.length) throw new Error('夸克解析返回空(inject=' + JSON.stringify(res).slice(0, 200) + ')');
     return files.map((f) => ({
       name: f.name,
       size: bytesToSize(f.size),
