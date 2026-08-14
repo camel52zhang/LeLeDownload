@@ -480,43 +480,85 @@ async function resolvePan123(url, pwd) {
 // 关键：页面跨域 fetch drive-pc.quark.cn 必须带 credentials:'include' 才会发送夸克登录态
 // cookie（默认 same-origin 不跨域发 cookie，导致 download 401）。页面 fetch 无法手动设置
 // Cookie 头（forbidden），故依赖浏览器自动携带 + credentials:'include'。
+// 重要：夸克分享文件**不能直连 file/download**（会报 require login [share missing]），标准做法
+// 是先把分享转存(save)到自己的网盘，轮询 task 拿到新 fid，再用自有网盘的 {"fids":[newfid]}
+// 下载（QuarkPanTool / Alist 均如此实现，只需 cookie 无需 X-User-Token）。
 // 永远返回结构化对象 {ok, step, status, body, files}，绝不抛出（throw 会被吞成 result:null）。
 async function quarkApiFetch(pwdId, pwd) {
   const log = (...a) => console.log('[quark-inject]', ...a);
   const headers = { 'Content-Type': 'application/json', 'Referer': 'https://pan.quark.cn/' };
   const out = { ok: false };
+  const api = (path) => 'https://drive-pc.quark.cn/1/clouddrive' + path;
   try {
     log('token req pwdId=', pwdId, 'pwd=', pwd ? '***' : '(空)');
-    const tokenResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc', {
+    const tokenResp = await fetch(api('/share/sharepage/token?pr=ucpro&fr=pc'), {
       method: 'POST', headers, credentials: 'include',
       body: JSON.stringify({ pwd_id: pwdId, passcode: pwd || '', app_ver: '2.5.0' }),
     });
     const tokenJson = await tokenResp.json();
-    log('token', tokenResp.status, JSON.stringify(tokenJson).slice(0, 200));
     const stoken = tokenJson.data && tokenJson.data.stoken;
     if (!stoken) { out.step = 'token'; out.status = tokenResp.status; out.body = JSON.stringify(tokenJson).slice(0, 200); return out; }
-    // 2) 列文件：detail 为 GET，pwd_id + stoken 放 query（POST 会 405 Method Not Allowed）
-    const detailQs = '?pr=ucpro&fr=pc&pwd_id=' + encodeURIComponent(pwdId) + '&stoken=' + encodeURIComponent(stoken) + '&pdir_fid=0&_page=&_size=50&_sort=&_dir=asc';
-    const detailResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail' + detailQs, { method: 'GET', headers, credentials: 'include' });
-    const detailJson = await detailResp.json();
-    log('detail', detailResp.status, JSON.stringify(detailJson).slice(0, 300));
-    const list = (detailJson.data && detailJson.data.list) || [];
-    if (!list.length) { out.step = 'detail'; out.status = detailResp.status; out.body = JSON.stringify(detailJson).slice(0, 300); return out; }
-    // 3) 逐文件换直链：download 为 POST，字段名是 fids（非 fid_list），并带 share_fid_token
+    // 2) 递归列文件（含子目录）：detail 为 GET，pwd_id + stoken 放 query（POST 会 405）
+    const allFiles = [];
+    async function listDir(pdirFid) {
+      const detailQs = '?pr=ucpro&fr=pc&pwd_id=' + encodeURIComponent(pwdId) + '&stoken=' + encodeURIComponent(stoken) +
+        '&pdir_fid=' + encodeURIComponent(pdirFid) + '&_page=&_size=100&_sort=&_dir=asc';
+      const detailResp = await fetch(api('/share/sharepage/detail' + detailQs), { method: 'GET', headers, credentials: 'include' });
+      const detailJson = await detailResp.json();
+      const list = (detailJson.data && detailJson.data.list) || [];
+      for (const f of list) {
+        if (f.dir) await listDir(f.fid);
+        else allFiles.push(f);
+      }
+    }
+    await listDir('0');
+    if (!allFiles.length) { out.step = 'detail'; out.status = 200; out.body = '分享内没有文件'; return out; }
+    log('detail files=', allFiles.length);
+    // 3) 转存到自己的网盘（必须；直连 download 会 [share missing]）
+    const saveResp = await fetch(api('/share/sharepage/save?pr=ucpro&fr=pc'), {
+      method: 'POST', headers, credentials: 'include',
+      body: JSON.stringify({
+        fid_list: allFiles.map((f) => f.fid),
+        fid_token_list: allFiles.map((f) => f.share_fid_token || f.fid_token || ''),
+        pwd_id: pwdId, stoken: stoken, pdir_fid: '0', scene: 'link',
+      }),
+    });
+    const saveJson = await saveResp.json();
+    log('save', saveResp.status, JSON.stringify(saveJson).slice(0, 200));
+    if (saveJson.status !== 200 || !saveJson.data || !saveJson.data.task_id) {
+      out.step = 'save'; out.status = saveResp.status; out.body = JSON.stringify(saveJson).slice(0, 300); return out;
+    }
+    // 4) 轮询转存任务，收集新 fid（task_info_list 每项对应一个文件，含 fid）
+    let taskJson = null;
+    const newFids = [];
+    for (let i = 0; i < 40; i++) {
+      const taskResp = await fetch(api('/task?pr=ucpro&fr=pc&task_id=' + encodeURIComponent(saveJson.data.task_id) + '&retry_index=0'), { method: 'GET', headers, credentials: 'include' });
+      taskJson = await taskResp.json();
+      const til = (taskJson.data && taskJson.data.task_info_list) || [];
+      for (const ti of til) {
+        const nf = ti.fid || (ti.save_as && ti.save_as.fid) || (ti.file && ti.file.fid);
+        if (nf && newFids.indexOf(nf) < 0) newFids.push(nf);
+      }
+      if (newFids.length >= allFiles.length) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!newFids.length) { out.step = 'task'; out.status = (taskJson && taskJson.status) || 0; out.body = '转存任务未返回新fid：' + JSON.stringify(taskJson).slice(0, 300); return out; }
+    log('task newFids=', newFids.length);
+    // 5) 用新 fid 走自有网盘下载（只需 cookie）
     const files = [];
-    for (const f of list) {
-      const dlResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc', {
+    for (let i = 0; i < newFids.length; i++) {
+      const nf = newFids[i];
+      const src = allFiles[i] || {};
+      const dlResp = await fetch(api('/file/download?pr=ucpro&fr=pc'), {
         method: 'POST', headers, credentials: 'include',
-        body: JSON.stringify({ fids: [f.fid], stoken: stoken, pdir_fid: '0', share_fid_token: f.share_fid_token }),
+        body: JSON.stringify({ fids: [nf] }),
       });
       const dlJson = await dlResp.json();
       log('dl', dlResp.status, JSON.stringify(dlJson).slice(0, 200));
-      const dl = dlJson.data || {};
-      let durl = dl.download_url;
-      if (!durl && dl.list && dl.list[0]) durl = dl.list[0].download_url;
-      if (!durl && Array.isArray(dl) && dl[0]) durl = dl[0].download_url;
-      if (!durl) { out.step = 'download'; out.status = dlResp.status; out.body = JSON.stringify(dlJson).slice(0, 300); out.name = f.file_name; return out; }
-      files.push({ name: f.file_name, size: f.size, url: durl });
+      const arr = Array.isArray(dlJson.data) ? dlJson.data : [];
+      const durl = (arr[0] && arr[0].download_url) || '';
+      if (!durl) { out.step = 'download'; out.status = dlResp.status; out.body = JSON.stringify(dlJson).slice(0, 300); out.name = src.file_name; return out; }
+      files.push({ name: src.file_name || ('file_' + i), size: src.size || 0, url: durl });
     }
     out.ok = true; out.files = files;
     return out;
@@ -599,7 +641,8 @@ async function resolveQuark(url, pwd) {
     }
     if (!r || !r.ok) {
       const detail = r ? (r.error || r.body || '无详情') : (lastRes && lastRes.injectError ? ('inject失败:' + lastRes.injectError) : JSON.stringify(lastRes));
-      throw new Error('夸克解析失败(' + (r ? r.step : 'null-result') + ')：' + detail);
+      const loginHint = /login|未登录|请先登录/i.test(detail) ? '；请确认已在当前浏览器登录 pan.quark.cn 夸克网盘（扩展借用你的登录态转存并下载）' : '';
+      throw new Error('夸克解析失败(' + (r ? r.step : 'null-result') + ')：' + detail + loginHint);
     }
     const files = r.files || [];
     if (!files.length) throw new Error('夸克解析为空(分享内无文件)');
