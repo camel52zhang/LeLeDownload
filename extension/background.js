@@ -467,42 +467,95 @@ async function resolvePan123(url, pwd) {
   return out;
 }
 
-// 夸克网盘：drive-pc.quark.cn 分享 API（需 pan.quark.cn 登录态 cookie）
-async function resolveQuark(url, pwd) {
-  const cookie = await getCookieString('https://pan.quark.cn');
-  if (!cookie) throw new Error('未检测到夸克网盘登录态，请先在浏览器登录 pan.quark.cn');
-  const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
-  const pwdId = m ? m[1] : '';
-  if (!pwdId) throw new Error('无法从链接提取分享ID');
-  // 注意：不手动塞 Cookie 头（会被 MV3 丢弃），登录态由 credentials:'include' 自动携带；
-  // cookie 变量仅用于随直链回传给 App 下载引擎。
+// 夸克网盘：必须在 pan.quark.cn 页面上下文发请求。
+// drive-pc.quark.cn 的 CORS 仅放行 Origin=https://pan.quark.cn 的同源页面请求；
+// SW 里的跨域 fetch 其 Origin 固定为 chrome-extension://<id>，会被服务器
+// 返回 [HTTP 403] Invalid CORS request。因此走 chrome.scripting.executeScript，
+// 把请求注入到 pan.quark.cn 标签页内执行：Origin 自动为 pan.quark.cn 且自动携带
+// 登录态 cookie，CORS 通过。（注意 fetchJson 是 SW 全局函数，content script 内不可用，
+// 故注入函数内一律用原生 fetch。）
+async function quarkApiFetch(pwdId, pwd) {
   const headers = { 'Content-Type': 'application/json' };
-  const tokenResp = await fetchJson('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc', {
+  const tokenResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc', {
     method: 'POST', headers, body: JSON.stringify({ pwd_id: pwdId, passcode: pwd || '', app_ver: '2.5.0' }),
   });
-  const stoken = tokenResp.data && tokenResp.data.stoken;
-  if (!stoken) throw new Error('夸克获取 stoken 失败：' + JSON.stringify(tokenResp).slice(0, 200));
-  const detail = await fetchJson('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc', {
+  const tokenJson = await tokenResp.json();
+  const stoken = tokenJson.data && tokenJson.data.stoken;
+  if (!stoken) throw new Error('夸克获取 stoken 失败：' + JSON.stringify(tokenJson).slice(0, 200));
+  const detailResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc', {
     method: 'POST', headers, body: JSON.stringify({ token: stoken, pdir_fid: '0', _page: '', _size: '50', _sort: '', _dir: 'asc' }),
   });
-  const list = (detail.data && detail.data.list) || [];
+  const detailJson = await detailResp.json();
+  const list = (detailJson.data && detailJson.data.list) || [];
   if (!list.length) throw new Error('夸克分享内没有文件');
   const out = [];
   for (const f of list) {
-    const dl = await fetchJson('https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc', {
-      method: 'POST', headers, body: JSON.stringify({ fid: [f.fid], token: stoken, pdir_fid: '0' }),
+    const dlResp = await fetch('https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc', {
+      method: 'POST', headers, body: JSON.stringify({ fid_list: [f.fid], stoken: stoken, pdir_fid: '0' }),
     });
-    const durl = dl.data && dl.data.download_url;
-    if (!durl) throw new Error('夸克未返回直链');
-    // 夸克直链校验 Referer + 登录态，必须把 cookie 一并交给 App 下载引擎，否则 403。
-    out.push({
-      name: f.file_name,
-      size: bytesToSize(f.size),
-      url: durl,
-      headers: { Referer: 'https://pan.quark.cn/', 'User-Agent': navigator.userAgent, Cookie: cookie },
-    });
+    const dlJson = await dlResp.json();
+    const durl = dlJson.data && dlJson.data.download_url;
+    if (!durl) throw new Error('夸克未返回直链：' + JSON.stringify(dlJson).slice(0, 200));
+    out.push({ name: f.file_name, size: f.size, url: durl });
   }
   return out;
+}
+
+// 找一个已打开的 pan.quark.cn/s/* 标签页；没有则返回 null（由调用方临时开一个）
+async function getQuarkPageTab() {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://pan.quark.cn/s/*' });
+    if (tabs && tabs.length) return tabs[0].id;
+  } catch (_) {}
+  return null;
+}
+
+// 等待标签页加载完成（最多 ~10s）
+async function waitTabComplete(tabId) {
+  for (let i = 0; i < 40; i++) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t && t.status === 'complete') return;
+    } catch (_) { return; }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+// 夸克网盘：在 pan.quark.cn 页面上下文解析（见 quarkApiFetch 说明）
+async function resolveQuark(url, pwd) {
+  const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+  const pwdId = m ? m[1] : '';
+  if (!pwdId) throw new Error('无法从链接提取分享ID');
+  // 下载阶段需要 pan.quark.cn 登录态 cookie（含 httpOnly），由 SW 侧读取后回传给 App 下载引擎
+  const cookie = await getCookieString('https://pan.quark.cn');
+  if (!cookie) throw new Error('未检测到夸克网盘登录态，请先在浏览器登录 pan.quark.cn');
+  // 优先复用已打开的夸克分享页；没有则临时开一个后台标签页，解析完即关
+  const existing = await getQuarkPageTab();
+  let tabId = existing;
+  let tempTabId = null;
+  if (tabId == null) {
+    const tab = await chrome.tabs.create({ url: 'https://pan.quark.cn/s/' + pwdId, active: false });
+    tempTabId = tab.id;
+    await waitTabComplete(tempTabId);
+    tabId = tempTabId;
+  }
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: quarkApiFetch,
+      args: [pwdId, pwd || ''],
+    });
+    const files = (res && res[0] && res[0].result) || [];
+    if (!files.length) throw new Error('夸克解析返回空');
+    return files.map((f) => ({
+      name: f.name,
+      size: bytesToSize(f.size),
+      url: f.url,
+      headers: { Referer: 'https://pan.quark.cn/', 'User-Agent': navigator.userAgent, Cookie: cookie },
+    }));
+  } finally {
+    if (tempTabId != null) { try { await chrome.tabs.remove(tempTabId); } catch (_) {} }
+  }
 }
 
 // 阿里云盘（alipan.com，原 aliyundrive.com）
