@@ -481,8 +481,9 @@ async function resolvePan123(url, pwd) {
 // cookie（默认 same-origin 不跨域发 cookie，导致 download 401）。页面 fetch 无法手动设置
 // Cookie 头（forbidden），故依赖浏览器自动携带 + credentials:'include'。
 // 重要：夸克分享文件**不能直连 file/download**（会报 require login [share missing]），标准做法
-// 是先把分享转存(save)到自己的网盘，等转存完成(status==2)后，用**原始分享 fid**走自有网盘的
-// {"fids":[fid]}下载（夸克 fid 转存后保持不变，无需取新 fid；QuarkPanTool 即如此实现，只需 cookie）。
+// 是先把分享转存(save)到自己的网盘，等转存完成(status==2)后，从 task 响应的 data.save_as.save_as[]
+// 取**新 fid**，再用新 fid 走自有网盘的 {"fids":[新fid]}下载（转存会生成新 fid，原始分享 fid 在
+// 自有网盘里查不到 → "file not found"；只需 cookie 无需 X-User-Token）。
 // 永远返回结构化对象 {ok, step, status, body, files}，绝不抛出（throw 会被吞成 result:null）。
 async function quarkApiFetch(pwdId, pwd) {
   const log = (...a) => console.log('[quark-inject]', ...a);
@@ -528,14 +529,20 @@ async function quarkApiFetch(pwdId, pwd) {
     if (saveJson.status !== 200 || !saveJson.data || !saveJson.data.task_id) {
       out.step = 'save'; out.status = saveResp.status; out.body = JSON.stringify(saveJson).slice(0, 300); return out;
     }
-    // 4) 轮询转存任务，仅确认转存完成（status==2）。关键：夸克分享 fid 转存到自己网盘后
-    //    保持不变（全局文件 ID），无需从 task 取「新 fid」，下载时直接用原始分享 fid 即可。
+    // 4) 轮询转存任务，转存完成后从 data.save_as.save_as 取「新 fid」
+    //    （夸克转存会生成新 fid，藏在 task 响应的 save_as.save_as[] 里，不是 task_info_list）
     let taskJson = null;
+    let savedList = [];
     for (let i = 0; i < 40; i++) {
       const taskResp = await fetch(api('/task?pr=ucpro&fr=pc&task_id=' + encodeURIComponent(saveJson.data.task_id) + '&retry_index=0'), { method: 'GET', headers, credentials: 'include' });
       taskJson = await taskResp.json();
       const st = taskJson.data && taskJson.data.status;
-      if (st === 2) break;            // 2 = 转存完成
+      if (st === 2) {
+        const sa = (taskJson.data && taskJson.data.save_as) || {};
+        savedList = sa.save_as || [];                                   // 新 fid 列表
+        if (!savedList.length) savedList = (taskJson.data && taskJson.data.task_info_list) || []; // 兜底旧结构
+        break;
+      }
       if (st === 3) {                 // 3 = 转存失败
         out.step = 'task'; out.status = (taskJson && taskJson.status) || 0;
         out.body = '转存任务失败：' + JSON.stringify(taskJson && taskJson.data).slice(0, 300);
@@ -543,19 +550,24 @@ async function quarkApiFetch(pwdId, pwd) {
       }
       await new Promise((r) => setTimeout(r, 500));
     }
-    // 5) 用原始分享 fid 走自有网盘下载（转存后 fid 不变，仅需在「已转存」状态下下载）
+    // 5) 用新 fid 走自有网盘下载（新 fid 已属自己网盘，原始分享 fid 不存在于自有网盘）
     const files = [];
-    for (const f of allFiles) {
+    for (let i = 0; i < allFiles.length; i++) {
+      const src = allFiles[i];
+      // 优先按 file_name 配对（防顺序错位），否则按索引
+      let saved = savedList.find((s) => s.file_name === src.file_name) || savedList[i] || {};
+      const nf = saved.fid || saved.file_id || (saved.save_as && saved.save_as.fid);
+      if (!nf) { out.step = 'task'; out.status = (taskJson && taskJson.status) || 0; out.body = '转存任务未返回新fid：' + JSON.stringify(taskJson && taskJson.data).slice(0, 300); return out; }
       const dlResp = await fetch(api('/file/download?pr=ucpro&fr=pc'), {
         method: 'POST', headers, credentials: 'include',
-        body: JSON.stringify({ fids: [f.fid] }),
+        body: JSON.stringify({ fids: [nf] }),
       });
       const dlJson = await dlResp.json();
       log('dl', dlResp.status, JSON.stringify(dlJson).slice(0, 200));
       const arr = Array.isArray(dlJson.data) ? dlJson.data : [];
       const durl = (arr[0] && arr[0].download_url) || '';
-      if (!durl) { out.step = 'download'; out.status = dlResp.status; out.body = JSON.stringify(dlJson).slice(0, 300); out.name = f.file_name; return out; }
-      files.push({ name: f.file_name, size: f.size, url: durl });
+      if (!durl) { out.step = 'download'; out.status = dlResp.status; out.body = JSON.stringify(dlJson).slice(0, 300); out.name = src.file_name; return out; }
+      files.push({ name: saved.file_name || src.file_name, size: saved.size || src.size, url: durl });
     }
     out.ok = true; out.files = files;
     return out;
