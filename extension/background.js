@@ -417,7 +417,14 @@ async function fetchJson(url, opts) {
       Object.assign({ signal: controller.signal, cache: 'no-store', credentials: 'include' }, opts)
     );
     const text = await res.text();
-    try { return JSON.parse(text); } catch (_) { throw new Error('[HTTP ' + res.status + '] 非 JSON 响应: ' + text.slice(0, 300)); }
+    try { return JSON.parse(text); }
+    catch (_) {
+      // 把 endpoint + statusText 带进去，便于定位是哪个端点 / 是否 410 Gone（分享被撤回）
+      const st = (res.statusText || '').trim();
+      const tag = st ? ' [' + st + ']' : '';
+      const body = (text || '').slice(0, 300);
+      throw new Error('[HTTP ' + res.status + tag + '] ' + url + ' 非 JSON 响应: ' + body);
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -819,25 +826,61 @@ async function resolveAliyun(url, pwd) {
     'X-Canary': ALI_CANARY,
   };
 
-  // 列文件（分页 marker 直到取完；单次上限 200）
-  const items = [];
-  let marker = '';
-  do {
-    const body = {
-      share_id: shareId, parent_file_id: 'root', limit: 200,
-      order_by: 'name', order_direction: 'ASC',
-      image_thumbnail_process: '', image_url_process: '', video_thumbnail_process: '',
-    };
-    if (marker) body.marker = marker;
-    const flist = await fetchJson('https://api.alipan.com/adrive/v3/file/list', {
-      method: 'POST', headers: shareHeaders, body: JSON.stringify(body),
-    });
-    (flist.items || []).forEach((x) => items.push(x));
-    marker = flist.next_marker || '';
-  } while (marker && items.length < 1000);
+  // 列文件（分页 marker 直到取完；单次上限 200）—— 抽成 helper，供递归复用
+  async function listAliyunItems(parentFileId) {
+    const items = [];
+    let marker = '';
+    do {
+      const body = {
+        share_id: shareId, parent_file_id: parentFileId, limit: 200,
+        order_by: 'name', order_direction: 'ASC',
+        image_thumbnail_process: '', image_url_process: '', video_thumbnail_process: '',
+      };
+      if (marker) body.marker = marker;
+      const flist = await fetchJson('https://api.alipan.com/adrive/v3/file/list', {
+        method: 'POST', headers: shareHeaders, body: JSON.stringify(body),
+      });
+      (flist.items || []).forEach((x) => items.push(x));
+      marker = flist.next_marker || '';
+    } while (marker && items.length < 1000);
+    return items;
+  }
 
-  const files = items.filter((x) => x.type === 'file');
-  if (!files.length) throw new Error('阿里分享内没有可下载文件（仅含文件夹时暂不支持递归）');
+  // 递归展开子文件夹收集 file（参考百度 expandBaiduItems：MAX_DEPTH=5 防循环）
+  const files = [];
+  const ALIYUN_MAX_DEPTH = 5;
+  async function expandAliyunItems(parentFileId, dirPath, depth) {
+    if (depth >= ALIYUN_MAX_DEPTH) return;
+    const items = await listAliyunItems(parentFileId);
+    for (const it of items) {
+      if (it && it.type === 'folder') {
+        const subPath = (dirPath ? dirPath + '/' : '') + (it.name || '');
+        await expandAliyunItems(it.file_id, subPath, depth + 1);
+      } else if (it && it.type === 'file') {
+        files.push({
+          file_id: it.file_id,
+          size: it.size,
+          name: (dirPath ? dirPath + '/' : '') + (it.name || ''),
+        });
+      }
+    }
+  }
+  try {
+    await expandAliyunItems('root', '', 0);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    // 阿里对「API 侧无权访问的分享」常包成 410 Gone；根因多为 token 读取时机/账号不符
+    if (/\[HTTP ?410/.test(msg)) {
+      throw new Error('阿里 file/list 返回 410（Gone）：分享在 API 侧不可见。常见原因：\n'
+        + '① 解析时 alipan.com 标签页未登录/未打开 → 扩展读到的 access_token 无权访问该分享；\n'
+        + '② 该分享被设为「仅指定用户」等访问限制。\n'
+        + '建议：先打开 alipan.com 并登录、保持该标签页打开，再重新解析；若仍失败，换一个分享链接。\n'
+        + '原始错误：' + msg);
+    }
+    throw e;
+  }
+
+  if (!files.length) throw new Error('阿里分享内没有可下载文件');
 
   const out = [];
   for (const f of files) {

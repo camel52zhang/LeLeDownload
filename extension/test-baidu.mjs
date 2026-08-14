@@ -28,14 +28,19 @@ import assert from 'node:assert/strict';
 
 // ===== 以下实现镜像 extension/background.js（与 wxlist 新流程一致） =====
 
-// 统一的 JSON 请求封装（与 background.js fetchJson 一致：非 JSON 响应报错带 [HTTP 状态码]）
+// 统一的 JSON 请求封装（与 background.js fetchJson 一致：非 JSON 响应报错带 [HTTP 状态码] + statusText + URL）
 async function fetchJson(url, opts) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
     const res = await fetch(url, Object.assign({ signal: controller.signal, cache: 'no-store', credentials: 'include' }, opts));
     const text = await res.text();
-    try { return JSON.parse(text); } catch (_) { throw new Error('[HTTP ' + res.status + '] 非 JSON 响应: ' + text.slice(0, 300)); }
+    try { return JSON.parse(text); }
+    catch (_) {
+      const st = (res.statusText || '').trim();
+      const tag = st ? ' [' + st + ']' : '';
+      throw new Error('[HTTP ' + res.status + tag + '] ' + url + ' 非 JSON 响应: ' + (text || '').slice(0, 300));
+    }
   } finally {
     clearTimeout(timer);
   }

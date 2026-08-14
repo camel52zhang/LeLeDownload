@@ -28,14 +28,19 @@ import assert from 'node:assert/strict';
 
 // ===== 以下实现镜像 extension/background.js（与零配置自动读取当前实现一致） =====
 
-// 统一的 JSON 请求封装（与 background.js fetchJson 一致：非 JSON 响应报错带 [HTTP 状态码]）
+// 统一的 JSON 请求封装（与 background.js fetchJson 一致：非 JSON 响应报错带 [HTTP 状态码] + statusText + URL）
 async function fetchJson(url, opts) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
     const res = await fetch(url, Object.assign({ signal: controller.signal, cache: 'no-store', credentials: 'include' }, opts));
     const text = await res.text();
-    try { return JSON.parse(text); } catch (_) { throw new Error('[HTTP ' + res.status + '] 非 JSON 响应: ' + text.slice(0, 300)); }
+    try { return JSON.parse(text); }
+    catch (_) {
+      const st = (res.statusText || '').trim();
+      const tag = st ? ' [' + st + ']' : '';
+      throw new Error('[HTTP ' + res.status + tag + '] ' + url + ' 非 JSON 响应: ' + (text || '').slice(0, 300));
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -190,25 +195,61 @@ async function resolveAliyun(url, pwd) {
     'X-Canary': ALI_CANARY,
   };
 
-  // 列文件（分页 marker 直到取完；单次上限 200）
-  const items = [];
-  let marker = '';
-  do {
-    const body = {
-      share_id: shareId, parent_file_id: 'root', limit: 200,
-      order_by: 'name', order_direction: 'ASC',
-      image_thumbnail_process: '', image_url_process: '', video_thumbnail_process: '',
-    };
-    if (marker) body.marker = marker;
-    const flist = await fetchJson('https://api.alipan.com/adrive/v3/file/list', {
-      method: 'POST', headers: shareHeaders, body: JSON.stringify(body),
-    });
-    (flist.items || []).forEach((x) => items.push(x));
-    marker = flist.next_marker || '';
-  } while (marker && items.length < 1000);
+  // 列文件（分页 marker 直到取完；单次上限 200）—— 抽成 helper，供递归复用
+  async function listAliyunItems(parentFileId) {
+    const items = [];
+    let marker = '';
+    do {
+      const body = {
+        share_id: shareId, parent_file_id: parentFileId, limit: 200,
+        order_by: 'name', order_direction: 'ASC',
+        image_thumbnail_process: '', image_url_process: '', video_thumbnail_process: '',
+      };
+      if (marker) body.marker = marker;
+      const flist = await fetchJson('https://api.alipan.com/adrive/v3/file/list', {
+        method: 'POST', headers: shareHeaders, body: JSON.stringify(body),
+      });
+      (flist.items || []).forEach((x) => items.push(x));
+      marker = flist.next_marker || '';
+    } while (marker && items.length < 1000);
+    return items;
+  }
 
-  const files = items.filter((x) => x.type === 'file');
-  if (!files.length) throw new Error('阿里分享内没有可下载文件（仅含文件夹时暂不支持递归）');
+  // 递归展开子文件夹收集 file（参考百度 expandBaiduItems：MAX_DEPTH=5 防循环）
+  const files = [];
+  const ALIYUN_MAX_DEPTH = 5;
+  async function expandAliyunItems(parentFileId, dirPath, depth) {
+    if (depth >= ALIYUN_MAX_DEPTH) return;
+    const items = await listAliyunItems(parentFileId);
+    for (const it of items) {
+      if (it && it.type === 'folder') {
+        const subPath = (dirPath ? dirPath + '/' : '') + (it.name || '');
+        await expandAliyunItems(it.file_id, subPath, depth + 1);
+      } else if (it && it.type === 'file') {
+        files.push({
+          file_id: it.file_id,
+          size: it.size,
+          name: (dirPath ? dirPath + '/' : '') + (it.name || ''),
+        });
+      }
+    }
+  }
+  try {
+    await expandAliyunItems('root', '', 0);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    // 阿里对「API 侧无权访问的分享」常包成 410 Gone；根因多为 token 读取时机/账号不符
+    if (/\[HTTP ?410/.test(msg)) {
+      throw new Error('阿里 file/list 返回 410（Gone）：分享在 API 侧不可见。常见原因：\n'
+        + '① 解析时 alipan.com 标签页未登录/未打开 → 扩展读到的 access_token 无权访问该分享；\n'
+        + '② 该分享被设为「仅指定用户」等访问限制。\n'
+        + '建议：先打开 alipan.com 并登录、保持该标签页打开，再重新解析；若仍失败，换一个分享链接。\n'
+        + '原始错误：' + msg);
+    }
+    throw e;
+  }
+
+  if (!files.length) throw new Error('阿里分享内没有可下载文件');
 
   const out = [];
   for (const f of files) {
@@ -267,8 +308,9 @@ function makeAliChrome(overrides) {
 }
 
 // 默认 fetch 链：auth token / get_share_token / file/list / download_url 全返回正常
-function makeAliApiHandler({ accessToken, shareToken, items, downloadUrl, shareCode } = {}) {
-  return (u) => {
+// file/list 支持按 parent_file_id 分发（用于文件夹递归测试）：传 itemsByParent={root:[..], D1:[..]}
+function makeAliApiHandler({ accessToken, shareToken, items, itemsByParent, downloadUrl, shareCode } = {}) {
+  return (u, opts) => {
     const s = String(u);
     if (s.includes('auth.alipan.com/v2/account/token')) {
       return { text: async () => JSON.stringify({ access_token: accessToken || 'ATOK' }), ok: true };
@@ -278,7 +320,19 @@ function makeAliApiHandler({ accessToken, shareToken, items, downloadUrl, shareC
       return { text: async () => JSON.stringify({ share_token: shareToken || 'STOK' }), ok: true };
     }
     if (s.includes('adrive/v3/file/list')) {
-      return { text: async () => JSON.stringify({ items: items || [{ type: 'file', name: 'a.txt', size: 1024, file_id: 'F1' }] }), ok: true };
+      // 从 opts.body 取 parent_file_id，按它分发 items（递归关键）
+      let parentId = 'root';
+      try { parentId = (JSON.parse((opts && opts.body) || '{}').parent_file_id) || 'root'; } catch (_) {}
+      const defaults = { type: 'file', name: 'a.txt', size: 1024, file_id: 'F1' };
+      let itemsOut;
+      if (itemsByParent && Object.prototype.hasOwnProperty.call(itemsByParent, parentId)) {
+        itemsOut = itemsByParent[parentId];
+      } else if (itemsByParent) {
+        itemsOut = [];  // 显式给了 itemsByParent 但当前 parent 不在表中 → 返回空（模拟叶子空目录）
+      } else {
+        itemsOut = items || [defaults];
+      }
+      return { text: async () => JSON.stringify({ items: itemsOut }), ok: true };
     }
     if (s.includes('get_share_link_download_url')) {
       return { text: async () => JSON.stringify({ download_url: downloadUrl || 'https://dl.alipan.com/a.txt' }), ok: true };
@@ -440,21 +494,27 @@ test('resolveAliyun get_share_token 无 share_token 且无 SharePwd code → 抛
 });
 
 // ---------------------------------------------------------------------------
-// A8: file/list 返回仅文件夹（type!=='file'）→ 抛「没有可下载文件」
+// A8: file/list 根目录仅含文件夹，子文件夹也为空 → 递归后无 file → 抛「没有可下载文件」
 // ---------------------------------------------------------------------------
-test('resolveAliyun file/list 仅含文件夹 → 抛「没有可下载文件」', async () => {
+test('resolveAliyun 文件夹递归到叶子仍空 → 抛「没有可下载文件」', async () => {
   globalThis.chrome = makeAliChrome({
     executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
   });
-  globalThis.fetch = async (u) => {
-    const s = String(u);
-    if (s.includes('auth.alipan.com/v2/account/token')) return { text: async () => JSON.stringify({ access_token: 'ATOK' }), ok: true };
-    if (s.includes('share_link/get_share_token')) return { text: async () => JSON.stringify({ share_token: 'STOK' }), ok: true };
-    if (s.includes('adrive/v3/file/list')) return { text: async () => JSON.stringify({ items: [{ type: 'folder', name: 'sub', file_id: 'D1' }] }), ok: true };
-    throw new Error('unexpected ' + s);
-  };
+  const rec = makeRecorder();
+  rec._handler = makeAliApiHandler({
+    itemsByParent: {
+      root: [{ type: 'folder', name: 'sub', file_id: 'D1' }],
+      D1: [],  // 子目录空 → 递归到底也拿不到 file
+    },
+  });
+  globalThis.fetch = rec;
   try {
     await assert.rejects(() => resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', ''), /没有可下载文件/);
+    // 应至少发起两次 file/list：一次 root、一次 D1
+    const listCalls = rec.calls.filter((c) => c.url.includes('adrive/v3/file/list'));
+    assert.equal(listCalls.length, 2, '应递归到子文件夹再列一次 file/list，实际: ' + listCalls.length);
+    const secondBody = JSON.parse(listCalls[1].body);
+    assert.equal(secondBody.parent_file_id, 'D1', '第二次 file/list 应以 D1 为 parent_file_id');
   } finally {
     delete globalThis.chrome;
   }
@@ -552,5 +612,152 @@ test('readAliyunToken：兼容驼峰 refreshToken；localStorage 空/解析失�
     assert.equal(r.step, 'field-missing');
   } finally {
     delete globalThis.localStorage;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A13: 文件夹递归 — 根目录是 folder，子目录含 file → 应展开 file 并以父目录名为 name 前缀
+// ---------------------------------------------------------------------------
+test('resolveAliyun 文件夹递归：根 folder → 子 file 展开，name 带父目录前缀', async () => {
+  globalThis.chrome = makeAliChrome({
+    executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
+  });
+  const rec = makeRecorder();
+  rec._handler = makeAliApiHandler({
+    itemsByParent: {
+      root: [{ type: 'folder', name: 'sub', file_id: 'D1' }],
+      D1: [
+        { type: 'file', name: 'x.txt', size: 100, file_id: 'FX' },
+        { type: 'file', name: 'y.txt', size: 200, file_id: 'FY' },
+      ],
+    },
+  });
+  globalThis.fetch = rec;
+  try {
+    const out = await resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', '');
+    assert.equal(out.length, 2, '应展开 2 个子文件');
+    const names = out.map((x) => x.name).sort();
+    assert.deepEqual(names, ['sub/x.txt', 'sub/y.txt'], 'name 应带父目录前缀，实际: ' + JSON.stringify(names));
+    // 第二次 list 应以 D1 为 parent_file_id
+    const listCalls = rec.calls.filter((c) => c.url.includes('adrive/v3/file/list'));
+    assert.equal(listCalls.length, 2);
+    assert.equal(JSON.parse(listCalls[1].body).parent_file_id, 'D1');
+    // download_url 请求应携带 file_id（FX / FY）
+    const dlCalls = rec.calls.filter((c) => c.url.includes('get_share_link_download_url'));
+    assert.equal(dlCalls.length, 2);
+    const dlBodies = dlCalls.map((c) => JSON.parse(c.body).file_id).sort();
+    assert.deepEqual(dlBodies, ['FX', 'FY']);
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A14: 多层嵌套 A → B → file → name 累积父路径 'A/B/file.txt'
+// ---------------------------------------------------------------------------
+test('resolveAliyun 多层嵌套 A→B→file：name 累积父路径', async () => {
+  globalThis.chrome = makeAliChrome({
+    executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
+  });
+  const rec = makeRecorder();
+  rec._handler = makeAliApiHandler({
+    itemsByParent: {
+      root: [{ type: 'folder', name: 'A', file_id: 'DA' }],
+      DA: [{ type: 'folder', name: 'B', file_id: 'DB' }],
+      DB: [{ type: 'file', name: 'leaf.txt', size: 50, file_id: 'FL' }],
+    },
+  });
+  globalThis.fetch = rec;
+  try {
+    const out = await resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', '');
+    assert.equal(out.length, 1);
+    assert.equal(out[0].name, 'A/B/leaf.txt', '三层嵌套 name 应为 A/B/leaf.txt，实际: ' + out[0].name);
+    assert.equal(out[0].size, bytesToSize(50));
+    const listCalls = rec.calls.filter((c) => c.url.includes('adrive/v3/file/list'));
+    assert.equal(listCalls.length, 3, '应递归 3 次 file/list（root→DA→DB），实际: ' + listCalls.length);
+    const parentIds = listCalls.map((c) => JSON.parse(c.body).parent_file_id);
+    assert.deepEqual(parentIds, ['root', 'DA', 'DB']);
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A15: MAX_DEPTH=5 — 5 层以下递归正常截断（mock 第 6 层不会被请求）
+// ---------------------------------------------------------------------------
+test('resolveAliyun MAX_DEPTH=5：6 层嵌套第 6 层不再发起 file/list', async () => {
+  globalThis.chrome = makeAliChrome({
+    executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
+  });
+  const rec = makeRecorder();
+  // 6 层深的纯 folder（每层只有一个 folder）→ 递归到第 5 层（depth=4）后 depth+1=5 → 不再展开
+  rec._handler = makeAliApiHandler({
+    itemsByParent: {
+      root: [{ type: 'folder', name: 'L1', file_id: 'L1' }],
+      L1: [{ type: 'folder', name: 'L2', file_id: 'L2' }],
+      L2: [{ type: 'folder', name: 'L3', file_id: 'L3' }],
+      L3: [{ type: 'folder', name: 'L4', file_id: 'L4' }],
+      L4: [{ type: 'folder', name: 'L5', file_id: 'L5' }],
+      // 故意不给 L5：若误调，handler 走 fallback 返回默认 file（应不会发生）
+    },
+  });
+  globalThis.fetch = rec;
+  try {
+    await assert.rejects(() => resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', ''), /没有可下载文件/);
+    const listCalls = rec.calls.filter((c) => c.url.includes('adrive/v3/file/list'));
+    assert.equal(listCalls.length, 5, 'MAX_DEPTH=5 应止步 5 次 file/list（L1..L5），实际: ' + listCalls.length);
+    const parentIds = listCalls.map((c) => JSON.parse(c.body).parent_file_id);
+    assert.deepEqual(parentIds, ['root', 'L1', 'L2', 'L3', 'L4']);
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A16: fetchJson 410 Gone 错误文案带 statusText + URL（诊断加固：便于区分是哪个端点撤回）
+// ---------------------------------------------------------------------------
+test('fetchJson 410 Gone：抛错含 [Gone]、endpoint URL 与 body 片段', async () => {
+  // 单独验证 fetchJson 文案，不走 resolveAliyun
+  globalThis.fetch = async () => ({
+    status: 410,
+    statusText: 'Gone',
+    text: async () => '',  // 空 body 是阿里 API 410 的典型表现
+  });
+  try {
+    await assert.rejects(
+      () => fetchJson('https://api.alipan.com/adrive/v3/file/list', { method: 'POST', body: '{}' }),
+      (err) => {
+        const msg = String(err.message);
+        return /\[HTTP 410/.test(msg)
+          && /\[Gone\]/.test(msg)
+          && msg.includes('api.alipan.com/adrive/v3/file/list');
+      }
+    );
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A17: file/list 返回 410 Gone → resolveAliyun 改写为带「确认登录态/换链接」指引的错误
+// ---------------------------------------------------------------------------
+test('resolveAliyun file/list 返回 410 → 抛错含访问限制指引（而非裸 Gone）', async () => {
+  globalThis.chrome = makeAliChrome({
+    executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
+  });
+  globalThis.fetch = async (u) => {
+    const s = String(u);
+    if (s.includes('auth.alipan.com/v2/account/token')) return { text: async () => JSON.stringify({ access_token: 'ATOK' }), ok: true };
+    if (s.includes('share_link/get_share_token')) return { text: async () => JSON.stringify({ share_token: 'STOK' }), ok: true };
+    if (s.includes('adrive/v3/file/list')) return { status: 410, statusText: 'Gone', text: async () => '' };
+    throw new Error('unexpected ' + s);
+  };
+  try {
+    await assert.rejects(() => resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', ''), (err) => {
+      const msg = String(err.message);
+      return /file\/list 返回 410/.test(msg) && /alipan\.com 标签页/.test(msg) && /换一个分享链接/.test(msg);
+    });
+  } finally {
+    delete globalThis.chrome;
   }
 });
