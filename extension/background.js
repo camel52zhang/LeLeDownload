@@ -576,7 +576,14 @@ async function quarkApiFetch(pwdId, pwd) {
       log('dl', dlResp.status, JSON.stringify(dlJson).slice(0, 200));
       const arr = Array.isArray(dlJson.data) ? dlJson.data : [];
       const durl = (arr[0] && arr[0].download_url) || '';
-      if (!durl) { out.step = 'download'; out.status = dlResp.status; out.body = JSON.stringify(dlJson).slice(0, 300); out.name = src.file_name; return out; }
+      if (!durl) {
+        out.ok = false; // 显式置 false（防御性：未来 out 初始化若改为 true，这里仍安全）
+        out.step = 'download';
+        out.status = dlResp.status;
+        out.body = JSON.stringify(dlJson).slice(0, 300);
+        out.name = src.file_name;
+        return out;
+      }
       files.push({ name: saved.file_name || src.file_name, size: saved.size || src.size, url: durl });
     }
     out.ok = true; out.files = files;
@@ -894,9 +901,13 @@ function pickStr(blob, key) {
 //   -> { errno:0, data:{ uk, shareid, seckey, list:[...] } }
 //   /s/、/e/ 用 bare shorturl（不加前缀）；?surl= 旧链用 '1'+CODE。
 // errno 语义：2 = 链接失效/不存在；-9/-10/-12 = 提取码错误。
-async function baiduWxList(apiShorturl, pwd) {
+async function baiduWxList(apiShorturl, pwd, dirPath) {
+  // dirPath：百度 wxlist 的 dir 参数（绝对路径形式，如 "/book"），用于递归进文件夹；
+  // 不传或空 = 根目录（root=1）。递归深度由调用方控制。
   const body = 'shorturl=' + encodeURIComponent(apiShorturl) +
-    '&dir=&root=1&pwd=' + encodeURIComponent(pwd || '') +
+    (dirPath ? '&dir=' + encodeURIComponent(dirPath) : '&dir=') +
+    (dirPath ? '&root=0' : '&root=1') +
+    '&pwd=' + encodeURIComponent(pwd || '') +
     '&page=1&num=1000&order=time';
   let res;
   try {
@@ -1027,9 +1038,12 @@ async function resolveBaidu(url, pwd) {
   const safeDecode = (s) => { try { return decodeURIComponent(s); } catch (_) { return s; } };
 
   // 1) 列表（wxlist）。/s/、/e/ 用 bare shorturl；?surl= 用 1 前缀
-  const { list, uk, shareid, seckey } = await baiduWxList(apiShorturl, pwd);
+  const topList = await baiduWxList(apiShorturl, pwd);
+  const list = topList.list;
+  const uk = topList.uk;
+  const shareid = topList.shareid;
   // seckey 是 URL 编码的，解码后作为 sekey 传 sharedownload（避免双重编码触发参数错误）
-  const sekey = seckey ? safeDecode(seckey) : '';
+  const sekey = topList.seckey ? safeDecode(topList.seckey) : '';
 
   // 2) 令牌（tplconfig 取 sign/timestamp）
   const { sign, timestamp } = await baiduGetSign(apiShorturl);
@@ -1043,68 +1057,108 @@ async function resolveBaidu(url, pwd) {
   const out = [];
   let triedVerify = false;
   let lastRandsk = '';
-  for (const f of list) {
-    let dlink = '';
-    let lastErr = '';
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const curSekey = attempt === 0 ? sekey : (lastRandsk || sekey);
-      const extra = JSON.stringify({ sekey: curSekey });
-      const body = 'encrypt=0'
-        + '&product=share'
-        + '&primaryid=' + shareid
-        + '&shareid=' + shareid
-        + '&uk=' + uk
-        + '&fid_list=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
-        + (curSekey ? '&extra=' + encodeURIComponent(extra) : '');
-      const dlUrl = 'https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&app_id=250528'
-        + (sign ? '&sign=' + encodeURIComponent(sign) : '')
-        + (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '')
-        + '&web=1';
-      let sd;
-      try {
-        sd = await fetchJson(dlUrl, {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': 'https://pan.baidu.com/share/link?shareid=' + shareid + '&uk=' + uk,
-          },
-          body,
-        });
-      } catch (e) {
-        throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
+  const MAX_DEPTH = 5; // 防无限嵌套（分享循环引用/极深结构）
+
+  // 把单个 wxlist items 展开为可加入下载的文件（folder 递归展开）：
+  // - 文件（type==='file' 或 isdir===0）：走 sharedownload 拿 dlink 后 push
+  // - 文件夹（type==='folder' 或 isdir===1）：递归调 baiduWxList 取其 dir 子项并平铺
+  async function expandBaiduItems(items, dirPath, depth) {
+    if (!items || !items.length) return;
+    if (depth > MAX_DEPTH) {
+      throw new Error('百度分享嵌套层级超过 ' + MAX_DEPTH + '（疑似循环引用，请用浏览器打开该分享核对）');
+    }
+    for (const f of items) {
+      const isFolder = (f.type === 'folder') || (f.isdir === 1) || (f.isdir === '1') || (f.type === 1) || (f.type === '1');
+      if (isFolder) {
+        // 文件夹：递归。folder path 字段形如 '/书荒来看'，作下层 dir 传给 wxlist
+        const subPath = (typeof f.path === 'string' && f.path) ? f.path : (dirPath + '/' + (f.server_filename || f.filename || ''));
+        const sub = await baiduWxList(apiShorturl, pwd, subPath);
+        await expandBaiduItems(sub.list, subPath, depth + 1);
+        continue;
       }
-      const en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
-      if (en === 9019 && !triedVerify) {
-        // 补验证：/share/verify 取 randsk（即 BDCLND 令牌）桥接进 cookie jar 后重试
-        triedVerify = true;
-        const randsk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
-        if (randsk) {
-          lastRandsk = randsk;
-          // 验证后刷新 cookie（含 BDCLND），供本文件及下载引擎使用
-          const newCookie = await getCookieString('https://pan.baidu.com');
-          if (newCookie) cookie = newCookie;
+      // 普通文件：原 sharedownload 流程拿 dlink
+      let dlink = '';
+      let lastErr = '';
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const curSekey = attempt === 0 ? sekey : (lastRandsk || sekey);
+        const extra = JSON.stringify({ sekey: curSekey });
+        const body = 'encrypt=0'
+          + '&product=share'
+          + '&primaryid=' + shareid
+          + '&shareid=' + shareid
+          + '&uk=' + uk
+          + '&fid_list=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
+          + (curSekey ? '&extra=' + encodeURIComponent(extra) : '');
+        const dlUrl = 'https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&app_id=250528'
+          + (sign ? '&sign=' + encodeURIComponent(sign) : '')
+          + (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '')
+          + '&web=1';
+        let sd;
+        try {
+          sd = await fetchJson(dlUrl, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'X-Requested-With': 'XMLHttpRequest',
+              'Referer': 'https://pan.baidu.com/share/link?shareid=' + shareid + '&uk=' + uk,
+            },
+            body,
+          });
+        } catch (e) {
+          throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
         }
-        continue; // 用 randsk 作 sekey 重试一次
+        const en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
+        if (en === 9019 && !triedVerify) {
+          // 补验证：/share/verify 取 randsk（即 BDCLND 令牌）桥接进 cookie jar 后重试
+          triedVerify = true;
+          const randsk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
+          if (randsk) {
+            lastRandsk = randsk;
+            // 验证后刷新 cookie（含 BDCLND），供本文件及下载引擎使用
+            const newCookie = await getCookieString('https://pan.baidu.com');
+            if (newCookie) cookie = newCookie;
+          }
+          continue; // 用 randsk 作 sekey 重试一次
+        }
+        const dl = sd.list && sd.list[0] && sd.list[0].dlink;
+        if (dl) {
+          // 百度 sharedownload 的 dlink 字段常常只返回相对路径（如 '/rest/2.0/pcs/file?...'），
+          // 必须拼上 https://d.pcs.baidu.com 才是完整直链；带 scheme 则原样保留。
+          if (/^https?:\/\//i.test(dl)) {
+            dlink = dl;
+          } else {
+            dlink = 'https://d.pcs.baidu.com' + (dl.startsWith('/') ? dl : '/' + dl);
+          }
+          break;
+        }
+        // 没拿到 dlink：构建用户友好的错误文案
+        // 1) 优先把百度显式的 show_msg/errmsg 提到前面（用户第一眼能看到真实原因）
+        // 2) errno -20 是百度风控（触发验证码），附上专项引导
+        const serverMsg = sd.show_msg || sd.errmsg || '';
+        const enPart = (typeof en !== 'undefined' && en !== '') ? ('errno ' + en) : '无 errno';
+        const hint = (en === -20)
+          ? '（百度判定触发风控/验证码。建议：先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
+          : '';
+        throw new Error(
+          '百度接口提示：' + (serverMsg || '未返回 dlink') +
+          '（' + enPart + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）' +
+          hint + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
+        );
       }
-      const dl = sd.list && sd.list[0] && sd.list[0].dlink;
-      if (dl) { dlink = dl; break; }
-      lastErr = (typeof en !== 'undefined' && en !== '') ? ('errno ' + en + (sd.errmsg ? ': ' + sd.errmsg : '')) : '无 dlink';
-      if (en !== 9019) {
-        throw new Error('百度未返回 dlink（' + lastErr + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + JSON.stringify(sd).slice(0, 200));
+      if (!dlink) {
+        throw new Error('百度未返回 dlink（' + (lastErr || '未知错误') + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）');
       }
+      out.push({
+        name: (depth > 0 && dirPath ? dirPath + '/' : '') + f.server_filename,
+        size: bytesToSize(f.size),
+        url: dlink,
+        headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie },
+      });
     }
-    if (!dlink) {
-      throw new Error('百度未返回 dlink（' + (lastErr || '未知错误') + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）');
-    }
-    out.push({
-      name: f.server_filename,
-      size: bytesToSize(f.size),
-      url: dlink,
-      headers: { 'User-Agent': BAIDU_UA, Referer: 'https://pan.baidu.com/', Cookie: cookie },
-    });
   }
+
+  await expandBaiduItems(list, '', 0);
   return out;
 }
 

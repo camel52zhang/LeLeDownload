@@ -15,7 +15,7 @@ try {
 } catch {
   // 忽略清理失败（如 safe-delete 垫片拦截），下方 cpSync 会覆盖同名文件
 }
-fs.cpSync(srcExt, dstExt, { recursive: true });
+fs.cpSync(srcExt, dstExt, { recursive: true, filter: (s) => !path.basename(s).startsWith('test-') });
 console.log('[build] synced extension -> src-tauri/extension');
 
 build({

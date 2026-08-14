@@ -338,16 +338,46 @@ fn netdisk_result_apply(
         pending.lock().unwrap().remove(id);
     }
     if let Some(files) = v.get_mut("files").and_then(|x| x.as_array_mut()) {
-        files.retain(|f| {
-            f.get("url")
-                .and_then(|u| u.as_str())
-                .map(|u| is_url_safe(u).is_ok())
-                .unwrap_or(false)
+        // 收集每个文件被过滤的具体原因（SSRF 规则 vs url 字段缺失），
+        // 避免「解析结果为空或直链未通过安全校验」一个文案掩盖三种情况。
+        let total = files.len();
+        let mut rejected: Vec<String> = Vec::new();
+        files.retain(|f| match f.get("url").and_then(|u| u.as_str()) {
+            Some(u) => match is_url_safe(u) {
+                Ok(()) => true,
+                Err(reason) => {
+                    let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    rejected.push(format!("{} [{}]: {}", name, u, reason));
+                    false
+                }
+            },
+            None => {
+                let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                rejected.push(format!("{}: url 字段为空或非字符串", name));
+                false
+            }
         });
         if files.is_empty() {
             v["ok"] = serde_json::Value::Bool(false);
-            v["error"] =
-                serde_json::Value::String("解析结果为空或直链未通过安全校验".to_string());
+            v["error"] = if total == 0 {
+                serde_json::Value::String("解析结果为空：扩展未返回任何文件".to_string())
+            } else if rejected.is_empty() {
+                serde_json::Value::String("解析结果为空或直链未通过安全校验".to_string())
+            } else {
+                // 限长避免错误框太长；最多展示前 3 条
+                let head: Vec<String> = rejected.iter().take(3).cloned().collect();
+                let more = if rejected.len() > 3 {
+                    format!(" …等共 {} 条", rejected.len())
+                } else {
+                    String::new()
+                };
+                serde_json::Value::String(format!(
+                    "全部 {} 个文件被过滤：{}{}",
+                    total,
+                    head.join("；"),
+                    more
+                ))
+            };
         }
     }
     Some(("200 OK".to_string(), "{\"ok\":true}".to_string(), v))
@@ -856,6 +886,70 @@ mod netdisk_tests {
         let (_s, _r, event) = netdisk_result_apply(&p, body).unwrap();
         let files = event["files"].as_array().unwrap();
         assert_eq!(files.len(), 1, "公网直链应保留");
+    }
+
+    #[test]
+    fn result_apply_reports_missing_url_field() {
+        // url 字段缺失（实际 baidu dlink 为空时会被静默丢弃），应给出诊断而非笼统报错。
+        let p = make_pending();
+        insert(&p, "nk_1", 0);
+        let body = r#"{"id":"nk_1","ok":true,"files":[{"name":"a.zip","size":1024}]}"#;
+        let (_s, _r, event) = netdisk_result_apply(&p, body).unwrap();
+        let files = event["files"].as_array().unwrap();
+        assert!(files.is_empty(), "缺失 url 必须被过滤");
+        assert_eq!(event["ok"], serde_json::Value::Bool(false));
+        let err = event["error"].as_str().unwrap();
+        assert!(
+            err.contains("url 字段为空"),
+            "应提示 url 字段缺失原因: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn result_apply_reports_empty_files_array() {
+        // 扩展根本没返回文件（files:[]）—— 与「全部被过滤」语义不同，需区分。
+        let p = make_pending();
+        insert(&p, "nk_1", 0);
+        let body = r#"{"id":"nk_1","ok":true,"files":[]}"#;
+        let (_s, _r, event) = netdisk_result_apply(&p, body).unwrap();
+        assert_eq!(event["ok"], serde_json::Value::Bool(false));
+        let err = event["error"].as_str().unwrap();
+        assert!(
+            err.contains("未返回任何文件"),
+            "应区分扩展未返回文件: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn result_apply_reports_ssrf_block_reasons() {
+        // 多种拦截原因混在一起：错误文案应包含每条具体原因（域名/IP/原因），便于排查。
+        // 当前设计：3 条全部被拦时，error 文案应列出全部 3 条（限长前 3 = 全部展示）。
+        let p = make_pending();
+        insert(&p, "nk_1", 0);
+        let body = r#"{"id":"nk_1","ok":true,"files":[
+            {"name":"a","url":"http://127.0.0.1:8080/a"},
+            {"name":"b","url":"http://169.254.169.254/latest/meta-data"},
+            {"name":"c","url":"ftp://example.com/x"}
+        ]}"#;
+        let (_s, _r, event) = netdisk_result_apply(&p, body).unwrap();
+        let files = event["files"].as_array().unwrap();
+        assert!(files.is_empty(), "全部被拦时 files 应清空");
+        assert_eq!(event["ok"], serde_json::Value::Bool(false));
+        let err = event["error"].as_str().unwrap();
+        assert!(err.contains("127.0.0.1"), "应提示私网 IP 拦截: {}", err);
+        assert!(
+            err.contains("169.254") || err.contains("metadata"),
+            "应提示元数据拦截: {}",
+            err
+        );
+        assert!(
+            err.contains("scheme") || err.contains("ftp"),
+            "应提示非法 scheme: {}",
+            err
+        );
+        assert!(err.contains("全部 3 个文件被过滤"), "应说明总数: {}", err);
     }
 
     #[test]
