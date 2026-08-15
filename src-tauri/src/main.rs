@@ -220,10 +220,11 @@ fn sanitize_headers(raw: &Option<HashMap<String, String>>) -> Option<HashMap<Str
     }
 }
 
-// 从 /download 请求 body 中解析出 (url, 已清洗的 headers)。
-// 供 run_http 桥接主流程与测试复用；headers 缺省时返回 None（旧路径兼容）。
+// 从 /download 请求 body 中解析出 (url, 已清洗的 headers, 显式文件名)。
+// 供 run_http 桥接主流程与测试复用；headers 缺省时返回 None（旧路径兼容），
+// 显式文件名缺省时返回 None（此时由 create_download 走 extract_filename 探测）。
 // 注意：此处只做 JSON 解析 + 边界清洗，SSRF 校验(is_url_safe)由调用方在拿到 url 后执行。
-fn parse_download_request(body: &str) -> Option<(String, Option<HashMap<String, String>>)> {
+fn parse_download_request(body: &str) -> Option<(String, Option<HashMap<String, String>>, Option<String>)> {
     let j: serde_json::Value = serde_json::from_str(body).ok()?;
     let url = j.get("url").and_then(|v| v.as_str())?.to_string();
     let raw_headers = j
@@ -235,7 +236,15 @@ fn parse_download_request(body: &str) -> Option<(String, Option<HashMap<String, 
                 .collect::<HashMap<String, String>>()
         });
     let headers = sanitize_headers(&raw_headers);
-    Some((url, headers))
+    // 兼容调用方显式指定的文件名：优先 `filename`，回退 `name`（netdisk-resolver 会同时带这两个字段）。
+    // 显式文件名可跳过 extract_filename 的 HEAD 探测，避免 123 云盘等分享直链因取不到
+    // Content-Disposition 而落回到无意义的 URL 路径段（如 c-m9013）。
+    let filename = j
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .or_else(|| j.get("name").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    Some((url, headers, filename))
 }
 
 // 向 socket 写出一段 JSON 响应。CORS 仅对浏览器扩展 origin 放开（chrome-extension://*、
@@ -542,7 +551,7 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                     if r.contains("/download") {
                         if let Some(pos) = r.find("\r\n\r\n") {
                             let body = &r[pos + 4..];
-                            if let Some((url, headers)) = parse_download_request(body) {
+                            if let Some((url, headers, filename)) = parse_download_request(body) {
                                 // 可观测性日志（桥接到 %TEMP%/lele_http_bridge.log）：收到 /download 时打印
                                 // headers 是否有值及来源类型（带 headers=扩展 share-link 上报；无 headers=直链/右键）。
                                 let has_headers = headers.is_some();
@@ -571,7 +580,9 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                                             .to_string_lossy()
                                             .to_string()
                                     });
-                                match dm.create_download(url.clone(), dir, headers, None).await {
+                                // 显式文件名（来自请求 body 的 filename/name）原样透传，
+                                // 跳过 extract_filename 的 HEAD 探测，保证 123 云盘等分享直链存盘为中文真实名。
+                                match dm.create_download(url.clone(), dir, headers, filename).await {
                                     Ok(t) => {
                                         log_http(&format!("[ok] id={} url={}", t.id, url));
                                         let _ = dm.start_download(t.id.clone()).await;
@@ -765,19 +776,20 @@ mod http_tests {
     #[test]
     fn bridge_json_with_headers_parses_some() {
         let body = r#"{"url":"https://cdn.example.com/file.zip","timestamp":1,"headers":{"Cookie":"a=1","Referer":"https://we.tl/x","Authorization":"Bearer t"}}"#;
-        let (u, headers) = parse_download_request(body).expect("应解析成功");
+        let (u, headers, filename) = parse_download_request(body).expect("应解析成功");
         assert_eq!(u, "https://cdn.example.com/file.zip");
         let h = headers.expect("headers 应为 Some");
         assert_eq!(h.get("Cookie"), Some(&"a=1".to_string()));
         assert_eq!(h.get("Referer"), Some(&"https://we.tl/x".to_string()));
         assert_eq!(h.get("Authorization"), Some(&"Bearer t".to_string()));
+        assert!(filename.is_none(), "未带 filename/name 时应为 None");
     }
 
     #[test]
     fn bridge_json_without_headers_parses_none() {
         // 旧调用方（右键菜单 / onCreated / popup）不含 headers 字段 -> headers=None（旧分支不变）
         let body = r#"{"url":"https://cdn.example.com/file.zip","timestamp":1}"#;
-        let (u, headers) = parse_download_request(body).expect("应解析成功");
+        let (u, headers, _filename) = parse_download_request(body).expect("应解析成功");
         assert_eq!(u, "https://cdn.example.com/file.zip");
         assert!(headers.is_none(), "缺省 headers 时必须为 None（旧路径兼容）");
     }
@@ -792,8 +804,20 @@ mod http_tests {
     fn bridge_json_with_empty_headers_object_is_none() {
         // headers 字段存在但为空对象 -> 解析后无有效头 -> None（不污染旧路径）
         let body = r#"{"url":"https://cdn.example.com/file.zip","headers":{}}"#;
-        let (_u, headers) = parse_download_request(body).expect("应解析成功");
+        let (_u, headers, _filename) = parse_download_request(body).expect("应解析成功");
         assert!(headers.is_none(), "空 headers 对象应等价 None");
+    }
+
+    #[test]
+    fn bridge_json_prefers_filename_then_name() {
+        // netdisk-resolver 会带 filename/name：显式文件名应被解析出来，跳过 HEAD 探测。
+        let with_filename = r#"{"url":"https://cdn.123pan.cn/c-m9013?auto_redirect=1","filename":"西游记.1996.S01E18.1080P.H265.mp4"}"#;
+        let (_, _, f1) = parse_download_request(with_filename).expect("应解析成功");
+        assert_eq!(f1.as_deref(), Some("西游记.1996.S01E18.1080P.H265.mp4"));
+
+        let with_name_only = r#"{"url":"https://cdn.123pan.cn/c-m9013?auto_redirect=1","name":"西游记.mp4"}"#;
+        let (_, _, f2) = parse_download_request(with_name_only).expect("应解析成功");
+        assert_eq!(f2.as_deref(), Some("西游记.mp4"));
     }
 }
 
