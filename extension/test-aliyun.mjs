@@ -251,19 +251,81 @@ async function resolveAliyun(url, pwd) {
 
   if (!files.length) throw new Error('阿里分享内没有可下载文件');
 
+  // ---- 410 转存兜底（镜像 background.js r18：参考 netdisk-resolver-v1.4 aliyun/resolver.py）----
+  async function aliyunTransferAndGetUrl(fileId, timeoutMs) {
+    const userHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken };
+    const me = await fetchJson('https://api.alipan.com/v2/user/get', {
+      method: 'POST', headers: userHeaders, body: JSON.stringify({}),
+    });
+    const myDriveId = me.default_drive_id;
+    if (!myDriveId) throw new Error('阿里未返回默认 drive_id，无法转存（请确认已登录 alipan.com）');
+    const cp = await fetchJson('https://api.alipan.com/v2/file/copy', {
+      method: 'POST', headers: shareHeaders,
+      body: JSON.stringify({
+        share_id: shareId, file_id: fileId,
+        to_drive_id: myDriveId, to_parent_file_id: 'root', auto_rename: true,
+      }),
+    });
+    const copiedDriveId = String(cp.drive_id || myDriveId);
+    const copiedFileId = String(cp.file_id || '');
+    if (!copiedFileId) throw new Error('阿里转存未返回 file_id：' + JSON.stringify(cp).slice(0, 200));
+    const taskId = String(cp.async_task_id || '');
+    if (taskId) {
+      const deadline = Date.now() + (timeoutMs || 30000);
+      while (Date.now() < deadline) {
+        const task = await fetchJson('https://api.alipan.com/v2/async_task/get', {
+          method: 'POST', headers: userHeaders, body: JSON.stringify({ async_task_id: taskId }),
+        });
+        const state = String(task.state || '').toLowerCase();
+        if (state === 'succeed' || state === 'success') break;
+        if (state === 'failed' || state === 'cancel') throw new Error('阿里转存任务失败：' + String(task.message || taskId));
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    const dl = await fetchJson('https://api.alipan.com/v2/file/get_download_url', {
+      method: 'POST', headers: userHeaders,
+      body: JSON.stringify({ drive_id: copiedDriveId, file_id: copiedFileId, expire_sec: 600 }),
+    });
+    let durl = dl.url || dl.cdn_url || dl.internal_url || dl.download_url || dl.DownloadUrl;
+    if (!durl && dl.domain_id) {
+      try {
+        const dl2 = await fetchJson('https://' + dl.domain_id + '.api.aliyunpds.com/v2/file/get_download_url', {
+          method: 'POST', headers: userHeaders,
+          body: JSON.stringify({ drive_id: copiedDriveId, file_id: copiedFileId, expire_sec: 600 }),
+        });
+        durl = dl2.url || dl2.cdn_url || dl2.internal_url || dl2.download_url || dl2.DownloadUrl;
+      } catch (_) {}
+    }
+    if (!durl) throw new Error('阿里转存后未返回直链：' + JSON.stringify(dl).slice(0, 200));
+    return durl;
+  }
+
   const out = [];
   for (const f of files) {
-    const dl = await fetchJson('https://api.alipan.com/v2/file/get_share_link_download_url', {
-      method: 'POST', headers: shareHeaders,
-      body: JSON.stringify({ share_id: shareId, file_id: f.file_id, expire_sec: 600 }),
-    });
-    const durl = dl.download_url || dl.url;
-    if (!durl) throw new Error('阿里未返回直链：' + JSON.stringify(dl).slice(0, 200));
+    let durl = '';
+    let viaTransfer = false;
+    try {
+      const dl = await fetchJson('https://api.alipan.com/v2/file/get_share_link_download_url', {
+        method: 'POST', headers: shareHeaders,
+        body: JSON.stringify({ share_id: shareId, file_id: f.file_id, expire_sec: 600 }),
+      });
+      durl = dl.download_url || dl.url;
+      if (!durl) throw new Error('阿里未返回直链：' + JSON.stringify(dl).slice(0, 200));
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (/\[HTTP ?410/.test(msg)) {
+        // 分享禁止直接下载（版权/限速）→ 转存到自己云盘后取直链
+        durl = await aliyunTransferAndGetUrl(f.file_id);
+        viaTransfer = true;
+      } else {
+        throw e;
+      }
+    }
     out.push({
       name: f.name,
       size: bytesToSize(f.size),
       url: durl,
-      headers: { Referer: 'https://www.alipan.com/', 'User-Agent': navigator.userAgent },
+      headers: { Referer: viaTransfer ? 'https://www.aliyundrive.com/' : 'https://www.alipan.com/', 'User-Agent': navigator.userAgent },
     });
   }
   return out;
@@ -761,3 +823,108 @@ test('resolveAliyun file/list 返回 410 → 抛错含访问限制指引（而�
     delete globalThis.chrome;
   }
 });
+
+// ---------------------------------------------------------------------------
+// A18: get_share_link_download_url 返 410（分享禁止直接下载）→ 转存到自己云盘 → 取直链成功
+// ---------------------------------------------------------------------------
+test('resolveAliyun 410 直链 → 转存自己云盘 → 取直链成功（r18）', async () => {
+  globalThis.chrome = makeAliChrome({
+    executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
+  });
+  const rec = makeRecorder();
+  rec._handler = (u, opts) => {
+    const s = String(u);
+    if (s.includes('auth.alipan.com/v2/account/token')) return { text: async () => JSON.stringify({ access_token: 'ATOK' }), ok: true };
+    if (s.includes('share_link/get_share_token')) return { text: async () => JSON.stringify({ share_token: 'STOK' }), ok: true };
+    if (s.includes('adrive/v3/file/list')) return { text: async () => JSON.stringify({ items: [{ type: 'file', name: 'a.txt', size: 1024, file_id: 'F1' }] }), ok: true };
+    // 分享直链申请 → 410 Gone（空 body，版权/限速分享典型）
+    if (s.includes('get_share_link_download_url')) return { status: 410, statusText: 'Gone', text: async () => '' };
+    // 转存链路
+    if (s.includes('/v2/user/get')) return { text: async () => JSON.stringify({ default_drive_id: 'DRIVE_ME' }), ok: true };
+    if (s.includes('/v2/file/copy')) return { text: async () => JSON.stringify({ drive_id: 'DRIVE_ME', file_id: 'NEW_F1' }), ok: true };
+    if (s.includes('/v2/file/get_download_url')) return { text: async () => JSON.stringify({ url: 'https://aliyun-drive-cdn.example/f1' }), ok: true };
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const out = await resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', '');
+    assert.equal(out.length, 1);
+    assert.equal(out[0].url, 'https://aliyun-drive-cdn.example/f1', '应使用转存后的直链');
+    assert.equal(out[0].headers.Referer, 'https://www.aliyundrive.com/', '转存直链 Referer 应为 aliyundrive.com');
+    // 转存请求断言：copy 带 share_id + to_drive_id
+    const copy = findCall(rec.calls, '/v2/file/copy');
+    assert.ok(copy, '应发起 /v2/file/copy 转存');
+    const copyBody = JSON.parse(copy.body);
+    assert.equal(copyBody.share_id, 'AbCdEfGh123');
+    assert.equal(copyBody.to_drive_id, 'DRIVE_ME');
+    assert.equal(copyBody.file_id, 'F1');
+    // 用户空间接口不带 x-share-token
+    const userGet = findCall(rec.calls, '/v2/user/get');
+    assert.ok(!userGet.opts.headers['x-share-token'], 'user/get 不应带 x-share-token');
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A19: 410 → 转存失败（user/get 无 default_drive_id）→ 抛「无法转存」清晰错误
+// ---------------------------------------------------------------------------
+test('resolveAliyun 410 → 转存失败（无 default_drive_id）→ 抛「无法转存」', async () => {
+  globalThis.chrome = makeAliChrome({
+    executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
+  });
+  globalThis.fetch = async (u) => {
+    const s = String(u);
+    if (s.includes('auth.alipan.com/v2/account/token')) return { text: async () => JSON.stringify({ access_token: 'ATOK' }), ok: true };
+    if (s.includes('share_link/get_share_token')) return { text: async () => JSON.stringify({ share_token: 'STOK' }), ok: true };
+    if (s.includes('adrive/v3/file/list')) return { text: async () => JSON.stringify({ items: [{ type: 'file', name: 'a.txt', size: 1024, file_id: 'F1' }] }), ok: true };
+    if (s.includes('get_share_link_download_url')) return { status: 410, statusText: 'Gone', text: async () => '' };
+    if (s.includes('/v2/user/get')) return { text: async () => JSON.stringify({}), ok: true };  // 无 default_drive_id
+    throw new Error('unexpected ' + s);
+  };
+  try {
+    await assert.rejects(() => resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', ''), /无法转存/);
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A20: 转存后 get_download_url 返回 url 空 + domain_id → PDS 域（{domain_id}.api.aliyunpds.com）兜底成功
+// ---------------------------------------------------------------------------
+test('resolveAliyun 转存后 url 空 → PDS 域兜底取直链（r19）', async () => {
+  globalThis.chrome = makeAliChrome({
+    executeScript: async () => [{ result: { ok: true, value: 'rt_123' } }],
+  });
+  const rec = makeRecorder();
+  rec._handler = (u, opts) => {
+    const s = String(u);
+    if (s.includes('auth.alipan.com/v2/account/token')) return { text: async () => JSON.stringify({ access_token: 'ATOK' }), ok: true };
+    if (s.includes('share_link/get_share_token')) return { text: async () => JSON.stringify({ share_token: 'STOK' }), ok: true };
+    if (s.includes('adrive/v3/file/list')) return { text: async () => JSON.stringify({ items: [{ type: 'file', name: 'a.txt', size: 1024, file_id: 'F1' }] }), ok: true };
+    if (s.includes('get_share_link_download_url')) return { status: 410, statusText: 'Gone', text: async () => '' };
+    if (s.includes('/v2/user/get')) return { text: async () => JSON.stringify({ default_drive_id: 'DRIVE_ME' }), ok: true };
+    if (s.includes('/v2/file/copy')) return { text: async () => JSON.stringify({ drive_id: 'DRIVE_ME', file_id: 'NEW_F1' }), ok: true };
+    // api.alipan.com 域：url 空 + domain_id（用户真实报错形态），不带 cdn_url
+    if (s.includes('api.alipan.com/v2/file/get_download_url')) {
+      return { text: async () => JSON.stringify({ domain_id: 'bj29', drive_id: 'DRIVE_ME', file_id: 'NEW_F1', revision_id: 'R1', method: 'GET', url: '', expiration: '2026-08-19T10:32:00Z' }), ok: true };
+    }
+    // PDS 域兜底：返回 cdn_url
+    if (s.includes('bj29.api.aliyunpds.com/v2/file/get_download_url')) {
+      return { text: async () => JSON.stringify({ url: '', cdn_url: 'https://data-cdn.aliyunpds.com/f1?Expires=1' }), ok: true };
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const out = await resolveAliyun('https://www.alipan.com/s/AbCdEfGh123', '');
+    assert.equal(out.length, 1);
+    assert.equal(out[0].url, 'https://data-cdn.aliyunpds.com/f1?Expires=1', '应使用 PDS 域兜底的 cdn_url');
+    const pdsCall = findCall(rec.calls, 'bj29.api.aliyunpds.com');
+    assert.ok(pdsCall, '应发起 PDS 域兜底请求');
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+

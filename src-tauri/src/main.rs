@@ -220,8 +220,9 @@ fn sanitize_headers(raw: &Option<HashMap<String, String>>) -> Option<HashMap<Str
     }
 }
 
-// 从 /download 请求 body 中解析出 (url, 已清洗的 headers)。
-// 供 run_http 桥接主流程与测试复用；headers 缺省时返回 None（旧路径兼容）。
+// 从 /download 请求 body 中解析出 (url, 已清洗的 headers, 显式文件名)。
+// 供 run_http 桥接主流程与测试复用；headers 缺省时返回 None（旧路径兼容），
+// 显式文件名缺省时返回 None（此时由 create_download 走 extract_filename 探测）。
 // 注意：此处只做 JSON 解析 + 边界清洗，SSRF 校验(is_url_safe)由调用方在拿到 url 后执行。
 fn parse_download_request(body: &str) -> Option<(String, Option<HashMap<String, String>>, Option<String>)> {
     let j: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -806,6 +807,7 @@ mod http_tests {
         let (_u, headers, _filename) = parse_download_request(body).expect("应解析成功");
         assert!(headers.is_none(), "空 headers 对象应等价 None");
     }
+
     #[test]
     fn bridge_json_prefers_filename_then_name() {
         // netdisk-resolver 会带 filename/name：显式文件名应被解析出来，跳过 HEAD 探测。

@@ -15,7 +15,13 @@ try {
 } catch {
   // 忽略清理失败（如 safe-delete 垫片拦截），下方 cpSync 会覆盖同名文件
 }
-fs.cpSync(srcExt, dstExt, { recursive: true, filter: (s) => !path.basename(s).startsWith('test-') });
+// filter 同时挡住 test-*（测试文件）和以 _ 开头的临时副本（如 _t.mjs/_tmp.mjs 等）。
+// Chrome 扩展禁止文件名以 _ 开头，否则 chrome://extensions 报
+// "Cannot load extension with file or directory name _xxx" 整个扩展挂掉。
+fs.cpSync(srcExt, dstExt, { recursive: true, filter: (s) => {
+  const base = path.basename(s);
+  return !base.startsWith('test-') && !base.startsWith('_');
+}});
 console.log('[build] synced extension -> src-tauri/extension');
 
 build({

@@ -1186,7 +1186,7 @@ impl DownloadManager {
                 filename = parse_content_disposition(disposition_str);
             }
         }
-        
+
         if filename.is_none() {
             // 兜底增强：部分分享直链（如 123 云盘）的真实文件名编码在 URL 的 `filename=`
             // 查询参数里（URL 百分号编码），优先于此还原，避免落回无意义的路径段

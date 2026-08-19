@@ -348,6 +348,7 @@ function detectNetdiskPlatform(url) {
     if (h.includes('baidu')) return 'baidu';
     if (h.includes('aliyun') || h.includes('alipan')) return 'aliyun';
     if (h.includes('quark')) return 'quark';
+    if (h.includes('xunlei')) return 'xunlei';
     if (h.includes('123pan') || h.includes('123912') || h.includes('123685') || h.includes('123959')) return 'pan123';
     if (h.includes('cloud.189') || h.includes('189.cn')) return 'tianyi';
   } catch (_) { /* ignore */ }
@@ -442,33 +443,438 @@ function bytesToSize(n) {
 
 // ---- 各平台解析器 ----
 
-// 123云盘：官方分享 API（公开分享可匿名；带密分享传 pwd）
+// 123云盘（r12 重写，参考 netdisk-resolver-v1.4 / alist 123_share 驱动）：
+// - 端点已迁移：原 www.123pan.com/api/share/get 已 404，新端点是 https://yun.123pan.cn/b/api/...
+// - 所有请求必须带 signPath 签名查询参数（?timeSign=<timestamp>-<random>-<dataSign>），
+//   否则服务端返 210/2100/signature invalid。签名算法：CRC32(IEEE) + 一张 26 字母映射表。
+// - /share/get 是 GET（不是 POST），/share/download/info 是 POST（body 用小写字段）。
+// - 响应结构：data.InfoList[]（不是 data.fileList.data），字段 FileId/FileName/Type/Size/S3KeyFlag/Etag，
+//   Type=1 为文件夹、Type=0 为文件；下载 URL 在另一接口 /share/download/info 取，
+//   且 DownloadURL 是 `?params=base64(真直链)` 的二次包装，默认 auto_redirect=0 会返 210 JSON 壳，
+//   必须改 auto_redirect=1 才能让 CDN 直接输出文件流。
+// 诊断 body 加 build=r21 标签，便于真机复测时定位。
+// r14 修复：r13 硬编码 code=5112 → 分享方限制是错的（5112 也用于"未登录/付费"拦截）。
+// 现按 message 关键词判断（分享方流量包/用户登录付费/链接失效/提取码/兜底），
+// 删掉硬编码 code 匹配，避免误判。同时把"提取"歧义词改为更精确的"提取码"。
+// r15 增强：123 已取消免登录下载 → 新增登录态注入（getPan123Token/readPan123Token，
+// 注入 www.123pan.com localStorage 拿 Authorization Bearer token），download/info 返
+// 5112 未登录时强制刷新登录态重试一次。
+// r16 修正：实测多个公开分享后发现「分享方提取流量包不足」= 分享方未给游客开放提取流量
+// （guest-share-free-download-cdn 域名实锤游客可下，但分享方可选是否开放），登录用户/会员
+// 很可能可下 → 「流量包/提取次数」同样触发登录态重试 + helper 提示改为引导登录。
+const PAN123_API_BASE = 'https://yun.123pan.cn/b/api';
+const PAN123_SIGN_TABLE = [
+  'a', 'd', 'e', 'f', 'g', 'h', 'l', 'm', 'y', 'i',
+  'j', 'n', 'o', 'p', 'k', 'q', 'r', 's', 't', 'u',
+  'b', 'c', 'v', 'w', 's', 'z',
+];
+
+// 与 netdisk-resolver-v1.4 pan123/api.py sign_path 一致：CRC32(IEEE) → 无符号 32 位。
+function pan123Crc32IEEE(buf) {
+  // 在 SW context 中没有 zlib，使用手工 CRC32-IEEE 表（与 Go / Python zlib.crc32 一致）。
+  // 用全局缓冲的 256 项表提高速度；多线程安全（SW 单线程）。
+  if (!pan123Crc32IEEE._t) {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[i] = c >>> 0;
+    }
+    pan123Crc32IEEE._t = t;
+  }
+  const t = pan123Crc32IEEE._t;
+  let c = 0xFFFFFFFF;
+  // 把 string 当 UTF-8 字节序列处理（与 Python bytes.encode('utf-8') 一致）
+  const bytes = typeof buf === 'string' ? new TextEncoder().encode(buf) : buf;
+  for (let i = 0; i < bytes.length; i++) c = t[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// 生成 123云盘请求签名，返回 [timeSign, fullSign]，调用方把 timeSign 作为查询参数名、
+// fullSign 作为查询参数值，附加到 URL（参见 alist / netdisk-resolver-v1.4）。
+function pan123SignPath(path, os /* web */ , version /* 3 */ ) {
+  const rand = String(Math.round(Math.random() * 1e7));
+  // CST (+08:00) 当前时间戳
+  const now = new Date();
+  const cstMs = now.getTime() + 8 * 3600 * 1000;
+  const cst = new Date(cstMs);
+  const Y = cst.getUTCFullYear();
+  const M = String(cst.getUTCMonth() + 1).padStart(2, '0');
+  const D = String(cst.getUTCDate()).padStart(2, '0');
+  const h = String(cst.getUTCHours()).padStart(2, '0');
+  const m = String(cst.getUTCMinutes()).padStart(2, '0');
+  const nowStr = '' + Y + M + D + h + m;  // YYYYMMDDHHMM（12 位）
+  let mapped = '';
+  for (const ch of nowStr) mapped += PAN123_SIGN_TABLE[Number(ch)];
+  const timeSign = String(pan123Crc32IEEE(mapped));
+  const ts = String(Math.floor(cstMs / 1000));
+  const data = [ts, rand, path, os || 'web', version || '3', timeSign].join('|');
+  const dataSign = String(pan123Crc32IEEE(data));
+  return [timeSign, ts + '-' + rand + '-' + dataSign];
+}
+
+// 构造带签名的完整 URL：base + path + ?<timeSign>=<ts-rand-dataSign>&<其它查询参数>
+function pan123SignedUrl(path, params) {
+  const qs = Object.assign({}, params || {});
+  const keyVal = pan123SignPath(path);
+  qs[keyVal[0]] = keyVal[1];
+  const url = new URL(PAN123_API_BASE + path);
+  for (const k of Object.keys(qs)) url.searchParams.set(k, qs[k]);
+  return url.toString();
+}
+
+// 把 123 服务端业务错误翻译成用户可读提示（区分分享方限制/用户未登录/链接失效/提取码/其他）。
+// 参考返回值形如 { code:5112, message:'…' }，字段名是 message。
+// 关键：code 不是稳定语义（如 5112 既可能是分享方流量包耗尽，也可能是用户未登录付费），
+// 必须按 message 关键词判断，不能硬编码 code→语义。
+// 端点错误或网络错误（非 code 业务错）不归本函数，由 fetchJson 抛 HTTP 错误。
+// 加 ⛔ 前缀让"平台业务层限制"在 UI 里一眼可见，避免用户误以为是下载器 bug。
+function pan123BusinessError(ctx, code, msg) {
+  const m = String(msg || '').trim();
+  const low = m.toLowerCase();
+  let label = '业务层限制';
+  let hint = '';
+  // 当前用户未登录 / 未付费（解法：登录 123 或开会员；r12 SW 匿名 fetch 触发的就是这种）
+  if (m.indexOf('登录') >= 0 || m.indexOf('注册') >= 0 || m.indexOf('付费') >= 0
+      || m.indexOf('会员') >= 0 || low.indexOf('vip') >= 0 || low.indexOf('login') >= 0 || low.indexOf('pay') >= 0) {
+    label = '当前用户未登录或非会员';
+    hint = '该分享需要登录 123 账号或开通会员后才能下载，请在浏览器登录 pan.xunlei.com / yun.123pan.cn 后重试';
+  }
+  // 分享未向游客开放提取流量（解法：登录 123，会员更佳；实测 5112 流量包 = 游客被拦，登录可能可下）
+  else if (m.indexOf('流量包') >= 0 || m.indexOf('提取次数') >= 0) {
+    label = '分享未向游客开放提取流量';
+    hint = '请登录 123 账号（会员更佳）后重试；若登录后仍失败，才是分享方主动关闭了提取，需请对方重新分享';
+  }
+  // 链接失效
+  else if (m.indexOf('不存在') >= 0 || m.indexOf('失效') >= 0 || low.indexOf('expired') >= 0 || low.indexOf('not found') >= 0) {
+    label = '分享不存在或已失效';
+  }
+  // 提取码
+  else if (m.indexOf('密码') >= 0 || m.indexOf('提取码') >= 0 || low.indexOf('pwd') >= 0 || low.indexOf('password') >= 0) {
+    label = '提取码错误/需要';
+  }
+  const tail = hint ? '（' + hint + '）' : '';
+  return '⛔ 123云盘' + label + '（' + ctx + '）：' + (m || ('code=' + code)) + tail + (code ? ' [错误码 ' + code + ']' : '');
+}
+
+// 123 下载 URL 二次包装：DownloadURL 通常是 `https://wp.imgapi.com/...?params=base64(真直链)`，
+// 需要把 params base64 解码得到真 CDN 直链，并改 auto_redirect=0→1。
+function pan123NormalizeDownloadUrl(u) {
+  if (!u) return u;
+  try {
+    const m = String(u).match(/[?&]auto_redirect=0/);
+    if (m) return u.replace(/([?&])auto_redirect=0/, '$1auto_redirect=1');
+  } catch (_) {}
+  return u;
+}
+
+function pan123DecodeParamsUrl(u) {
+  if (!u) return u;
+  try {
+    const idx = u.indexOf('params=');
+    if (idx < 0) return pan123NormalizeDownloadUrl(u);
+    const tail = u.slice(idx + 'params='.length);
+    // params 可能是最后一段 query（被 & 截断的 base64），取直到下一个 & 或字符串末尾
+    const amp = tail.indexOf('&');
+    const b64 = amp < 0 ? tail : tail.slice(0, amp);
+    let decoded = '';
+    try { decoded = decodeURIComponent(b64); } catch (_) { decoded = b64; }
+    // base64 → utf-8（与 Python base64.b64decode().decode('utf-8', 'ignore') 一致）
+    let inner = '';
+    try {
+      const bin = atob(decoded.replace(/-/g, '+').replace(/_/g, '/'));
+      // 容错：atob 对非 utf-8 字节序列静默截断（与 'ignore' 语义相近）
+      inner = bin;
+    } catch (_) {
+      // base64 解码失败 → 回退原 URL
+      return pan123NormalizeDownloadUrl(u);
+    }
+    if (typeof inner === 'string' && inner.startsWith('http')) {
+      return pan123NormalizeDownloadUrl(inner);
+    }
+  } catch (_) {}
+  return pan123NormalizeDownloadUrl(u);
+}
+
+// ================= 123云盘 登录态注入（Authorization token）=================
+// 123 平台政策变更（2026-08 起）：取消免登录下载，游客必须注册/登录/付费才能取直链，
+// 否则 download/info 返 code=5112「您需要注册登录或付费后下载」。
+// web 端登录态 = www.123pan.com localStorage 里的 JWT token，请求头带
+// `Authorization: Bearer <token>` 即可。key 探测参考 dmhy123 油猴脚本：
+//   直接 key：authorToken / token / accessToken；JSON key：userInfo / user_info /
+//   loginInfo / login_info / user（对象内递归找 token 字段），token 长度 > 50 才可信。
+// 与阿里云盘方案同构：优先注入已打开的 123 标签页，无则临时开后台标签页读后关闭。
+let _pan123Token = '';
+let _pan123TokenAt = 0;        // 获取成功时间
+let _pan123TokenFailedAt = 0;  // 获取失败时间（短时间不重复开标签页）
+
+// 页面上下文注入：探测 localStorage 中的 123 token（永不 throw，返回结构化结果）
+// r17 增强：① 已知 key 探测（authorToken/token/accessToken/panLoginToken + JSON 递归）
+// ② 兜底遍历全部 localStorage entries 找 JWT 格式值（xxx.yyy.zzz 三段 base64url），
+// 抓未知 key 名的 token——123 前端改版时 key 可能变化，JWT 格式检测更稳。
+function readPan123Token() {
+  try {
+    const isUsable = (t) => typeof t === 'string' && t.trim().length > 50;
+    // JWT 格式：三段点分 base64url（123 的 Authorization Bearer token 是 JWT）
+    const isJwt = (t) => typeof t === 'string'
+      && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(t.trim())
+      && t.trim().length > 50;
+    const directKeys = ['authorToken', 'token', 'accessToken', 'panLoginToken'];
+    for (const k of directKeys) {
+      const v = localStorage.getItem(k);
+      if (isJwt(v)) return { ok: true, value: v.trim() };
+      if (isUsable(v)) return { ok: true, value: v.trim() };
+    }
+    const jsonKeys = ['userInfo', 'user_info', 'loginInfo', 'login_info', 'user', 'userInfoV2'];
+    const findTok = (obj, depth) => {
+      if (!obj || depth > 4) return null;
+      if (typeof obj === 'string') return isUsable(obj) ? obj : null;
+      if (typeof obj !== 'object') return null;
+      for (const k of ['authorToken', 'token', 'accessToken', 'jwt', 'token_info', 'loginToken']) {
+        if (isUsable(obj[k])) return obj[k];
+      }
+      for (const k of Object.keys(obj)) {
+        const r = findTok(obj[k], depth + 1);
+        if (r) return r;
+      }
+      return null;
+    };
+    for (const k of jsonKeys) {
+      const raw = localStorage.getItem(k);
+      if (!raw) continue;
+      try {
+        const tok = findTok(JSON.parse(raw), 0);
+        if (tok) return { ok: true, value: String(tok).trim() };
+      } catch (_) {}
+    }
+    // 兜底：遍历全部 localStorage entries 抓 JWT 格式值（未知 key 名的 token）
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      const v = localStorage.getItem(k);
+      if (isJwt(v)) return { ok: true, value: v.trim() };
+      if (v && v.charAt(0) === '{') {
+        try {
+          const tok = findTok(JSON.parse(v), 0);
+          if (tok) return { ok: true, value: String(tok).trim() };
+        } catch (_) {}
+      }
+    }
+    return { ok: false, step: 'no-token', reason: 'localStorage 无可用 token（可能未登录 123，或 token 存于 HttpOnly cookie）' };
+  } catch (err) {
+    return { ok: false, step: 'exception', reason: String(err) };
+  }
+}
+
+// 找出所有已打开的 123 标签页（token 可能在 www.123pan.com 或 yun.123pan.cn 任一域）
+async function getPan123PageTabs() {
+  try {
+    const all = [];
+    for (const pat of ['https://www.123pan.com/*', 'https://123pan.com/*', 'https://yun.123pan.cn/*']) {
+      const tabs = await chrome.tabs.query({ url: [pat] });
+      if (tabs && tabs.length) all.push(...tabs);
+    }
+    return all;
+  } catch (_) { return []; }
+}
+
+// 协调获取 123 token：
+//   1) 内存缓存（10 分钟内有效）
+//   2) 优先复用已打开的 123 标签页（逐个注入，直到读到 token）
+//   3) 无则临时开一个后台标签页注入后立即关闭
+//   4) 兜底 chrome.storage.local.pan123_token（用户手动配置）
+// 永不抛错，失败返回 ''。
+async function getPan123Token(forceRefresh) {
+  if (typeof chrome === 'undefined' || !chrome.tabs || !chrome.scripting) {
+    return _pan123Token || '';
+  }
+  const now = Date.now();
+  if (!forceRefresh && _pan123Token && now - _pan123TokenAt < 10 * 60 * 1000) return _pan123Token;
+  if (!forceRefresh && !_pan123Token && _pan123TokenFailedAt && now - _pan123TokenFailedAt < 60 * 1000) return '';
+  let tempTabId = null;
+  try {
+    // r17：依次注入所有已打开的 123 标签页（token 可能只存在于其中一个域）
+    let tabs = await getPan123PageTabs();
+    if (!tabs.length) {
+      const created = await chrome.tabs.create({ url: 'https://www.123pan.com/', active: false });
+      tempTabId = created;
+      tabs = [created];
+      await waitTabComplete(created.id);
+    }
+    // 等 SPA 稳定，避免注入时页面仍在跳转导致执行上下文被销毁（表现为 result:null）
+    await new Promise((r) => setTimeout(r, 1200));
+    for (const tab of tabs) {
+      if (!tab || tab.id == null) continue;
+      try {
+        for (let i = 0; i < 2; i++) {
+          const inj = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: readPan123Token });
+          const r = inj && inj[0] && inj[0].result;
+          if (r && r.ok && r.value) {
+            _pan123Token = r.value;
+            _pan123TokenAt = now;
+            return r.value;
+          }
+          console.log('[123] readPan123Token tab', tab.id, 'attempt', i, '=', JSON.stringify(r));
+        }
+      } catch (e) {
+        console.log('[123] inject tab', tab.id, 'error:', String((e && e.message) || e));
+      }
+    }
+  } catch (e) {
+    console.log('[123] getPan123Token error:', String((e && e.message) || e));
+  } finally {
+    if (tempTabId != null) {
+      try { await chrome.tabs.remove(tempTabId.id); } catch (_) {}
+    }
+  }
+  // 兜底：用户手动配置的 token
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+      const stored = await new Promise((res) => {
+        try {
+          chrome.storage.local.get(['pan123_token'], (rr) => res((rr && rr.pan123_token) || ''));
+        } catch (_) { res(''); }
+      });
+      if (stored) { _pan123Token = stored; _pan123TokenAt = now; return stored; }
+    }
+  } catch (_) {}
+  _pan123TokenFailedAt = now;
+  return '';
+}
+
+// 123云盘主解析器：列分享（含子目录递归）→ 逐文件取 download/info 解码出真直链。
+// 出错统一抛 Error（含 build=r21 标记）；不返回部分结果。
 async function resolvePan123(url, pwd) {
-  const origin = new URL(url).origin;
   const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
   const shareKey = m ? m[1] : '';
-  if (!shareKey) throw new Error('无法从链接提取分享Key');
-  const get = await fetchJson(origin + '/api/share/get', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ shareKey: shareKey, sharePwd: pwd || '', page: 1, limit: 100 }),
-  });
-  const files = (get.data && get.data.fileList && get.data.fileList.data) || [];
-  if (!files.length) throw new Error('123云盘分享内没有可下载文件，或需要密码');
+  if (!shareKey) throw new Error('无法从链接提取 123云盘分享 Key');
+  // r14+：123 取消免登录下载，尝试注入 www.123pan.com 登录态（Authorization Bearer token）。
+  // 拿不到也没关系：列文件匿名可读，仅 download/info 取直链时需要登录，失败时下面会重试。
+  let token = await getPan123Token();
+  let authRetried = false;
+  const BASE_HDR = {
+    'Content-Type': 'application/json;charset=UTF-8',
+    'Origin': 'https://yun.123pan.cn',
+    'Referer': 'https://yun.123pan.cn/',
+    'platform': 'web',
+    'app-version': '3',
+  };
+  if (token) BASE_HDR['Authorization'] = 'Bearer ' + token;
+
+  // 列分享（含子目录递归）：Type=1 为文件夹，Type=0 为文件。
+  const MAX_DEPTH = 10;
+  const allFiles = [];  // [{fileId, fileName, size, s3keyFlag, etag, path}]
+  const visited = new Set();
+  async function listDir(parentFileId, dirPath, depth) {
+    if (depth > MAX_DEPTH) {
+      console.log('[pan123] warn listDir depth > 10, truncating at', dirPath);
+      return;
+    }
+    if (parentFileId && visited.has(String(parentFileId))) {
+      console.log('[pan123] warn listDir cycle', parentFileId); return;
+    }
+    if (parentFileId) visited.add(String(parentFileId));
+    let page = 1;
+    while (true) {
+      const listUrl = pan123SignedUrl('/share/get', {
+        limit: '100',
+        next: '0',
+        orderBy: 'file_id',
+        orderDirection: 'desc',
+        parentFileId: String(parentFileId || 0),
+        Page: String(page),
+        shareKey,
+        SharePwd: pwd || '',
+      });
+      let j;
+      try { j = await fetchJson(listUrl, { method: 'GET', headers: BASE_HDR }); }
+      catch (e) { throw new Error('123云盘 listDir 失败(depth=' + depth + ' page=' + page + ')：' + (e && e.message || e)); }
+      if (j && j.code !== 0) {
+        const msg = (j && j.message) || ('code=' + j.code);
+        throw new Error(pan123BusinessError(dirPath || '根目录', j.code, msg));
+      }
+      const payload = (j && j.data) || {};
+      const items = Array.isArray(payload.InfoList) ? payload.InfoList : [];
+      for (const f of items) {
+        if (!f || typeof f !== 'object') continue;
+        const fid = f.FileId != null ? String(f.FileId) : (f.fileId != null ? String(f.fileId) : '');
+        if (!fid) continue;
+        const name = String(f.FileName || f.fileName || '');
+        const type = Number(f.Type != null ? f.Type : (f.type != null ? f.type : 0));
+        const size = Number(f.Size || f.size || 0) || 0;
+        const s3keyFlag = String(f.S3KeyFlag || f.s3keyFlag || '');
+        const etag = String(f.Etag || f.etag || '');
+        const subPath = (dirPath ? dirPath + '/' : '') + name;
+        if (type === 1) {
+          await listDir(fid, subPath, depth + 1);
+        } else {
+          allFiles.push({ fileId: fid, fileName: name, size, s3keyFlag, etag, path: subPath });
+        }
+      }
+      const nxt = String(payload.Next || '');
+      if (nxt === '-1' || !items.length) break;
+      page += 1;
+      if (page > 50) break;  // 防御性兜底
+    }
+  }
+  await listDir(0, '', 0);
+
+  if (!allFiles.length) {
+    throw new Error('123云盘分享内没有可下载文件（build=r21：已迁移到 yun.123pan.cn 并签名）');
+  }
+
+  // 逐文件取直链（POST /share/download/info）
   const out = [];
-  for (const f of files) {
-    const dl = await fetchJson(origin + '/api/share/download', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ shareKey: shareKey, sharePwd: pwd || '', fileId: f.fileId }),
+  for (const f of allFiles) {
+    if (!f.s3keyFlag || !f.etag) {
+      throw new Error('123云盘文件缺少 Etag/S3KeyFlag（build=r21）：' + f.path);
+    }
+    const dlUrl = pan123SignedUrl('/share/download/info');
+    const dlBody = JSON.stringify({
+      shareKey,
+      SharePwd: pwd || '',
+      etag: f.etag,
+      fileId: Number(f.fileId),
+      s3keyFlag: f.s3keyFlag,
+      size: f.size || 0,
     });
-    const durl = dl.data && dl.data.DownloadURL;
-    if (!durl) throw new Error('123云盘未返回直链（可能需要登录或密码）');
+    let dl;
+    try {
+      dl = await fetchJson(dlUrl, { method: 'POST', headers: BASE_HDR, body: dlBody });
+    } catch (e) { throw new Error('123云盘 download/info 失败（' + f.path + '）：' + (e && e.message || e)); }
+    if (dl && dl.code !== 0) {
+      // r16：5112 的「未登录/付费」与「分享方提取流量包不足」都可能是游客身份拦截
+      // （分享方未给游客开放提取流量，登录用户/会员可能可下）→ 强制刷新登录态重试一次。
+      const msg0 = String(dl.message || '');
+      const low0 = msg0.toLowerCase();
+      const needLogin = msg0.indexOf('登录') >= 0 || msg0.indexOf('注册') >= 0 || msg0.indexOf('付费') >= 0
+        || msg0.indexOf('会员') >= 0 || msg0.indexOf('流量包') >= 0 || msg0.indexOf('提取次数') >= 0
+        || low0.indexOf('vip') >= 0 || low0.indexOf('login') >= 0 || low0.indexOf('pay') >= 0;
+      if (needLogin && !authRetried) {
+        authRetried = true;
+        token = await getPan123Token(true);
+        if (token) {
+          BASE_HDR['Authorization'] = 'Bearer ' + token;
+          try {
+            dl = await fetchJson(dlUrl, { method: 'POST', headers: BASE_HDR, body: dlBody });
+          } catch (e) { throw new Error('123云盘 download/info 失败（' + f.path + '）：' + (e && e.message || e)); }
+          if (dl && dl.code !== 0) throw new Error(pan123BusinessError(f.path, dl.code, dl.message || ''));
+        } else {
+          throw new Error(pan123BusinessError(f.path, dl.code, dl.message || ''));
+        }
+      } else {
+        throw new Error(pan123BusinessError(f.path, dl.code, dl.message || ''));
+      }
+    }
+    const wrapped = (((dl || {}).data) || {}).DownloadURL || '';
+    if (!wrapped) throw new Error('123云盘未返回 DownloadURL（' + f.path + '）');
+    const realUrl = pan123DecodeParamsUrl(wrapped);
+    if (!realUrl) throw new Error('123云盘直链解析失败（' + f.path + '）');
     out.push({
-      name: f.filename,
-      size: bytesToSize(f.fileSize),
-      url: durl,
-      headers: { Referer: origin + '/', 'User-Agent': navigator.userAgent },
+      name: f.fileName,
+      size: bytesToSize(f.size),
+      url: realUrl,
+      headers: { Referer: 'https://yun.123pan.cn/', 'User-Agent': navigator.userAgent },
     });
   }
   return out;
@@ -882,19 +1288,94 @@ async function resolveAliyun(url, pwd) {
 
   if (!files.length) throw new Error('阿里分享内没有可下载文件');
 
+  // ---- 410 转存兜底（参考 netdisk-resolver-v1.4 aliyun/resolver.py _save_and_get_url）----
+  // 阿里对「未登录申请直链」或「分享禁止直接下载（版权/限速分享）」返 HTTP 410（空 body）。
+  // 已登录仍 410 → 把分享文件转存到自己云盘，再从自己云盘取直链（转存会复制到网盘根目录）。
+  async function aliyunTransferAndGetUrl(fileId, timeoutMs) {
+    const userHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + accessToken,
+      // 注意：用户空间接口不带 x-share-token，否则被阿里判为「分享接口需登录」而拒绝
+    };
+    // 1) 用户默认 drive_id
+    const me = await fetchJson('https://api.alipan.com/v2/user/get', {
+      method: 'POST', headers: userHeaders, body: JSON.stringify({}),
+    });
+    const myDriveId = me.default_drive_id;
+    if (!myDriveId) throw new Error('阿里未返回默认 drive_id，无法转存（请确认已登录 alipan.com）');
+    // 2) 转存分享文件到自己云盘根目录（带 x-share-token）
+    const cp = await fetchJson('https://api.alipan.com/v2/file/copy', {
+      method: 'POST', headers: shareHeaders,
+      body: JSON.stringify({
+        share_id: shareId, file_id: fileId,
+        to_drive_id: myDriveId, to_parent_file_id: 'root', auto_rename: true,
+      }),
+    });
+    const copiedDriveId = String(cp.drive_id || myDriveId);
+    const copiedFileId = String(cp.file_id || '');
+    if (!copiedFileId) throw new Error('阿里转存未返回 file_id：' + JSON.stringify(cp).slice(0, 200));
+    // 3) 异步转存任务轮询（文件夹才异步；单文件一般同步返回）
+    const taskId = String(cp.async_task_id || '');
+    if (taskId) {
+      const deadline = Date.now() + (timeoutMs || 30000);
+      while (Date.now() < deadline) {
+        const task = await fetchJson('https://api.alipan.com/v2/async_task/get', {
+          method: 'POST', headers: userHeaders, body: JSON.stringify({ async_task_id: taskId }),
+        });
+        const state = String(task.state || '').toLowerCase();
+        if (state === 'succeed' || state === 'success') break;
+        if (state === 'failed' || state === 'cancel') throw new Error('阿里转存任务失败：' + String(task.message || taskId));
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    // 4) 从自己云盘取直链（不带 x-share-token）
+    // r19：api.alipan.com 对部分文件（冷门资源/刚转存）返回 url 空，且不带 cdn_url；
+    // 改用 PDS 智能域名 {domain_id}.api.aliyunpds.com 兜底（alist #6644 方案，cdn 更快）。
+    const dlBody = { drive_id: copiedDriveId, file_id: copiedFileId, expire_sec: 600 };
+    const dl = await fetchJson('https://api.alipan.com/v2/file/get_download_url', {
+      method: 'POST', headers: userHeaders, body: JSON.stringify(dlBody),
+    });
+    let durl = dl.url || dl.cdn_url || dl.internal_url || dl.download_url || dl.DownloadUrl;
+    if (!durl && dl.domain_id) {
+      // api.alipan.com 域拿不到 → 用响应里的 domain_id 构造 PDS 域名重试
+      try {
+        const dl2 = await fetchJson('https://' + dl.domain_id + '.api.aliyunpds.com/v2/file/get_download_url', {
+          method: 'POST', headers: userHeaders, body: JSON.stringify(dlBody),
+        });
+        durl = dl2.url || dl2.cdn_url || dl2.internal_url || dl2.download_url || dl2.DownloadUrl;
+      } catch (_) { /* PDS 域失败则保留原错误 */ }
+    }
+    if (!durl) throw new Error('阿里转存后未返回直链：' + JSON.stringify(dl).slice(0, 200));
+    return durl;
+  }
+
   const out = [];
   for (const f of files) {
-    const dl = await fetchJson('https://api.alipan.com/v2/file/get_share_link_download_url', {
-      method: 'POST', headers: shareHeaders,
-      body: JSON.stringify({ share_id: shareId, file_id: f.file_id, expire_sec: 600 }),
-    });
-    const durl = dl.download_url || dl.url;
-    if (!durl) throw new Error('阿里未返回直链：' + JSON.stringify(dl).slice(0, 200));
+    let durl = '';
+    let viaTransfer = false;
+    try {
+      const dl = await fetchJson('https://api.alipan.com/v2/file/get_share_link_download_url', {
+        method: 'POST', headers: shareHeaders,
+        body: JSON.stringify({ share_id: shareId, file_id: f.file_id, expire_sec: 600 }),
+      });
+      durl = dl.download_url || dl.url;
+      if (!durl) throw new Error('阿里未返回直链：' + JSON.stringify(dl).slice(0, 200));
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (/\[HTTP ?410/.test(msg)) {
+        // 分享禁止直接下载（版权/限速）→ 转存到自己云盘后取直链
+        durl = await aliyunTransferAndGetUrl(f.file_id);
+        viaTransfer = true;
+      } else {
+        throw e;
+      }
+    }
     out.push({
       name: f.name,
       size: bytesToSize(f.size),
       url: durl,
-      headers: { Referer: 'https://www.alipan.com/', 'User-Agent': navigator.userAgent },
+      // 转存后的直链是自己云盘 OSS，按 aliyundrive.com Referer 签名（参考项目实测）
+      headers: { Referer: viaTransfer ? 'https://www.aliyundrive.com/' : 'https://www.alipan.com/', 'User-Agent': navigator.userAgent },
     });
   }
   return out;
@@ -1012,6 +1493,20 @@ async function baiduGetSign(apiShorturl) {
   };
 }
 
+// bdstoken（登录令牌）：GET /api/gettemplatevariable?fields=["bdstoken"]，需登录态（BDUSS）。
+// 匿名/未登录返回 errno -6 → 返回 ''（sharedownload 不带 bdstoken，功能仍可用）。
+// 已登录用户带上 bdstoken 可显著降低 errno -20 风控/验证码触发概率（参考 netdisk-resolver）。
+async function baiduGetBdstoken() {
+  try {
+    const bd = await fetchJson('https://pan.baidu.com/api/gettemplatevariable?fields=' + encodeURIComponent('["bdstoken"]'), {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Referer: 'https://pan.baidu.com/disk/home' },
+    });
+    if (bd && bd.errno === 0 && bd.result && bd.result.bdstoken) return String(bd.result.bdstoken);
+    return '';
+  } catch (_) { return ''; }
+}
+
 // 百度网盘：需 BDUSS（免费账号直链由平台限速，会员账号登录则满速）
 // 提取码验证：先 /share/verify 拿到 randsk（即 BDCLND 令牌）并写入 cookie，
 // 否则 api/sharedownload 会返回 errno 9019 needverify。
@@ -1091,8 +1586,11 @@ async function resolveBaidu(url, pwd) {
   // 2) 令牌（tplconfig 取 sign/timestamp）
   const { sign, timestamp } = await baiduGetSign(apiShorturl);
 
+  // r20：登录态取 bdstoken，sharedownload 带上可显著降低 errno -20 风控（登录用户有效）
+  const bdstoken = await baiduGetBdstoken();
+
   // 直链（sharedownload）：严格对齐可工作的参考实现 netdisk-resolver
-  //   params: channel=chunlei&clienttype=0&app_id=250528&sign&timestamp&web=1
+  //   params: channel=chunlei&clienttype=0&app_id=250528&sign&timestamp&web=1[&bdstoken]
   //   body:   encrypt=0&product=share&primaryid=<id>&shareid=<id>&uk=<uk>&fid_list=[fs_id](紧凑JSON)&extra={"sekey":<seckey>}
   //   headers: Referer=share/link?shareid=<id>&uk=<uk> + X-Requested-With
   // wxlist 返回的 seckey 即带密分享的验证令牌，无需先 /share/verify；
@@ -1135,6 +1633,7 @@ async function resolveBaidu(url, pwd) {
         const dlUrl = 'https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&app_id=250528'
           + (sign ? '&sign=' + encodeURIComponent(sign) : '')
           + (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '')
+          + (bdstoken ? '&bdstoken=' + encodeURIComponent(bdstoken) : '')
           + '&web=1';
         let sd;
         try {
@@ -1177,14 +1676,18 @@ async function resolveBaidu(url, pwd) {
         }
         // 没拿到 dlink：构建用户友好的错误文案
         // 1) 优先把百度显式的 show_msg/errmsg 提到前面（用户第一眼能看到真实原因）
-        // 2) errno -20 是百度风控（触发验证码），附上专项引导
+        // 2) errno -20 是百度风控（触发验证码），附上专项引导（r20：提示登录可降低风控）
+        // 3) r21：errno 0 但 list 是字符串 = 百度「跳端下载」限制（web 端不给 dlink，需 PC 客户端）
         const serverMsg = sd.show_msg || sd.errmsg || '';
         const enPart = (typeof en !== 'undefined' && en !== '') ? ('errno ' + en) : '无 errno';
-        const hint = (en === -20)
-          ? '（百度判定触发风控/验证码。建议：先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
-          : '';
+        const isJumpToClient = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
+        const hint = isJumpToClient
+          ? '（百度限制该文件在网页端直接下载（返回 list:string 跳端下载指令，官方要求跳转 PC 客户端）。建议：换一个分享链接；或直接在浏览器打开该分享并用百度网盘客户端下载）'
+          : ((en === -20)
+            ? '（百度判定触发风控/验证码。建议：若已登录百度网盘账号会显著降低风控；未登录请先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
+            : '');
         throw new Error(
-          '百度接口提示：' + (serverMsg || '未返回 dlink') +
+          '百度接口提示：' + (serverMsg || (isJumpToClient ? '该文件被限制网页端直接下载' : '未返回 dlink')) +
           '（' + enPart + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）' +
           hint + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
         );
@@ -1203,6 +1706,433 @@ async function resolveBaidu(url, pwd) {
 
   await expandBaiduItems(list, '', 0);
   return out;
+}
+
+// 迅雷云盘（pan.xunlei.com）分享解析 —— 必须在 pan.xunlei.com 页面上下文执行。
+// 为什么必须注入页面（而非 SW 直发）：
+//   1) 迅雷每个请求都要 x-captcha-token（无感验证码，WASM 生成，无法在 SW 里伪造）；
+//      但网页版会把 captcha token 与登录态存进 localStorage（greasyfork「迅雷云盘」脚本
+//      证实）：`credentials*` 前缀 key 存 {token_type, access_token}、`captcha*` 前缀 key
+//      存 {token}、`deviceid` key 存设备 ID。注入已登录的 pan.xunlei.com 页面即可全部复用。
+//   2) api-pan.xunlei.com 的 CORS 依赖页面同源上下文；页面 fetch 自动带登录 cookie。
+// 链路（与 AList xunlei 驱动 / urldb / 52pojie 逆向一致）：
+//   1) GET  /drive/v1/share?share_id=<id>&pass_code=<pwd>&limit=100
+//        -> {data:{...share_info..., pass_code_token, files:[{id,name,size?,kind?}]}}（files 含根目录）
+//   2) GET  /drive/v1/share?share_id=<id>&pass_code_token=&parent_id=&page_token=&limit=100
+//        -> {data:{files:[{id,name,size?,kind?}], next_page_token?}}（递归子目录，folder 继续下钻）
+//        关键：web 端不支持 POST /share/detail（返 error_code:12 "Method Not Allowed"），
+//        仅 android client SDK 开放，extension 注入必须用 GET + parent_id 翻页。
+//        详见 https://github.com/ctwj/urldb/blob/v1.5.5/common/xunlei_pan.go GetShareFolder（POST）
+//        对应 web 端真实实现 = getShare（GET ?parent_id=&page_token=）。
+//        ⚠️ 字段名陷阱：GET /share 的 files 元素用 **`id`**（不是 file_id）。
+//        POST /share/detail 才用 file_id。代码统一 `f.id || f.file_id` 兜底兼容。
+//   3) GET  /drive/v1/files/<file_id>?space=&usage=CONSUME
+//        -> {data:{web_content_link? / links:{"application/octet-stream":{url}}}}（下载直链）
+// 错误码：body 含 PASS_CODE_EMPTY=需提取码/码错；NOT_FOUND/EXPIRED/SENSITIVE_RESOURCE=失效。
+// 永远返回结构化对象 {ok, step, status, body, files}，绝不抛出（throw 会被吞成 result:null）。
+async function xunleiApiFetch(shareId, pwd) {
+  const log = (...a) => console.log('[xunlei-inject]', ...a);
+  const out = { ok: false };
+  const API = 'https://api-pan.xunlei.com/drive/v1';
+  try {
+    // ---- 收集页面 localStorage 里的登录态 token（greasyfork 迅雷云盘脚本同款逻辑）----
+    let accessToken = '';
+    let clientId = '';
+    let captchaToken = '';
+    let deviceId = '';
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i) || '';
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        if (key.indexOf('credentials') === 0) {
+          try {
+            const p = JSON.parse(raw);
+            accessToken = (p.token_type ? p.token_type + ' ' : 'Bearer ') + (p.access_token || '');
+            clientId = key.substring(key.indexOf('_') + 1) || '';
+          } catch (_) {}
+        } else if (key.indexOf('captcha') === 0) {
+          try {
+            const p = JSON.parse(raw);
+            captchaToken = p.token || p.captcha_token || '';
+          } catch (_) { captchaToken = raw; }
+        } else if (key === 'deviceid') {
+          deviceId = raw;
+        }
+      }
+    } catch (e) { log('localStorage scan err', String(e)); }
+    log('tokens: at=', !!accessToken, 'cid=', !!clientId, 'captcha=', !!captchaToken, 'dev=', !!deviceId);
+
+    // 统一请求头：x-client-id / x-device-id 必须存在，否则 400
+    const baseHeaders = {
+      'Content-Type': 'application/json',
+      'Origin': 'https://pan.xunlei.com',
+      'Referer': 'https://pan.xunlei.com/',
+      'x-client-id': clientId || 'Xqp0kJBXWhwaTpB6',
+      'x-device-id': deviceId || '',
+      'x-captcha-token': captchaToken || '',
+    };
+    if (accessToken) baseHeaders.Authorization = accessToken;
+    const authHeaders = Object.assign({}, baseHeaders, { 'x-captcha-token': captchaToken || '' });
+
+    // 1) 分享信息（仅快速验证 + 拿 pass_code_token；完整 root listing 在 listShareDir 内做，避免重复请求）
+    const shareQs = '?share_id=' + encodeURIComponent(shareId)
+      + (pwd ? '&pass_code=' + encodeURIComponent(pwd) : '')
+      + '&limit=100';
+    let shareJson, shareResp;
+    try {
+      shareResp = await fetch(API + '/share' + shareQs, { method: 'GET', headers: authHeaders, credentials: 'include' });
+      shareJson = await shareResp.json();
+      log('share', shareResp.status, JSON.stringify(shareJson).slice(0, 500));
+      if (shareResp.status !== 200) {
+        out.step = 'share'; out.status = shareResp.status; out.body = JSON.stringify(shareJson).slice(0, 300); return out;
+      }
+    } catch (e) {
+      out.step = 'share'; out.status = 0; out.body = '请求异常:' + String((e && e.message) || e); return out;
+    }
+    const sBody = JSON.stringify(shareJson);
+    if (sBody.indexOf('PASS_CODE_EMPTY') >= 0) {
+      out.step = 'passcode'; out.status = 200; out.body = '分享需要提取码，或提取码不正确（PASS_CODE_EMPTY）'; return out;
+    }
+    if (sBody.indexOf('NOT_FOUND') >= 0 || sBody.indexOf('EXPIRED') >= 0 || sBody.indexOf('SENSITIVE_RESOURCE') >= 0) {
+      out.step = 'share'; out.status = 200; out.body = '分享已失效或被删除（' + sBody.slice(0, 200) + '）'; return out;
+    }
+    const sd = shareJson.data || shareJson;
+    let passCodeToken = sd.pass_code_token || '';  // 用 let：listShareDir 内部会更新为下一层响应里的更准确 pass_code_token
+    log('pass_code_token=', passCodeToken ? '***' : '(空)');
+    // 诊断日志：dump sd 的 schema（字段名 + 长度），便于排查"files 字段在哪"
+    try {
+      const keys = Object.keys(sd || {});
+      const filesArr = sd.files || sd.file_list || sd.fileInfoList || [];
+      log('sd keys=', keys.join(','), 'files.length=', filesArr.length, 'first file keys=', filesArr[0] ? Object.keys(filesArr[0]).join(',') : '(空)');
+    } catch (e) { log('diag dump err', String(e)); }
+
+    // 2) 递归列分享内部所有文件（无副作用 / 不转存全部）。
+    //    用 /share/detail?parent_id=<folder.id> 列 folder 实际子文件，
+    //    而非 /share?parent_id=...（那个返回 self-ref，server 无视 parent_id）。
+    //    参考 netdisk-resolver-v1.4 xunlei_dl_probe.json 抓包实证：
+    //    root 用 /share，子目录用 /share/detail?parent_id=...。
+    //    listShareDir('', ...) 内会调 /share root，传入 useRootData=sd 避免重复请求；
+//    但本轮主流程只调用 1 次 /share 用于快速验证（401/NOT_FOUND/PASS_CODE），完整列文件已在 listShareDir。
+    const allFiles = [];   // 每项 { share_file_id, name, size }
+    let firstResp = null;  // 诊断 dump 共用引用（首次列目录时写入）
+
+    // 文件夹识别：优先用 kind 显式标记（share 与 /files 端点统一用 drive#folder / drive#file）。
+    // 关键坑：迅雷 /files 接口给「文件」也带 folder_type（如 "DEFAULT"），
+    // 旧逻辑用 folder_type.length>0 直接判文件夹，会把视频/文档误判成文件夹→递归查子目录为空→丢文件。
+    // 因此 folder_type 仅作辅助，且要求该 entry 没有 mime_type（文件必有 mime_type，文件夹通常没有）。
+    function detectIsFolder(f) {
+      if (!f || typeof f !== 'object') return false;
+      if (f.kind === 'drive#folder' || f.kind === 'folder' || f.kind === 'FOLDER') return true;
+      if (f.kind === 'drive#file' || f.kind === 'file') return false;
+      if (f.type === 1 || f.type === '1' || f.type === 'folder' || f.type === 'FOLDER') return true;
+      if (f.type === 0 || f.type === '0' || f.type === 'file') return false;
+      if (f.isdir === 1 || f.isdir === '1' || f.isdir === true) return true;
+      if (f.is_dir === 1 || f.is_dir === '1' || f.is_dir === true) return true;
+      if (typeof f.folder_type === 'string' && f.folder_type.length > 0 && !f.mime_type) return true;
+      if (f.phase === 'folder' || f.phase === 'FOLDER') return true;
+      if (typeof f.mime_type === 'string' && f.mime_type.indexOf('folder') >= 0) return true;
+      return false;
+    }
+
+    const truncatedPaths = []; // MAX_DEPTH 截断的路径，用于错误提示
+    const visitedShareIds = new Set();
+    async function listShareDir(parentId, dirPath, depth, useExistingData) {
+      if (depth > 10) {
+        log('warn listShareDir depth > 10, truncating at', dirPath);
+        truncatedPaths.push(dirPath);
+        return;
+      }
+      if (parentId && visitedShareIds.has(parentId)) {
+        log('warn listShareDir cycle', parentId); return;
+      }
+      if (parentId) visitedShareIds.add(parentId);
+      const isRoot = !parentId;
+      let pageToken = '';
+      for (;;) {
+        let j, rawText, r;
+        if (useExistingData && isRoot) {
+          // 主流程已调过 /share 验证 + 拿 pct，复用其 body，节省一次请求
+          j = useExistingData;
+          r = { status: 200 };
+          rawText = JSON.stringify(j);
+          useExistingData = null; // 仅首次复用
+        } else {
+          const qs = '?share_id=' + encodeURIComponent(shareId)
+            + (pwd ? '&pass_code=' + encodeURIComponent(pwd) : '')
+            + (passCodeToken ? '&pass_code_token=' + encodeURIComponent(passCodeToken) : '')
+            + (parentId ? '&parent_id=' + encodeURIComponent(parentId) : '')
+            + '&limit=30&keyword=&page_token=' + encodeURIComponent(pageToken)
+            + '&scene=NORMAL&order=DEFAULT_ORDER&thumbnail_size=SIZE_SMALL';
+          const url = API + (isRoot ? '/share' : '/share/detail') + qs;
+          try {
+            r = await fetch(url, { method: 'GET', headers: authHeaders, credentials: 'include' });
+            rawText = await r.text();
+            try { j = JSON.parse(rawText); } catch (_) { j = { _raw: rawText.slice(0, 200) }; }
+            if (r.status !== 200) { out.step = isRoot ? 'listroot' : 'listdir'; out.status = r.status; out.body = JSON.stringify(j).slice(0, 300); return; }
+          } catch (e) { out.step = isRoot ? 'listroot' : 'listdir'; out.status = 0; out.body = '列分享异常:' + String((e && e.message) || e); return; }
+        }
+        // 该层响应可能返回新的 pass_code_token（首次 root 必有），更新供下一层用
+        if (j && j.pass_code_token) passCodeToken = j.pass_code_token;
+        // 顶级分享 schema：files 在顶层；详细：files 也在顶层（实测抓包）
+        const files = Array.isArray(j.files) ? j.files : (j.data && Array.isArray(j.data.files) ? j.data.files : []);
+        let dcount = 0, fcount = 0;
+        for (const f of files) {
+          const fid = f.id || f.file_id || '';
+          const isFolder = detectIsFolder(f);
+          if (isFolder) dcount++; else fcount++;
+          const subPath = (dirPath ? dirPath + '/' : '') + (f.name || f.file_name || '');
+          if (isFolder && fid) {
+            await listShareDir(fid, subPath, depth + 1, null);
+          } else if (fid) {
+            allFiles.push({ share_file_id: fid, name: subPath || f.name, size: f.size || 0 });
+          } else {
+            log('WARN entry 缺 fid', JSON.stringify(f).slice(0, 200));
+          }
+        }
+        if (!firstResp) {
+          firstResp = {
+            url: (isRoot ? '/share' : '/share/detail') + ' (root listing reused, original URL was ' + shareQs + ')',
+            status: r.status, body: rawText.slice(0, 1200), fullText: rawText,
+            mode: isRoot ? 'LIST_SHARE_ROOT' : 'LIST_SHARE_DETAIL',
+            folderCnt: dcount, fileCnt: fcount,
+          };
+        }
+        pageToken = j.next_page_token || j.data?.next_page_token || '';
+        if (!pageToken) break;
+      }
+    }
+    log('listShareDir begin root');
+    await listShareDir('', '', 0, sd);
+    log('listShareDir done, allFiles.length=', allFiles.length);
+
+    // 诊断：无文件时给出可定位信息（含列目录现场 + 截断深度）
+    if (!allFiles.length) {
+      const diagKeys = Object.keys(sd || {}).join(',') || '(sd 空)';
+      const rootFiles = sd.files || [];
+      const firstFileKeys = rootFiles[0] ? Object.keys(rootFiles[0]).join(',') : '无 rootFiles';
+      const ldMode = firstResp ? (firstResp.mode || '-') : '-';
+      const ldUrl = firstResp ? firstResp.url : '(未调用列目录)';
+      const ldStatus = firstResp ? firstResp.status : '-';
+      const ldBody = firstResp ? firstResp.body : '-';
+      // 用完整响应文本反解 files 数量（不解析被截断的 1200B，避免误报 parse-err）
+      let ldFilesLen = '-';
+      const ldFull = firstResp ? firstResp.fullText : '';
+      if (ldFull) {
+        try { const pj = JSON.parse(ldFull); ldFilesLen = (pj.files || (pj.data && pj.data.files) || []).length; } catch (_) { ldFilesLen = 'JSON解析失败(响应非合法JSON)'; }
+      }
+      const ldFolderCnt = firstResp && firstResp.folderCnt !== undefined ? firstResp.folderCnt : '-';
+      const ldFileCnt = firstResp && firstResp.fileCnt !== undefined ? firstResp.fileCnt : '-';
+      out.step = 'detail'; out.status = 200;
+      out.body = '分享内没有可下载文件。诊断(build=r11，参考 netdisk-resolver 改用 /share + /share/detail)：\n'
+        + '① sd 字段=[' + diagKeys + ']\n'
+        + '② rootFiles.length=' + (rootFiles.length) + '；first file keys=[' + firstFileKeys + ']\n'
+        + '③ 已尝试：根目录 /share 列出 → 子目录 /share/detail 递归下钻，不做整份转存。\n'
+        + '④ 列目录现场=' + ldMode + '  status=' + ldStatus + '  URL=' + ldUrl + '\n'
+        + '⑤ 列目录响应 body（前 1200B）=' + ldBody + '\n'
+        + '⑥ 该响应内：files.length=' + ldFilesLen + '；其中 folder 数=' + ldFolderCnt + '，file 数=' + ldFileCnt + '。\n'
+        + '   folder 数≥1 但 file 数=0：可能 folder 嵌套超过 10 层，已在 truncatedPaths 标记；\n'
+        + '   → 若 file 数≥1 但本错误仍出现：说明 download 链路（/share/file_info 或 restore 兜底）有 bug，截图发我。';
+      return out;
+    }
+    log('files=', allFiles.length);
+
+    // 3) 逐文件取下载直链：fast path 用 /share/file_info（无副作用、不污染网盘），
+    //    失败回退到「单文件转 + /files/{id} 不带 usage=CONSUME」取 web_content_link。
+    //    关键事实：从 netdisk-resolver-v1.4 的 xunlei_dl_probe.json 抓包看，
+    //    /share/file_info 返回顶层或 file_info.web_content_link；若空就回退 restore。
+    const files = [];
+    const restoredIds = []; // best-effort 清理记录
+    for (const f of allFiles) {
+      let durl = '';
+      let lastErr = '';
+      let attemptMode = '';
+
+      // 3a) Fast path: /share/file_info?file_id=...&share_id=...&pass_code_token=...
+      try {
+        const fiQs = '?share_id=' + encodeURIComponent(shareId)
+          + (pwd ? '&pass_code=' + encodeURIComponent(pwd) : '')
+          + (passCodeToken ? '&pass_code_token=' + encodeURIComponent(passCodeToken) : '')
+          + '&file_id=' + encodeURIComponent(f.share_file_id)
+          + '&limit=30&scene=NORMAL&thumbnail_size=SIZE_SMALL';
+        const fiResp = await fetch(API + '/share/file_info' + fiQs, { method: 'GET', headers: authHeaders, credentials: 'include' });
+        const fit = await fiResp.text();
+        let fij;
+        try { fij = JSON.parse(fit); } catch (_) { fij = { _raw: fit.slice(0, 200) }; }
+        log('file_info', f.name, fiResp.status, fit.slice(0, 200));
+        if (fiResp.status === 200) {
+          const fileInfo = fij.file_info || fij;
+          durl = fileInfo.web_content_link || '';
+          const medias = fileInfo.medias || [];
+          if (!durl && medias.length) {
+            for (const m of medias) {
+              if (m && m.link && m.link.url) { durl = m.link.url; break; }
+            }
+          }
+          if (durl) attemptMode = 'FAST_PATH';
+        }
+      } catch (e) { log('file_info fast path err', String((e && e.message) || e)); }
+
+      // 3b) Fallback: 单文件转存 + /files/{id} 取 web_content_link（不带 usage=CONSUME）
+      if (!durl) {
+        log('fallback to restore-single-file for', f.name);
+        try {
+          const restoreBody = {
+            share_id: shareId,
+            pass_code_token: passCodeToken || '',
+            file_ids: [f.share_file_id],
+            folder_type: 'NORMAL',
+            specify_parent_id: true,
+            parent_id: '',
+          };
+          const rr = await fetch(API + '/share/restore', {
+            method: 'POST', headers: authHeaders, credentials: 'include',
+            body: JSON.stringify(restoreBody),
+          });
+          const rt = await rr.text();
+          let jTask;
+          try { jTask = JSON.parse(rt); } catch (_) { jTask = { _raw: rt.slice(0, 200) }; }
+          const restoreTaskId = (jTask && (jTask.task_id || jTask.restore_task_id || (jTask.data && (jTask.data.task_id || jTask.data.restore_task_id)))) || '';
+          if (!restoreTaskId) {
+            lastErr = 'restore 未返回 task_id：' + rt.slice(0, 200);
+          } else {
+            let newFileId = '';
+            for (let i = 0; i < 30; i++) {
+              await new Promise((res) => setTimeout(res, 800));
+              try {
+                const tresp = await fetch(API + '/tasks/' + encodeURIComponent(restoreTaskId), { method: 'GET', headers: authHeaders, credentials: 'include' });
+                const tt = await tresp.text();
+                let tj;
+                try { tj = JSON.parse(tt); } catch (_) { tj = { _raw: tt.slice(0, 200) }; }
+                if (tj && tj.progress === 100) {
+                  const params = tj.params || {};
+                  const traceStr = params.trace_file_ids || '';
+                  if (traceStr && typeof traceStr === 'string') {
+                    try {
+                      const m = JSON.parse(traceStr);
+                      newFileId = m[f.share_file_id] || (Object.values(m)[0]) || '';
+                    } catch (_) {}
+                  }
+                  if (!newFileId && Array.isArray(params.new_file_ids)) newFileId = params.new_file_ids[0];
+                  if (!newFileId && Array.isArray(params.file_ids)) newFileId = params.file_ids[0];
+                  break;
+                }
+              } catch (e) { log('task poll err', String((e && e.message) || e)); }
+            }
+            if (!newFileId) {
+              lastErr = 'restore task 完成但未取到 new_file_id';
+            } else {
+              restoredIds.push(newFileId);
+              // /files/{id} 不带 usage=CONSUME，否则 web_content_link 不返回
+              const dlResp = await fetch(API + '/files/' + encodeURIComponent(newFileId) + '?space=', {
+                method: 'GET', headers: authHeaders, credentials: 'include',
+              });
+              const dlText = await dlResp.text();
+              let dlJson;
+              try { dlJson = JSON.parse(dlText); } catch (_) { dlJson = { _raw: dlText.slice(0, 200) }; }
+              log('dl', f.name, dlResp.status, dlText.slice(0, 300));
+              if (dlResp.status === 200) {
+                const dd = dlJson.data || dlJson;
+                durl = dd.web_content_link || (dd.links && dd.links['application/octet-stream'] && dd.links['application/octet-stream'].url) || dd.url || '';
+                if (durl) attemptMode = 'TRANS';
+              } else {
+                lastErr = 'HTTP ' + dlResp.status + ' ' + dlText.slice(0, 200);
+              }
+            }
+          }
+        } catch (e) { lastErr = String((e && e.message) || e); }
+      }
+
+      if (!durl) {
+        out.ok = false;
+        out.step = 'download';
+        out.status = 0;
+        out.body = '文件[' + f.name + ']取直链失败（fast_path + trans 两条都未返回 web_content_link）：' + lastErr + '\n注：迅雷分享文件实际可下载；可能该文件不开放直链或受限。';
+        out.name = f.name;
+        return out;
+      }
+      files.push({ name: f.name, size: f.size || 0, url: durl, mode: attemptMode });
+    }
+    out.ok = true; out.files = files;
+    return out;
+  } catch (e) {
+    out.step = 'exception'; out.error = String((e && e.message) || e);
+    log('exception', out.error);
+    return out;
+  }
+}
+
+// 找一个已打开的 pan.xunlei.com 标签页（任意路径均可，分享页 /s/ 优先）；没有则返回 null
+async function getXunleiPageTab() {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://pan.xunlei.com/*' });
+    if (tabs && tabs.length) return tabs[0].id;
+  } catch (_) {}
+  return null;
+}
+
+// 迅雷云盘：在 pan.xunlei.com 页面上下文解析（见 xunleiApiFetch 说明）
+async function resolveXunlei(url, pwd) {
+  const m = url.match(/\/s\/([A-Za-z0-9_-]+)/);
+  const shareId = m ? m[1] : '';
+  if (!shareId) throw new Error('无法从链接提取迅雷 share_id（请使用 pan.xunlei.com/s/ 开头的分享链接）');
+  // 下载阶段需要 pan.xunlei.com 登录态 cookie（含 httpOnly），由 SW 侧读取后回传给 App 下载引擎
+  const cookie = await getCookieString('https://pan.xunlei.com');
+  const existing = await getXunleiPageTab();
+  let tabId = existing;
+  let tempTabId = null;
+  if (tabId == null) {
+    const tab = await chrome.tabs.create({ url: 'https://pan.xunlei.com/s/' + shareId, active: false });
+    tempTabId = tab.id;
+    await waitTabComplete(tempTabId);
+    tabId = tempTabId;
+  }
+  try {
+    // 等 SPA 稳定，避免注入时页面仍在跳转导致执行上下文被销毁（表现为 result:null）
+    await new Promise((rs) => setTimeout(rs, 1500));
+    let r = null;
+    let lastRes = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        lastRes = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: xunleiApiFetch,
+          args: [shareId, pwd || ''],
+        });
+        r = lastRes && lastRes[0] && lastRes[0].result;
+      } catch (e2) {
+        r = null;
+        lastRes = { injectError: String((e2 && e2.message) || e2) };
+        console.log('[xunlei] inject threw:', lastRes.injectError);
+      }
+      console.log('[xunlei] inject result(', attempt, ')=', JSON.stringify(r).slice(0, 500));
+      if (r && r.ok) break;
+      if (tempTabId == null) {
+        const tab = await chrome.tabs.create({ url: 'https://pan.xunlei.com/s/' + shareId, active: false });
+        tempTabId = tab.id;
+        await waitTabComplete(tempTabId);
+        tabId = tempTabId;
+      } else {
+        await waitTabComplete(tabId);
+      }
+      await new Promise((rs) => setTimeout(rs, 800));
+    }
+    if (!r || !r.ok) {
+      const detail = r ? (r.error || r.body || '无详情') : (lastRes && lastRes.injectError ? ('inject失败:' + lastRes.injectError) : JSON.stringify(lastRes));
+      const hint = /登录|未登录|请先登录/i.test(detail) ? '；请确认已在当前浏览器登录 pan.xunlei.com 迅雷网盘（扩展借用你的登录态）' : '';
+      throw new Error('迅雷解析失败(' + (r ? r.step : 'null-result') + ')：' + detail + hint);
+    }
+    const files = r.files || [];
+    if (!files.length) throw new Error('迅雷解析为空(分享内无文件)');
+    return files.map((f) => ({
+      name: f.name,
+      size: bytesToSize(f.size),
+      url: f.url,
+      headers: { Referer: 'https://pan.xunlei.com/', 'User-Agent': navigator.userAgent, Cookie: cookie },
+    }));
+  } finally {
+    if (tempTabId != null) { try { await chrome.tabs.remove(tempTabId); } catch (_) {} }
+  }
 }
 
 // 天翼云盘：使用第三方解析 API（52api.cn），需用户在扩展存储配置 tianyi_api_key
@@ -1226,6 +2156,7 @@ async function resolveNetdisk(req) {
     case 'baidu': return await resolveBaidu(req.url, req.pwd);
     case 'aliyun': return await resolveAliyun(req.url, req.pwd);
     case 'quark': return await resolveQuark(req.url, req.pwd);
+    case 'xunlei': return await resolveXunlei(req.url, req.pwd);
     case 'pan123': return await resolvePan123(req.url, req.pwd);
     case 'tianyi': return await resolveTianyi(req.url, req.pwd);
     default: throw new Error('不支持的网盘平台：' + (req.url || ''));

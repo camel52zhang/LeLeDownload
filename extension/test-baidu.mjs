@@ -141,6 +141,18 @@ async function baiduGetSign(apiShorturl) {
   };
 }
 
+// r20 镜像：登录态取 bdstoken（GET /api/gettemplatevariable），匿名返回 ''
+async function baiduGetBdstoken() {
+  try {
+    const bd = await fetchJson('https://pan.baidu.com/api/gettemplatevariable?fields=' + encodeURIComponent('["bdstoken"]'), {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Referer: 'https://pan.baidu.com/disk/home' },
+    });
+    if (bd && bd.errno === 0 && bd.result && bd.result.bdstoken) return String(bd.result.bdstoken);
+    return '';
+  } catch (_) { return ''; }
+}
+
 // 提取码验证：先 /share/verify 拿 randsk（BDCLND）并桥接进 cookie jar，否则 sharedownload 报 errno 9019
 async function baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp) {
   const signTs = (sign && timestamp)
@@ -208,6 +220,8 @@ async function resolveBaidu(url, pwd) {
   const shareid = topList.shareid;
   const sekey = topList.seckey ? safeDecode(topList.seckey) : '';
   const { sign, timestamp } = await baiduGetSign(apiShorturl);
+  // r20 镜像：登录态取 bdstoken，sharedownload 带上可降低 errno -20 风控
+  const bdstoken = await baiduGetBdstoken();
 
   const out = [];
   let triedVerify = false;
@@ -242,6 +256,7 @@ async function resolveBaidu(url, pwd) {
         const dlUrl = 'https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&app_id=250528'
           + (sign ? '&sign=' + encodeURIComponent(sign) : '')
           + (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '')
+          + (bdstoken ? '&bdstoken=' + encodeURIComponent(bdstoken) : '')
           + '&web=1';
         let sd;
         try {
@@ -278,15 +293,18 @@ async function resolveBaidu(url, pwd) {
           }
           break;
         }
-        // 与 background.js resolveBaidu 镜像：把 show_msg/errmsg 提到主文案前面，errno -20 加风控引导
+        // 与 background.js resolveBaidu 镜像：show_msg 前置 + errno -20 风控引导 + r21 跳端下载识别
         const serverMsg = sd.show_msg || sd.errmsg || '';
         const enPart = (typeof en !== 'undefined' && en !== '') ? ('errno ' + en) : '无 errno';
-        const hint = (en === -20)
-          ? '（百度判定触发风控/验证码。建议：先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
-          : '';
+        const isJumpToClient = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
+        const hint = isJumpToClient
+          ? '（百度限制该文件在网页端直接下载（返回 list:string 跳端下载指令，官方要求跳转 PC 客户端）。建议：换一个分享链接；或直接在浏览器打开该分享并用百度网盘客户端下载）'
+          : ((en === -20)
+            ? '（百度判定触发风控/验证码。建议：若已登录百度网盘账号会显著降低风控；未登录请先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
+            : '');
         if (en !== 9019) {
           throw new Error(
-            '百度接口提示：' + (serverMsg || '未返回 dlink') +
+            '百度接口提示：' + (serverMsg || (isJumpToClient ? '该文件被限制网页端直接下载' : '未返回 dlink')) +
             '（' + enPart + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）' +
             hint + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
           );
@@ -769,4 +787,79 @@ test('resolveBaidu 嵌套 folder（A→B→file）多层递归展开', async () 
   // 根 + /A + /A/B 共 3 次 wxlist
   const wxlistCalls = rec.calls.filter(c => c.url.includes('share/wxlist'));
   assert.equal(wxlistCalls.length, 3, '应触发根 + /A + /A/B 共 3 次 wxlist');
+});
+
+// T21: r20 bdstoken —— gettemplatevariable 返回 bdstoken 时 sharedownload URL 带 bdstoken 参数
+test('resolveBaidu 登录态 bdstoken → sharedownload URL 带 bdstoken（r20）', async () => {
+  const rec = makeRecorder();
+  rec._handler = (u) => {
+    const s = String(u);
+    if (s.includes('share/wxlist')) return { text: async () => JSON.stringify({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 1, server_filename: 'a.txt', size: 10, isdir: 0 }] } }), ok: true };
+    if (s.includes('share/tplconfig')) return { text: async () => JSON.stringify({ data: { sign: 'SIGN', timestamp: '1700000000' } }), ok: true };
+    if (s.includes('gettemplatevariable')) return { text: async () => JSON.stringify({ errno: 0, result: { bdstoken: 'BDTOKEN123' } }), ok: true };
+    if (s.includes('api/sharedownload')) return { text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }), ok: true };
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const out = await resolveBaidu('https://pan.baidu.com/share/init?surl=abc123&pwd=q7g4', '');
+    assert.equal(out.length, 1);
+    const sd = findCall(rec.calls, 'api/sharedownload');
+    assert.ok(sd, '应发起 sharedownload');
+    assert.ok(sd.url.includes('bdstoken=BDTOKEN123'), 'sharedownload URL 应带 bdstoken=BDTOKEN123，实际: ' + sd.url);
+    // 未登录场景（gettemplatevariable errno -6）→ 不带 bdstoken
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+// T22: r20 未登录（gettemplatevariable errno -6）→ sharedownload URL 不带 bdstoken
+test('resolveBaidu 未登录 → sharedownload 不带 bdstoken（r20）', async () => {
+  const rec = makeRecorder();
+  rec._handler = (u) => {
+    const s = String(u);
+    if (s.includes('share/wxlist')) return { text: async () => JSON.stringify({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 1, server_filename: 'a.txt', size: 10, isdir: 0 }] } }), ok: true };
+    if (s.includes('share/tplconfig')) return { text: async () => JSON.stringify({ data: { sign: 'SIGN', timestamp: '1700000000' } }), ok: true };
+    if (s.includes('gettemplatevariable')) return { text: async () => JSON.stringify({ errno: -6, result: [] }), ok: true };
+    if (s.includes('api/sharedownload')) return { text: async () => JSON.stringify({ errno: 0, list: [{ dlink: 'https://d.pcs.baidu.com/dl/a.txt' }] }), ok: true };
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const out = await resolveBaidu('https://pan.baidu.com/share/init?surl=abc123&pwd=q7g4', '');
+    assert.equal(out.length, 1);
+    const sd = findCall(rec.calls, 'api/sharedownload');
+    assert.ok(sd, '应发起 sharedownload');
+    assert.ok(!sd.url.includes('bdstoken='), '未登录时 sharedownload 不应带 bdstoken，实际: ' + sd.url);
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+// T23: r21 errno 0 + list 字符串（跳端下载）→ 识别为「限制网页端直接下载」而非「未返回 dlink」
+test('resolveBaidu errno 0 + list:string（跳端下载）→ 提示「限制网页端直接下载」（r21）', async () => {
+  const rec = makeRecorder();
+  rec._handler = (u) => {
+    const s = String(u);
+    if (s.includes('share/wxlist')) return { text: async () => JSON.stringify({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 1, server_filename: 'a.txt', size: 10, isdir: 0 }] } }), ok: true };
+    if (s.includes('share/tplconfig')) return { text: async () => JSON.stringify({ data: { sign: 'SIGN', timestamp: '1700000000' } }), ok: true };
+    if (s.includes('gettemplatevariable')) return { text: async () => JSON.stringify({ errno: -6, result: [] }), ok: true };
+    if (s.includes('api/sharedownload')) return { text: async () => JSON.stringify({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' }), ok: true };
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    await assert.rejects(
+      () => resolveBaidu('https://pan.baidu.com/share/init?surl=abc123&pwd=q7g4', ''),
+      (err) => {
+        const msg = String(err.message);
+        return /该文件被限制网页端直接下载/.test(msg)
+          && /跳端下载/.test(msg)
+          && /PC 客户端/.test(msg)
+          && !/未返回 dlink/.test(msg);
+      }
+    );
+  } finally {
+    delete globalThis.fetch;
+  }
 });

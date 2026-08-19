@@ -36,6 +36,7 @@ const PLATFORMS: { key: string; label: string; match: (h: string) => boolean }[]
       h.includes('123pan') || h.includes('123912') || h.includes('123685') || h.includes('123959'),
   },
   { key: 'tianyi', label: '天翼云盘', match: (h) => h.includes('cloud.189') || h.includes('189.cn') },
+  { key: 'xunlei', label: '迅雷云盘', match: (h) => h.includes('xunlei') },
 ]
 
 function detectPlatform(u: string): { key: string | null; label: string } {
@@ -47,6 +48,26 @@ function detectPlatform(u: string): { key: string | null; label: string } {
     /* ignore */
   }
   return { key: null, label: '自动' }
+}
+
+// 百度 / 迅雷的分享链接常带 ?pwd=xxxx；用户粘贴时习惯把链接和提取码一起复制，
+// 但 UI 上还要求「提取码」单独填——不自动提取就会触发 PASS_CODE_EMPTY。
+// 正则匹配而非 URL API，保留用户原始 URL 格式（不去做百分号重编码）。
+// 支持的键名：pwd / password / code / p（迅雷/百度/123 实际只用 pwd）。
+function extractPwdFromUrl(rawUrl: string): { cleanUrl: string; pwd: string | null } {
+  const m = rawUrl.match(/[?&](?:pwd|password|code|p)=([^&#]+)/i)
+  if (!m) return { cleanUrl: rawUrl, pwd: null }
+  let pwd = ''
+  try {
+    pwd = decodeURIComponent(m[1])
+  } catch {
+    pwd = m[1]
+  }
+  // 去掉该参数本身（保留其它 query 如 from / utm 等）
+  let clean = rawUrl.replace(/[?&](?:pwd|password|code|p)=[^&#]+/i, '')
+  // 收尾：剥掉孤立的 ? 或 &
+  clean = clean.replace(/[?&]$/, '')
+  return { cleanUrl: clean, pwd }
 }
 
 export function NetdiskPanel() {
@@ -96,7 +117,7 @@ export function NetdiskPanel() {
     const p = detectPlatform(url)
     setPlatform(p.label)
     if (!p.key) {
-      setError('暂不支持该链接所属的网盘平台（当前支持：百度 / 阿里 / 夸克 / 123 / 天翼）')
+      setError('暂不支持该链接所属的网盘平台（当前支持：百度 / 阿里 / 夸克 / 123 / 天翼 / 迅雷）')
       return
     }
     setError('')
@@ -153,7 +174,13 @@ export function NetdiskPanel() {
               <input
                 type="text"
                 value={url}
-                onChange={(e) => setUrl(e.target.value)}
+                onChange={(e) => {
+                  // 粘贴百度/迅雷分享链接时，常带 ?pwd=xxxx / ?password= / ?code=
+                  // 这里自动提取并填到「提取码」输入框，并把 URL 显示清干净。
+                  const { cleanUrl, pwd } = extractPwdFromUrl(e.target.value)
+                  setUrl(cleanUrl)
+                  if (pwd) setPwd(pwd)
+                }}
                 placeholder="https://pan.baidu.com/s/xxxx 或 https://www.123pan.com/s/xxxx"
                 className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-200"
               />
