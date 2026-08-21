@@ -396,3 +396,55 @@ pub fn open_extension_folder(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+
+// ===========================================================================
+// BitTorrent / 磁力下载命令（librqbit 嵌入式会话，见 torrent.rs）
+// ===========================================================================
+
+/// 添加磁力链接或 .torrent 文件下载任务。
+/// source: "magnet:?xt=..." / "http(s)://.../x.torrent" / 本地 ".torrent 文件路径"
+/// save_dir 可选（缺省用用户首选下载目录）
+#[tauri::command]
+pub async fn bt_add_torrent(source: String, save_dir: Option<String>) -> Result<serde_json::Value, String> {
+    let default_dir = std::path::PathBuf::from(get_default_save_dir());
+    crate::torrent::add_torrent(source, save_dir, default_dir).await
+}
+
+/// 列出所有 BT 任务（含进度/速度/状态）
+#[tauri::command]
+pub fn bt_list_tasks() -> Vec<serde_json::Value> {
+    crate::torrent::list_tasks()
+}
+
+/// 添加前快速预检磁力资源是否有活跃做种者（走 librqbit list_only 真实取 metadata，不下载）。
+/// 返回 { can_download: bool, reason?, name?, file_count?, total_bytes?, seen_peers?, message }。
+/// can_download=false 表示资源当前无活跃做种者，前端应弹确认让用户决定是否仍添加。
+#[tauri::command]
+pub async fn bt_precheck(source: String) -> Result<serde_json::Value, String> {
+    let default_dir = std::path::PathBuf::from(get_default_save_dir());
+    crate::torrent::precheck_torrent(source, default_dir).await
+}
+
+/// 查询单个 BT 任务状态
+#[tauri::command]
+pub fn bt_task_stats(id: String) -> Option<serde_json::Value> {
+    crate::torrent::task_stats(&id)
+}
+
+/// 暂停 BT 任务
+#[tauri::command]
+pub async fn bt_pause(id: String) -> Result<(), String> {
+    crate::torrent::pause_task(&id).await
+}
+
+/// 恢复 BT 任务
+#[tauri::command]
+pub async fn bt_resume(id: String) -> Result<(), String> {
+    crate::torrent::resume_task(&id).await
+}
+
+/// 删除 BT 任务（停止下载，不删已下载文件）
+#[tauri::command]
+pub async fn bt_remove(id: String) -> Result<(), String> {
+    crate::torrent::remove_task(&id).await
+}

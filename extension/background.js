@@ -34,7 +34,7 @@ function ensureMenu() {
     chrome.contextMenus.create({
       id: MENU_ID,
       title: '使用乐乐下载器下载',
-      contexts: ['link', 'image', 'video', 'audio', 'page']
+      contexts: ['link', 'image', 'video', 'audio', 'page', 'selection']
     }, () => {
       // 重复创建（id 已存在）会产生 lastError，属正常，忽略即可
       if (chrome.runtime.lastError) {
@@ -102,10 +102,20 @@ async function sendToLeleDownload(url, headers) {
       cache: 'no-store'
     });
     clearTimeout(timer);
-    return response.ok;
+    if (response.ok) return { ok: true };
+    // App 拒绝了：尝试从 JSON 响应体提取精确 msg
+    // （magnet 路由会回 {e:'bt_failed',msg:'...'}；HTTP 路由会回 url_blocked/create_failed）
+    let msg = '';
+    try {
+      const txt = await response.text();
+      const j = JSON.parse(txt);
+      if (j && typeof j.msg === 'string') msg = j.msg;
+    } catch (_) { /* 不是 JSON 时忽略，落到下方通用提示 */ }
+    if (msg) console.log('[乐乐] App 拒绝：', msg);
+    return { ok: false, msg: msg };
   } catch (e) {
     console.log('[乐乐] 发送下载请求失败：', e);
-    return false;
+    return { ok: false, msg: String((e && e.message) || e) };
   }
 }
 
@@ -127,9 +137,11 @@ async function handleShareLink(message) {
   }
   shareLinkSentCache[url] = now;
 
-  const ok = await sendToLeleDownload(url, headers);
-  if (ok) {
+  const res = await sendToLeleDownload(url, headers);
+  if (res.ok) {
     notify('已发送到乐乐下载器');
+  } else if (res.msg) {
+    notify('解析失败：' + res.msg);
   } else {
     const online = await isAppOnline();
     notify(online ? '解析失败，请改用浏览器原生下载' : '请先运行乐乐下载器，再重试');
@@ -148,25 +160,75 @@ async function captureUrl(url) {
   }
   const name = (url || '').split('/').pop() || url;
   console.log('[乐乐] 准备发送：', url);
-  const ok = await sendToLeleDownload(url);
-  if (ok) {
+  const res = await sendToLeleDownload(url);
+  if (res.ok) {
     notify('已发送到乐乐下载器：' + name);
-  } else {
-    // 发送失败：可能是 App 未运行，做一次在线探测以给出精确提示
-    const online = await isAppOnline();
-    notify(online
-      ? '发送失败，请确认乐乐下载器可正常接收任务'
-      : '请先运行乐乐下载器，再重试');
+    return true;
   }
-  return ok;
+  // 失败：有具体 msg 时直接展示（最常见是 BT 引擎拒绝：连接 tracker 失败、
+  // 无做种者、metadata 取不到等），否则回退旧的"App 在线/离线"二选一提示。
+  if (res.msg) {
+    notify('发送失败：' + res.msg);
+    return false;
+  }
+  const online = await isAppOnline();
+  notify(online
+    ? '发送失败，请确认乐乐下载器可正常接收任务'
+    : '请先运行乐乐下载器，再重试');
+  return false;
 }
 
+// content-script（magnet-context.js）在页面右键磁力/种子链接时，把真实 href 发来，
+// 绕过 Chrome 对非标准协议（magnet:/thunder:/ed2k:）链接不填充 contextMenus linkUrl 的坑。
+let lastRightClickedMagnet = '';
+try {
+  chrome.runtime.onMessage.addListener((msg, _sender) => {
+    if (msg && msg.type === 'lele-magnet-href' && typeof msg.href === 'string') {
+      lastRightClickedMagnet = msg.href;
+    }
+  });
+} catch (_) {}
+
 // 右键菜单：显式发送（不受 autoCapture 开关影响）
-chrome.contextMenus.onClicked.addListener((info, _tab) => {
+chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
   if (info.menuItemId !== MENU_ID) return;
-  const url = info.linkUrl || info.srcUrl || info.pageUrl;
-  console.log('[乐乐] 右键菜单点击, menuItemId=', info.menuItemId, 'url=', url);
-  captureUrl(url);
+  // 优先级：linkUrl（标准协议 Chrome 会给）→ 媒体源/选中文本/页面
+  let url = info.linkUrl || info.srcUrl || info.selectionText || info.pageUrl;
+
+  // 非标准协议（magnet: 等）Chrome 常不填充 linkUrl，走 content-script 兜底的 href。
+  // 用重试轮询读取 storage + 内存兜底，规避 MV3 SW 唤醒/消息时序竞态。
+  if (!url || (!url.startsWith('magnet:') && !/^https?:\/\//.test(url))) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      let candidate = null;
+      try {
+        const stored = await new Promise((resolve) => {
+          chrome.storage.local.get(['lele_last_magnet'], (r) => resolve(r.lele_last_magnet));
+        });
+        if (stored) candidate = stored;
+      } catch (_) {}
+      if (!candidate && lastRightClickedMagnet) candidate = lastRightClickedMagnet;
+      if (candidate && (candidate.startsWith('magnet:') || /^https?:\/\//.test(candidate))) {
+        url = candidate;
+        break;
+      }
+      await new Promise(r => setTimeout(r, 80));
+    }
+  }
+
+  // 兜底：从选中文本提取
+  if ((!url || !/^(magnet:|https?:\/\/)/.test(url)) && info.selectionText) {
+    const m = info.selectionText.match(/(magnet:\?[^\s]+|https?:\/\/[^\s]+)/i);
+    if (m) url = m[1];
+  }
+
+  console.log('[乐乐] 右键菜单点击, menuItemId=', info.menuItemId, 'url=', url, 'linkUrl=', info.linkUrl);
+  if (!url || !/^(magnet:|https?:\/\/)/.test(url)) {
+    // 临时诊断：便于定位为何没捕获到磁力（装好验证后可删）
+    notify('调试：未捕获到磁力/HTTP 链接（linkUrl=' + (info.linkUrl || '空') + '，content-script 兜底也未命中）');
+    return;
+  }
+  lastRightClickedMagnet = ''; // 消费后清空，避免误用上一次残留
+  captureUrl(url.trim());
 });
 
 // ---------------------------------------------------------------------------
@@ -273,15 +335,15 @@ chrome.downloads.onCreated.addListener((item) => {
     }
     // 组装浏览器头（UA/Referer/Origin/Cookie）后下发；组装失败则回退无头接管
     buildWetransferHeaders().then((headers) => {
-      sendToLeleDownload(item.url, headers).then((ok) => {
-        if (ok) {
+      sendToLeleDownload(item.url, headers).then((res) => {
+        if (res.ok) {
           try {
             chrome.downloads.cancel(item.id);
             chrome.downloads.erase({ id: item.id });
           } catch (_) { /* Firefox 部分版本 cancel 行为差异，忽略 */ }
           notify('乐乐下载器已接管 WeTransfer：' + filename);
         }
-        // 未成功（App 离线）：保持浏览器原生下载，不取消
+        // 未成功（App 离线 / 接管失败）：保持浏览器原生下载，不取消
       });
     }).catch((e) => {
       console.log('[乐乐] WeTransfer 头组装失败，回退无头接管：', e);
@@ -292,8 +354,8 @@ chrome.downloads.onCreated.addListener((item) => {
 
   console.log('[乐乐] 检测到下载，尝试接管：', item.url);
   // 先尝试把链接交给 App；成功才取消浏览器默认下载，避免 App 未运行时误伤。
-  sendToLeleDownload(item.url).then((ok) => {
-    if (ok) {
+  sendToLeleDownload(item.url).then((res) => {
+    if (res.ok) {
       try {
         chrome.downloads.cancel(item.id);
         chrome.downloads.erase({ id: item.id });

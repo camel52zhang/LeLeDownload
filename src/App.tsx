@@ -1,14 +1,16 @@
 ﻿import { useState, useEffect, useRef, useMemo } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
-import { X } from 'lucide-react'
+import { X, Play, Pause, Trash2 } from 'lucide-react'
 import { Header, DownloadForm, DownloadItem, StatusBar, EmptyState, SettingsPanel, NetdiskPanel } from './components'
-import type { DownloadTask } from './types'
+import type { DownloadTask, BtTask, BtPrecheckResult } from './types'
+import { formatBytes, formatSpeed } from './lib/format'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { checkForUpdate, downloadAndInstallUpdate, getUpdate } from './lib/updater'
 
 function App() {
   const [tasks, setTasks] = useState<DownloadTask[]>([])
+  const [btTasks, setBtTasks] = useState<BtTask[]>([])
   const [showSettings, setShowSettings] = useState(false)
   const [isAdding, setIsAdding] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -70,7 +72,65 @@ function App() {
   }, [])
 
   async function loadDownloads() { try { const downloads = await invoke<DownloadTask[]>('get_downloads'); setTasks(downloads) } catch (err) { console.error('Failed to load downloads:', err) } }
-  async function addDownload(url: string, saveDir?: string) { setIsAdding(true); try { const dir = saveDir || downloadDir || undefined; await invoke('create_download', { url, saveDir: dir }); loadDownloads() } catch (err) { console.error('Failed to create download:', err); alert('创建下载失败: ' + err) } finally { setIsAdding(false) } }
+  async function loadBtTasks() { try { const bt = await invoke<BtTask[]>('bt_list_tasks'); setBtTasks(bt) } catch (err) { console.error('Failed to load BT tasks:', err) } }
+
+  // BT 任务轮询（有 BT 任务时每 2s 刷新进度/速度）
+  useEffect(() => {
+    if (btTasks.length === 0) return
+    const timer = setInterval(loadBtTasks, 2000)
+    return () => clearInterval(timer)
+  }, [btTasks.length > 0])
+
+  const isBtSource = (url: string) => url.trim().startsWith('magnet:') || /\.torrent($|\?)/i.test(url.trim())
+  // invoke 包超时：librqbit 启动 DHT/UTP listener 偶尔阻塞，前端 30s 后强制断 Promise 让 finally 执行重置按钮
+  function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    return Promise.race([
+      p,
+      new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`${label}超时（${ms / 1000}s）。librqbit 启动监听端口/DHT 阻塞，可能是防火墙拦截或网络受限。请检查后重试`)), ms)),
+    ])
+  }
+
+  async function addDownload(url: string, saveDir?: string) {
+    setIsAdding(true)
+    try {
+      const dir = saveDir || downloadDir || undefined
+      if (isBtSource(url)) {
+        // 磁力 / torrent → BT 会话（后端 15s+60s 双重超时；前端 70s 兜底保险）
+        // 先快速预检：判断资源是否有活跃做种者（list_only 真实取 metadata，不下载）。
+        // 首次运行时预检会顺带初始化 BT 会话（≤15s），故前端超时放宽到 45s。
+        const pre = await withTimeout(
+          invoke<BtPrecheckResult>('bt_precheck', { source: url.trim() }),
+          45000,
+          'BT 资源预检',
+        )
+        // 资源当前无活跃做种者：明确告知，让用户决定是否仍要尝试添加（避免误以为软件坏了）
+        if (pre && pre.can_download === false) {
+          const ok = window.confirm(pre.message + '\n\n仍要尝试添加吗？')
+          if (!ok) {
+            setIsAdding(false)
+            return
+          }
+        }
+        await withTimeout(invoke('bt_add_torrent', { source: url.trim(), saveDir: dir }), 70000, '添加 BT 任务')
+        await loadBtTasks()
+      } else {
+        await invoke('create_download', { url, saveDir: dir })
+        loadDownloads()
+      }
+    } catch (err) {
+      console.error('Failed to create download:', err)
+      // Tauri v2 invoke reject.value 直接是后端 Result 的 Err 值（我们用 String）。
+      // 当作 Error 取 .message 会得到 undefined（→ alert 显示 "undefined"）。
+      // 兼容 string | Error | unknown。
+      const msg = typeof err === 'string' ? err : (err instanceof Error ? err.message : String(err))
+      // 先恢复按钮，避免 alert 阻塞期间仍显示"添加中"的卡顿错觉
+      setIsAdding(false)
+      setTimeout(() => alert('创建下载失败: ' + msg), 0)
+    } finally { setIsAdding(false) }
+  }
+  async function handleBtPause(id: string) { try { await invoke('bt_pause', { id }); loadBtTasks() } catch (err) { console.error('Failed to pause BT:', err) } }
+  async function handleBtResume(id: string) { try { await invoke('bt_resume', { id }); loadBtTasks() } catch (err) { console.error('Failed to resume BT:', err) } }
+  async function handleBtRemove(id: string) { try { await invoke('bt_remove', { id }); loadBtTasks() } catch (err) { console.error('Failed to remove BT:', err) } }
   function handleSaveSettings(settings: { downloadPath: string }) { const dir = settings.downloadPath; if (dir) { setDownloadDir(dir); localStorage.setItem('download_dir', dir) } }
   async function handlePause(task: DownloadTask) { try { await invoke('pause_download', { id: task.id }); setTasks(prev => prev.map(t => t.id === task.id ? { ...t, status: 'paused' } : t)) } catch (err) { console.error('Failed to pause:', err) } }
   async function handleResume(task: DownloadTask) { try { await invoke('resume_download', { id: task.id }); setTasks(prev => prev.map(t => t.id === task.id ? { ...t, status: 'downloading' } : t)) } catch (err) { console.error('Failed to resume:', err) } }
@@ -116,8 +176,34 @@ function App() {
         <div className="ml-auto text-xs text-gray-400">{sortedTasks.length} 个任务{searchQuery || filterStatus !== 'all' ? ' (筛选)' : ''}</div>
       </div>
       <main className="flex-1 overflow-auto p-3 sm:p-4">
+        {btTasks.length > 0 && (<div className="mb-4">
+          <div className="flex items-center gap-2 mb-2"><span className="text-xs font-medium text-indigo-600 bg-indigo-100 px-2 py-0.5 rounded">BT 任务</span><span className="text-xs text-gray-400">{btTasks.length} 个（磁力/种子）</span></div>
+          <div className="w-full space-y-2">
+            {btTasks.map(t => (<div key={t.id} className="bg-white rounded-xl border border-gray-100 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-gray-800 truncate" title={t.name}>{t.name}</div>
+                  <div className="flex items-center gap-3 mt-1 text-xs text-gray-500">
+                    <span className={t.state === 'downloading' ? 'text-blue-600' : t.state === 'completed' ? 'text-green-600' : t.state === 'error' ? 'text-red-600' : t.state === 'fetching_metadata' ? 'text-indigo-600 animate-pulse' : 'text-yellow-600'}>
+                      {t.state === 'downloading' ? '下载中' : t.state === 'paused' ? '已暂停' : t.state === 'completed' ? '已完成' : t.state === 'fetching_metadata' ? '获取元数据中…' : '异常'}
+                    </span>
+                    <span>{t.progress.toFixed(1)}%</span>
+                    <span>{formatBytes(t.downloaded_bytes)} / {formatBytes(t.total_bytes)}</span>
+                    {(t.state === 'downloading' || t.state === 'fetching_metadata') && <span>↓ {formatSpeed(t.download_rate)} ↑ {formatSpeed(t.upload_rate)}</span>}
+                  </div>
+                  <div className="mt-1.5 h-1.5 bg-gray-100 rounded-full overflow-hidden"><div className="h-full bg-indigo-500 rounded-full transition-all" style={{ width: Math.min(100, t.progress) + '%' }} /></div>
+                </div>
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  {t.state === 'downloading' && <button onClick={() => handleBtPause(t.id)} className="p-1.5 text-gray-400 hover:text-yellow-600 hover:bg-yellow-50 rounded-lg" title="暂停"><Pause className="w-4 h-4" /></button>}
+                  {t.state === 'paused' && <button onClick={() => handleBtResume(t.id)} className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg" title="恢复"><Play className="w-4 h-4" /></button>}
+                  <button onClick={() => handleBtRemove(t.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg" title="删除"><Trash2 className="w-4 h-4" /></button>
+                </div>
+              </div>
+            </div>))}
+          </div>
+        </div>)}
         {filterStatus === 'completed' && filteredTasks.length > 0 && (<div className="flex items-center gap-3 mb-3"><input type="checkbox" checked={selectedIds.size === filteredTasks.length && filteredTasks.length > 0} onChange={handleSelectAll} className="w-4 h-4 rounded border-gray-300 text-indigo-600" /><span className="text-sm text-gray-500">全选 ({selectedIds.size}/{filteredTasks.length})</span>{selectedIds.size > 0 && (<button onClick={handleBatchDelete} className="px-3 py-1 text-sm text-red-600 hover:bg-red-50 rounded-lg">删除选中</button>)}</div>)}
-        {sortedTasks.length === 0 ? <EmptyState /> : <div className="w-full space-y-2">{sortedTasks.map(task => (<div key={task.id} className="flex items-center gap-2">{task.status === 'completed' && <input type="checkbox" checked={selectedIds.has(task.id)} onChange={() => handleToggleSelect(task.id)} className="w-4 h-4 rounded border-gray-300 text-indigo-600 flex-shrink-0" />}<div className="flex-1 min-w-0"><DownloadItem task={task} onPause={handlePause} onResume={handleResume} onCancel={handleCancel} onRemove={handleRemove} /></div></div>))}</div>}
+        {sortedTasks.length === 0 && btTasks.length === 0 ? <EmptyState /> : <div className="w-full space-y-2">{sortedTasks.map(task => (<div key={task.id} className="flex items-center gap-2">{task.status === 'completed' && <input type="checkbox" checked={selectedIds.has(task.id)} onChange={() => handleToggleSelect(task.id)} className="w-4 h-4 rounded border-gray-300 text-indigo-600 flex-shrink-0" />}<div className="flex-1 min-w-0"><DownloadItem task={task} onPause={handlePause} onResume={handleResume} onCancel={handleCancel} onRemove={handleRemove} /></div></div>))}</div>}
       </main>
       <StatusBar totalTasks={tasks.length} downloadingCount={downloadingCount} onClearCompleted={handleClearCompleted} hasCompleted={hasCompleted} />
       </>)}

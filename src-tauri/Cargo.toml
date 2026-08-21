@@ -1,6 +1,6 @@
 [package]
 name = "lele_download"
-version = "26.8.19"
+version = "26.8.21"
 description = "LeLe Download Manager"
 authors = ["DownloadMaster"]
 edition = "2021"
@@ -28,6 +28,9 @@ url = "2.5"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+# BitTorrent / 磁力下载（纯 Rust 嵌入式 BT 客户端）
+librqbit = "9"
+hex = "0.4"
 
 [features]
 default = ["custom-protocol"]

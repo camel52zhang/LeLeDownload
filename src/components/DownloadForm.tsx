@@ -23,7 +23,7 @@ export function DownloadForm({ onAdd, isLoading }: DownloadFormProps) {
       e.preventDefault()
       const validUrls = lines.filter(line => {
         const trimmed = line.trim()
-        return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('ftp://')
+        return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('ftp://') || trimmed.startsWith('magnet:') || /\.torrent(\$|\?)/i.test(trimmed)
       })
       if (validUrls.length > 0) {
         setUrls(validUrls)
@@ -58,7 +58,7 @@ export function DownloadForm({ onAdd, isLoading }: DownloadFormProps) {
       const lines = text.split(/[\n\r]+/).filter(line => line.trim())
       const validUrls = lines.filter(line => {
         const trimmed = line.trim()
-        return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('ftp://')
+        return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('ftp://') || trimmed.startsWith('magnet:') || /\.torrent(\$|\?)/i.test(trimmed)
       })
       if (validUrls.length > 0) {
         setUrls(validUrls)

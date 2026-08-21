@@ -25,3 +25,27 @@ export interface DownloadProgress {
   progress: number;
   status: DownloadTask['status'];
 }
+
+// BitTorrent / 磁力任务（librqbit 会话，独立于 HTTP 下载列表）
+export interface BtTask {
+  id: string;
+  name: string;
+  state: 'downloading' | 'paused' | 'completed' | 'error' | 'fetching_metadata';
+  progress: number;          // 0-100
+  download_rate: number;     // B/s
+  upload_rate: number;       // B/s
+  downloaded_bytes: number;
+  total_bytes: number;
+}
+
+// 添加前的磁力资源预检结果（后端 bt_precheck，list_only 真实取 metadata）
+export interface BtPrecheckResult {
+  can_download: boolean;         // false = 无活跃做种者 / 取不到 metadata
+  reason?: string;               // 'no_metadata' | 'already_managed' | ...
+  info_hash?: string;
+  name?: string;
+  file_count?: number;
+  total_bytes?: number;
+  seen_peers?: number;
+  message: string;               // 给用户的可读说明
+}

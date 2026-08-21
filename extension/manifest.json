@@ -27,6 +27,12 @@
       ],
       "js": ["content-script.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["magnet-context.js"],
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "background": {

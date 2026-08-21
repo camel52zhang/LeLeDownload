@@ -1,6 +1,7 @@
 mod download;
 mod db;
 mod commands;
+mod torrent;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -169,6 +170,10 @@ fn main() {
             commands::get_default_download_dir, commands::select_download_dir,
             commands::open_devtools, commands::open_folder,
             commands::open_extension_folder,
+            commands::bt_add_torrent, commands::bt_list_tasks,
+            commands::bt_task_stats, commands::bt_precheck,
+            commands::bt_pause,
+            commands::bt_resume, commands::bt_remove,
         ])
         // 点击窗口关闭（X）：拦截默认退出，改为隐藏到系统托盘，让程序在后台继续运行。
         .on_window_event(|window, event| {
@@ -560,6 +565,62 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                                     "[recv] POST /download headers={} source={}",
                                     has_headers, source
                                 ));
+                                // 修复：优先用用户配置的首选下载目录（设置面板持久化到
+                                // settings.json），未配置时回退系统默认 Downloads。
+                                // 注：magnet 路由与 HTTP 路由都需用到，故在此统一解析一次。
+                                let dir = commands::load_download_dir()
+                                    .unwrap_or_else(|| {
+                                        dirs::download_dir()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_string()
+                                    });
+                                // 修复(P0+r24)：magnet 链接走 BT 引擎——绕开 HTTP SSRF + dm.create_download。
+                                // 右键菜单场景：用户在网页右键磁力 → 扩展 POST /download → 原代码
+                                // is_url_safe 直接 parse magnet: scheme 失败 → 返回 400 url_blocked
+                                // → 扩展 response.ok=false → 静默失败（用户看到"没反应"）。
+                                // 现改为：检测 magnet: scheme → 直接调 bt_add_torrent，与前端
+                                // addDownload 走同一条 BT 路径，体验一致（含 r23 预检）。
+                                if url.starts_with("magnet:") {
+                                    log_http(&format!(
+                                        "[bt-route] magnet -> bt_add_torrent, has_headers={}",
+                                        has_headers
+                                    ));
+                                    match commands::bt_add_torrent(url.clone(), Some(dir)).await {
+                                        Ok(v) => {
+                                            let id = v
+                                                .get("id")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("");
+                                            log_http(&format!("[bt-ok] id={} url={}", id, url));
+                                            write_json(
+                                                &mut s,
+                                                "200 OK",
+                                                &format!(
+                                                    "{{\"ok\":true,\"id\":\"{}\",\"bt\":true}}",
+                                                    id
+                                                ),
+                                                origin,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log_http(&format!(
+                                                "[bt-err] url={} err={:?}",
+                                                url, e
+                                            ));
+                                            write_json(
+                                                &mut s,
+                                                "400 Bad Request",
+                                                &format!(
+                                                    "{{\"e\":\"bt_failed\",\"msg\":\"{:?}\"}}",
+                                                    e
+                                                ),
+                                                origin,
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
                                 // 修复(P0)：SSRF 防护——仅允许 http/https，拒绝私网/回环/链路本地 IP
                                 if let Err(reason) = is_url_safe(&url) {
                                     log_http(&format!("[block] {} -> {}", url, reason));
@@ -571,15 +632,6 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                                     );
                                     return;
                                 }
-                                // 修复：优先用用户配置的首选下载目录（设置面板持久化到
-                                // settings.json），未配置时回退系统默认 Downloads。
-                                let dir = commands::load_download_dir()
-                                    .unwrap_or_else(|| {
-                                        dirs::download_dir()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .to_string()
-                                    });
                                 // 显式文件名（来自请求 body 的 filename/name）原样透传，
                                 // 跳过 extract_filename 的 HEAD 探测，保证 123 云盘等分享直链存盘为中文真实名。
                                 match dm.create_download(url.clone(), dir, headers, filename).await {
