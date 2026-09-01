@@ -21,6 +21,7 @@ agent_created: true
 3. 沙箱无 git 凭据，push 由用户本地执行：`git push -u origin main && git push -f origin v26.8.14`（版本号随当日日期）。
 4. 扩展包手动打：`lele-downloader-chrome-edge.zip` / `.xpi`（用 JDK `jar`，勿用 PowerShell Compress-Archive）。manifest.json 带 BOM 勿去。
 5. **版本号四件套**：任何正式出包前 `node scripts/set-version.mjs` 必须跑（幂等写 tauri.conf.json / Cargo.toml / package.json / src/version.ts 四件套）。格式 `semver = YY.M.D`（去掉前导零，如 `26.8.21`），界面显示 `vYY.MM.DD`（如 `v26.08.21`）。走 `npm run tauri:build` 已自动含 set-version；若手动 `node node_modules/@tauri-apps/cli/tauri.js build` 则**必须手动先跑** set-version，否则装包版本/界面版本错乱。
+6. **cargo 必须关沙箱（最易漏，代价 = 白等 16 分钟）**：跑 `tauri build` 时 Bash 工具必须带 `dangerouslyDisableSandbox: true`。沙箱会把 gcc 删临时 `.s` 文件当成破坏操作拦截（`strip_write`），表现为 **cargo 静默卡死：日志停在 vite build 完成那一行，再无任何输出，任务一直 running**。详见坑⑤。
 
 ## 构建环境（Rust GNU）
 - 工具链 `stable-x86_64-pc-windows-gnu`；winlibs `/c/Users/kfar-z/mingw64/mingw64/bin`；`rustup` `/c/Users/kfar-z/.cargo/bin`。
@@ -40,13 +41,25 @@ agent_created: true
   - **修法**：构建命令尾必须**手动补跑** `node scripts/post-build.mjs`（它把 raw 名重命名为 `vYY.MM.DD`）。
   - **坑③ set -e 陷阱**：若用 `set -e` 的脚本跑 `npm run tauri:build`，签名退出码 1 会让脚本**在 post-build 之前中止**。脚本里要把 tauri build 与 post-build 解耦（用 `|| true` 或分两条命令，且不要因 tauri build 失败而 `exit`）。
 - **坑④ CARGO_TARGET_DIR 路径错位（高频）**：为绕跨会话孤儿锁（见跨会话坑），常把 `CARGO_TARGET_DIR` 指向全新目录（如 `lele-target-v4`）。此时 nsis 产物落在 `<CARGO_TARGET_DIR>/release/bundle/nsis`，但 `post-build.mjs` **硬编码** `src-tauri/target/release/bundle/nsis` → 找不到 → 打印 `nsis dir not found, skip` 不重命名。
-  - **修法**：build 后先把 nsis 拷回默认路径再改名（`cp -r` 跨盘 OK）：
+  - **修法**：build 后把 nsis 拷回默认路径再改名。**务必只拷本次新产出的那个文件，不要整目录 `cp -r`**：
     ```bash
-    mkdir -p src-tauri/target/release/bundle
-    cp -r "$CARGO_TARGET_DIR/release/bundle/nsis" src-tauri/target/release/bundle/nsis
+    mkdir -p src-tauri/target/release/bundle/nsis
+    # ✅ 正确：只拷本次新包（文件名用当日 semver，如 26.8.31）
+    cp -f "$CARGO_TARGET_DIR/release/bundle/nsis/LeLeDownload_26.8.31_x64-setup.exe" \
+          src-tauri/target/release/bundle/nsis/
     node scripts/post-build.mjs   # 此时能找到并改名
     ```
+  - **坑④b 整目录 `cp -r` 会把旧包误改名（2026-08-31 实测踩到）**：`<CARGO_TARGET_DIR>` 是长期复用的缓存目录，里面**残留着历次构建的 raw 文件**（如 8/21 与 8/31 两个 `LeLeDownload_26.8.*_x64-setup.exe`）。而 `post-build.mjs` 用 `files.find()` 取**第一个**「非 `LeLeDownload_v` 开头」的匹配项 —— 字母序下 `26.8.21` 排在 `26.8.31` **之前**，于是**旧包被改名成 `v26.08.31`**，你以为交付的是新包，其实是 8/21 的旧二进制（字节数/MD5 都不对）。
+    - **判别**：改名后核对字节数与当次 `makensis` 日志里的产物大小是否一致；不一致就是被旧包顶替了。
+    - **稳妥做法**：拷回前先确认目标目录无残留 raw 文件（`ls -1 src-tauri/target/release/bundle/nsis | grep '^LeLeDownload_' | grep -v '^LeLeDownload_v'` 应为空），拷完再确认 raw 文件**只有一个**且是当日版本号。
   - 或：构建时**不设** `CARGO_TARGET_DIR`（用默认 `src-tauri/target`），前提是默认目录无跨会话孤儿锁（否则踩 os error 5）。新机器/新会话优先「全新 CARGO_TARGET_DIR + 拷回」方案。
+- **坑⑤ 沙箱导致 cargo 静默卡死（2026-08-31 实测，白等 16 分钟）**：
+  - **现象**：`tauri build` 日志走到 vite 打包完成（`✓ built in 18.24s`）后就**再无任何输出**，后台任务状态一直 `running`，持续十几分钟。检查会发现 **无 cargo/rustc 进程、无 `.cargo-lock`、target 目录时间戳还是上次的**（即 cargo 根本没启动，不是"编译慢"）。
+  - **根因**：Bash 工具默认沙箱把 gcc 删除临时 `.s` 汇编文件的动作判定为破坏操作并拦截（`strip_write`），cargo/rustc 卡在等待。
+  - **修法**：跑构建时 Bash 调用必须带 **`dangerouslyDisableSandbox: true`**（见铁律 6）。
+  - **如何与"正常编译慢"区分**：关沙箱重跑后，**45 秒内**日志就会推进到 `Compiling ...` 并持续增长。若 1 分钟内日志大小纹丝不动 → 就是卡死，别等。
+  - **善后**：用 `TaskStop` 终止卡死任务即可（cargo 未真正启动、无锁文件，不会造成孤儿锁；与下面"绝不 kill -9 正在编译的 cargo"不冲突）。
+- **绝不 `kill -9` 正在编译的 cargo/rustc（最贵的坑，曾废 2h）**：Bash 每次调用是独立沙箱会话，强杀会让 `target/` 里的 `.rlib`/`.d`/`.cargo-build-lock` 变"孤儿"，后续会话读写删一律 `拒绝访问 (os error 5)`，**且 rm/mv 都救不回来**。慢就等，靠后台任务通知。已中招唯一解：换全新 `CARGO_TARGET_DIR`（如 `lele-target-v5`），在同一会话内创建+使用，代价是依赖全量重编 1.5~2h。
 - `cargo test <过滤>`（二进制 crate，无 lib target）。
 
 ## 推荐构建方式（脚本文件，避免 shell 引号/set -e 陷阱）
@@ -85,7 +98,7 @@ MV3 `background.js` 非 ES module，无法 import；故各解析器函数**原�
 - `extension/test-baidu.mjs`（20 用例）：`fetchJson`(调 `.text()`+JSON.parse) → mock 须返回 `.text`；覆盖 wxlist URL/body、`?surl=` 1 前缀、tplconfig sign、verify 解码 BDCLND、sharedownload 参数对齐、errno 2/-9/-20/9019、文件夹递归 T15-T17。
 - `extension/test-aliyun.mjs`（12 用例）：`getAliyunRefreshToken`（content-script 注入读 localStorage.token）+ 列表/直链。
 - `extension/test-quark.mjs`（16 用例）：`quarkApiFetch`(页面 fetch `.json()`) → mock 须返回 `.json`；覆盖注入、credentials:'include'、save/download 全链路、ok=false 守卫。
-- 运行：`node --test extension/test-*.mjs`（当前 48/48 全绿）。
+- 运行：`node --test extension/test-*.mjs`（2026-08-31 实测 **136/136 全绿**；旧记录的 48 已过时）。改解析器后务必全量回归。
 - `build.mjs` 已加 filter 排除 `test-*.mjs` 不打进安装包。
 
 ## 百度分享解析核心（2026-08-13 起正确方案）

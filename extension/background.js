@@ -137,7 +137,20 @@ async function handleShareLink(message) {
   }
   shareLinkSentCache[url] = now;
 
-  const res = await sendToLeleDownload(url, headers);
+  // WeTransfer 补全浏览器头：content-script 上报的 headers 来自页面 fetch，
+  // 通常缺 Origin（页面 fetch 不带）且 UA 非浏览器 UA；签名 CDN 或代理地址需要
+  // Referer/Origin/浏览器 UA/会话 Cookie 才不会被 WAF 拒绝。
+  // 故对 wetransfer 系 URL 先用 buildWetransferHeaders 补齐，再让页面原始头覆盖同名字段
+  // （页面头带真实 Referer/页面 Cookie，优先级更高）。
+  let finalHeaders = headers;
+  if (isWetransferDownloadUrl(url)) {
+    try {
+      const wtHeaders = await buildWetransferHeaders();
+      finalHeaders = Object.assign({}, wtHeaders, headers || {});
+    } catch (_) { /* 头组装失败时保留页面原始头，不阻塞发送 */ }
+  }
+
+  const res = await sendToLeleDownload(url, finalHeaders);
   if (res.ok) {
     notify('已发送到乐乐下载器');
   } else if (res.msg) {
@@ -146,7 +159,9 @@ async function handleShareLink(message) {
     const online = await isAppOnline();
     notify(online ? '解析失败，请改用浏览器原生下载' : '请先运行乐乐下载器，再重试');
   }
-  return ok;
+  // 注意：此处原为 `return ok;`，ok 未声明 → ReferenceError，
+  // 导致成功路径抛错、sendResponse 不执行、content-script 收不到响应。修正为 res.ok。
+  return res.ok === true;
 }
 
 // 统一的"接管/发送"流程：直接发送到 App，再按结果给明确反馈。
@@ -239,8 +254,19 @@ chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
 // 故此处组装浏览器 UA + Referer + Origin + 会话 Cookie 头，透传给 App 引擎带自定义头下载。
 // ---------------------------------------------------------------------------
 
-// 判定是否为 WeTransfer 原生下载代理地址（host 精确为 wetransfer.com，且路径以 /download/ 开头）。
-// 既覆盖 local-bartender，也统一覆盖其它 /download/ 子路径。纯函数，便于单测。
+// 判定是否为 WeTransfer 下载地址，覆盖三类真实形态：
+//   1) 流式代理：wetransfer.com/download/<slug>?id=<base64>（鉴权令牌嵌在 URL 中，含 local-bartender）
+//   2) 直连下载域：download. / filedownload. / transfer.wetransfer.com
+//   3) 2026 实际文件 CDN：*-files.wetransfer.net（如 eu-west-1-files.wetransfer.net，
+//      带 Expires= + Signature= 的 CloudFront/S3 签名 URL）
+//
+// 修复背景：content-script.js 的 isLikelyFileRequest 早已把 2)/3) 识别为文件请求，
+// 但本函数旧版只认 1)，导致 2)/3) 走进「普通接管」分支 —— 不带 Referer/Origin/浏览器 UA/会话 Cookie，
+// App 引擎以非浏览器 UA 直连签名 URL，被 WAF/鉴权拒绝（用户反馈：点了下载没正确接管）。
+//
+// 注意：CDN 判定必须用 endsWith('files.wetransfer.net')，绝不能用 endsWith('.wetransfer.net')，
+// 否则会把 ekstrom / bsp-proxy / preview-eu 等 API/预览域名也误判为文件，破坏页面下载初始化。
+// 纯函数，便于单测。
 function isWetransferDownloadUrl(url) {
   if (!url || typeof url !== 'string') return false;
   let u;
@@ -251,7 +277,15 @@ function isWetransferDownloadUrl(url) {
   }
   const host = u.hostname.toLowerCase();
   const path = u.pathname.toLowerCase();
-  return host === 'wetransfer.com' && path.indexOf('/download/') === 0;
+  // 1) 流式代理（仅主域 wetransfer.com 的 /download/ 路径，含 local-bartender 及其它子路径）
+  if (host === 'wetransfer.com' && path.indexOf('/download/') === 0) return true;
+  // 2) 直连下载域
+  if (host === 'download.wetransfer.com') return true;
+  if (host === 'filedownload.wetransfer.com') return true;
+  if (host === 'transfer.wetransfer.com') return true;
+  // 3) 2026 实际文件 CDN（签名 URL）
+  if (host.endsWith('files.wetransfer.net')) return true;
+  return false;
 }
 
 // 由会话 Cookie 串组装下载请求头（纯函数，便于单测）。
@@ -413,6 +447,11 @@ function detectNetdiskPlatform(url) {
     if (h.includes('xunlei')) return 'xunlei';
     if (h.includes('123pan') || h.includes('123912') || h.includes('123685') || h.includes('123959')) return 'pan123';
     if (h.includes('cloud.189') || h.includes('189.cn')) return 'tianyi';
+    // WeTransfer：短链域 we.tl + 官方主域（含子域）。
+    // 用精确匹配而不是 includes('wetransfer')，避免 weather.com / weibo.com
+    // 这类含 "we" 的域名被误判成网盘链接。
+    if (h === 'we.tl') return 'wetransfer';
+    if (h === 'wetransfer.com' || h.endsWith('.wetransfer.com')) return 'wetransfer';
   } catch (_) { /* ignore */ }
   return null;
 }
@@ -471,16 +510,26 @@ async function ensureBaiduAuthHeaders() {
 // （manifest 已声明 <all_urls> host_permissions，扩展发起的跨域请求不受 CORS 限制）。
 // 真正需要手工带 Cookie/UA/Referer 的是「回传给 App 下载引擎的 headers」——
 // 那条链路走 Rust reqwest，不受浏览器禁止头限制，见各解析器返回值的 headers 字段。
-async function fetchJson(url, opts) {
+async function fetchJson(url, opts, timeoutMs = 20000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(
       url,
       Object.assign({ signal: controller.signal, cache: 'no-store', credentials: 'include' }, opts)
     );
     const text = await res.text();
-    try { return JSON.parse(text); }
+    try {
+      const parsed = JSON.parse(text);
+      // 暴露 HTTP 状态码（不可枚举，避免污染 for-in / JSON.stringify 输出），
+      // 让 WeTransfer 解析器能区分「服务端 500 + 空响应」与「分享内真的没文件」。
+      // 其他调用方无需感知。
+      if (parsed && typeof parsed === 'object') {
+        try { Object.defineProperty(parsed, '_status', { value: res.status, enumerable: false, configurable: true, writable: true }); }
+        catch (_) { /* ignore */ }
+      }
+      return parsed;
+    }
     catch (_) {
       // 把 endpoint + statusText 带进去，便于定位是哪个端点 / 是否 410 Gone（分享被撤回）
       const st = (res.statusText || '').trim();
@@ -2211,6 +2260,179 @@ async function resolveTianyi(url, pwd) {
   return arr.map((x) => ({ name: x.name || x.fileName || 'file', size: x.size ? String(x.size) : '', url: x.downloadUrl || x.url }));
 }
 
+// ---------- WeTransfer 公开分享解析 ----------
+// WeTransfer 是公开分享、不需要登录态，因此不需要 executeScript 注入页面
+// （那是对夸克等需登录网盘的做法），直接在 Service Worker 里 fetch 官方 v4 API 即可。
+//
+// 链路（2026-08 实网验证）：
+//   1) 短链 we.tl/t-xxx --302--> wetransfer.com/downloads/<transfer_id>/<security_hash>?t_exp=…
+//   2) POST /api/v4/transfers/<tid>/prepare-download  {"security_hash":"<sh>"} -> items[]
+//   3) 每个 item POST /api/v4/transfers/<tid>/download
+//      {"intent":"single_file","security_hash":"<sh>","file_ids":["<item.id>"]} -> {"direct_link":…}
+// 注意第 3 步参数名必须是 file_ids（数组），file_id / item_id / item_ids 都会被拒。
+// 实测（2026-08-31）这两个端点不校验 UA/Referer/Origin：裸 curl 也能正常返回。
+// 这里仍然带上，是因为 MV3 SW 的 fetch 会静默丢弃 Referer/Origin/UA 这类禁用头——
+// 带上是 best-effort（接口若日后收紧可省一次排查），丢了也不影响解析。
+const WETRANSFER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// 从落地页 URL 提取 transfer_id / security_hash：pathname 形如 /downloads/<tid>/<sh>
+function extractWeTransferIds(pageUrl) {
+  try {
+    const u = new URL(pageUrl);
+    const seg = u.pathname.split('/').filter((s) => s.length > 0);
+    const i = seg.indexOf('downloads');
+    if (i < 0 || seg.length < i + 3) return null;
+    const transferId = seg[i + 1];
+    const securityHash = seg[i + 2];
+    if (!transferId || !securityHash) return null;
+    return { transferId: transferId, securityHash: securityHash };
+  } catch (_) {
+    return null;
+  }
+}
+
+// 把 we.tl 短链展开成 wetransfer.com/downloads/... 落地页地址；已是落地页则原样返回。
+async function expandWeTransferUrl(rawUrl) {
+  let u;
+  try { u = new URL(rawUrl); } catch (_) { throw new Error('WeTransfer 链接格式非法：' + rawUrl); }
+  const host = u.hostname.toLowerCase();
+  if (host !== 'we.tl' && !host.endsWith('.we.tl')) return u.href;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  let res = null;
+  try {
+    res = await fetch(u.href, { redirect: 'follow', cache: 'no-store', signal: controller.signal });
+  } catch (e) {
+    throw new Error('WeTransfer 短链展开失败：' + ((e && e.message) || e));
+  } finally {
+    clearTimeout(timer);
+  }
+  const finalUrl = (res && res.url) || '';
+  if (finalUrl && extractWeTransferIds(finalUrl)) return finalUrl;
+  // 兜底：MV3 下 response.url 偶发不可靠，此时手工跟随 Location
+  const loc = res && res.headers && typeof res.headers.get === 'function' ? res.headers.get('location') : '';
+  if (loc) {
+    try { return new URL(loc, u.href).href; } catch (_) { /* ignore */ }
+  }
+  // 重定向没生效时 response.url 就是短链本身，此时继续下去只会拿到一堆无法解析的地址
+  if (finalUrl && finalUrl !== u.href) return finalUrl;
+  throw new Error('WeTransfer 短链展开失败：未拿到 wetransfer.com/downloads/ 落地页地址（最终地址：' + (finalUrl || '空') + '）');
+}
+
+// WeTransfer 接口出错时返回形如 {"message":"Missing parameter :security_hash"}，
+// 且状态码是 400/404 —— fetchJson 只看能不能 parse 成 JSON，不检查状态码，
+// 因此必须在这里显式识别，否则会静默当成空列表返回，用户只看到「解析成功但没文件」。
+// 兼容：message / error(字符串或 {message:..}) / errors[](数组) 三种常见形态，
+// 避免「服务端 500 + {}」被误导成「分享内没有可下载的文件」。
+function pickWeTransferError(j) {
+  if (!j || typeof j !== 'object') return '接口未返回有效 JSON';
+  if (j.message) return String(j.message);
+  if (j.error) {
+    if (typeof j.error === 'string') return j.error;
+    if (j.error && typeof j.error === 'object' && j.error.message) return String(j.error.message);
+    try { return JSON.stringify(j.error); } catch (_) { return 'error 字段无法序列化'; }
+  }
+  if (Array.isArray(j.errors) && j.errors.length) {
+    const flat = j.errors.map((e) => (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e)));
+    return flat.join('；');
+  }
+  return '';
+}
+
+async function resolveWeTransfer(url, pwd) {
+  const pageUrl = await expandWeTransferUrl(url);
+  const ids = extractWeTransferIds(pageUrl);
+  if (!ids) {
+    throw new Error('无法从 WeTransfer 链接提取 transfer_id / security_hash（应为 wetransfer.com/downloads/<id>/<hash>）：' + pageUrl);
+  }
+  const transferId = ids.transferId;
+  const securityHash = ids.securityHash;
+  const api = 'https://wetransfer.com/api/v4/transfers/' + encodeURIComponent(transferId);
+  const HDR = {
+    'Content-Type': 'application/json',
+    'User-Agent': WETRANSFER_UA,
+    'Referer': 'https://wetransfer.com/downloads/' + transferId + '/' + securityHash,
+    'Origin': 'https://wetransfer.com',
+  };
+
+  const prepared = await fetchJson(api + '/prepare-download', {
+    method: 'POST',
+    headers: HDR,
+    body: JSON.stringify({ security_hash: securityHash }),
+  }, 15000);
+  const prepErr = pickWeTransferError(prepared);
+  if (prepErr) throw new Error('WeTransfer 取文件列表失败：' + prepErr);
+
+  // F2 修复：服务端 500 + 空响应时，prepared 是 {} 且没有 message/error，
+  // 旧逻辑会落到下面的「items 为空」分支，把服务端错误误导成「分享没文件」。
+  // 现在 fetchJson 暴露了 _status，非 2xx 且无错误字段时直接报 HTTP 状态码。
+  if (prepared && typeof prepared._status === 'number' && prepared._status >= 400) {
+    throw new Error('WeTransfer 取文件列表失败：HTTP ' + prepared._status + '（接口未返回错误说明）');
+  }
+
+  if (prepared && prepared.password_protected === true) {
+    throw new Error('该分享受密码保护，请在提取码框填入分享密码（当前版本尚未实现 WeTransfer 密码校验，无法解析）');
+  }
+  const state = prepared && prepared.state;
+  if (state && state !== 'downloadable') {
+    throw new Error('该分享不可下载（state=' + state + '，可能已过期或已删除）');
+  }
+  const items = Array.isArray(prepared && prepared.items) ? prepared.items : [];
+  if (!items.length) throw new Error('WeTransfer 分享内没有可下载的文件（items 为空）');
+
+  const files = [];
+  const failures = [];
+  // F9 修复：逐文件取直链原本是串行 for 循环（20s × N），N=3 且网络慢时最坏 100s，
+  // 会撞上前端 60s 超时。改为 Promise.all 并行发起（WeTransfer 单次分享文件数通常个位数），
+  // 整轮耗时由 20N 降为单次 20s；配合 fetchJson/expand 超时收到 15s，最坏 15+15+15=45s < 60s。
+  const tasks = items.map(async (it) => {
+    const name = String((it && (it.name || it.display_name)) || 'file');
+    // F5 修复：与百度/阿里/迅雷对齐，使用 bytesToSize 单位化展示（13.24 MB 而非裸字节）。
+    const size = it && it.size != null && it.size !== '' ? bytesToSize(Number(it.size)) : '';
+    let direct = '';
+    let failMsg = '';
+    try {
+      const d = await fetchJson(api + '/download', {
+        method: 'POST',
+        headers: HDR,
+        body: JSON.stringify({
+          intent: 'single_file',
+          security_hash: securityHash,
+          file_ids: [String(it && it.id)],
+        }),
+      }, 15000);
+      const e2 = pickWeTransferError(d);
+      if (e2) throw new Error(e2);
+      direct = String((d && (d.direct_link || d.url)) || '');
+      if (!direct) throw new Error('接口未返回 direct_link');
+    } catch (e) {
+      // 单个文件取直链失败不拖垮整个分享：URL 留空并记日志，Rust 侧会过滤掉空 url 条目，
+      // 由下方 warning 把失败原因回传给前端，用户仍能看到成功文件并知悉哪些失败（F6）。
+      failMsg = String((e && e.message) || e);
+      failures.push(name + ': ' + failMsg);
+      console.log('[wetransfer] 文件取直链失败', String(it && it.id), failMsg);
+    }
+    return { name: name, size: size, url: direct, _fail: failMsg };
+  });
+  const settled = await Promise.all(tasks);
+  for (const r of settled) {
+    if (r._fail) continue; // 失败项交给 failures 汇总，不进 files（Rust 侧也会因 url 空被过滤）
+    files.push({ name: r.name, size: r.size, url: r.url });
+  }
+
+  // 全部失败说明是接口/参数层面的问题（而非个别文件异常），必须报错而不是返回一堆空链接。
+  // 注意：files 只装成功项，故「全部失败」= files 为空且确有失败（items≥1 已前置保证）。
+  if (files.length === 0 && failures.length > 0) {
+    throw new Error('WeTransfer 全部文件取直链失败：' + failures.join(' | '));
+  }
+  // 部分失败：保留成功文件，并用 warning 把失败原因回传前端（F6）——Rust 透传、前端琥珀横幅展示。
+  let warning;
+  if (failures.length > 0) {
+    warning = '有 ' + failures.length + ' 个文件取直链失败（其余 ' + files.length + ' 个可用）：' + failures.join('；');
+  }
+  return { files: files, warning: warning };
+}
+
 // 分发
 async function resolveNetdisk(req) {
   const platform = detectNetdiskPlatform(req.url) || req.platform;
@@ -2221,6 +2443,7 @@ async function resolveNetdisk(req) {
     case 'xunlei': return await resolveXunlei(req.url, req.pwd);
     case 'pan123': return await resolvePan123(req.url, req.pwd);
     case 'tianyi': return await resolveTianyi(req.url, req.pwd);
+    case 'wetransfer': return await resolveWeTransfer(req.url, req.pwd);
     default: throw new Error('不支持的网盘平台：' + (req.url || ''));
   }
 }
@@ -2247,8 +2470,11 @@ async function pollNetdiskPending() {
       if (!req || !req.id || netdiskInflight.has(req.id)) continue;
       netdiskInflight.add(req.id);
       try {
-        const files = await resolveNetdisk(req);
-        await reportNetdiskResult({ id: req.id, ok: true, files: files, url: req.url });
+        const resolved = await resolveNetdisk(req);
+        // resolveNetdisk 多数平台返回 files 数组；WeTransfer 部分失败时返回 {files, warning}（F6）。
+        const files = Array.isArray(resolved) ? resolved : (resolved && resolved.files || []);
+        const warning = (!Array.isArray(resolved) && resolved && resolved.warning) || undefined;
+        await reportNetdiskResult({ id: req.id, ok: true, files: files, url: req.url, warning: warning });
       } catch (e) {
         await reportNetdiskResult({ id: req.id, ok: false, error: String((e && e.message) || e), url: req.url });
       } finally {

@@ -15,6 +15,9 @@ interface ResolveResult {
   files?: NetdiskFile[]
   error?: string
   url?: string
+  // 部分文件解析成功、部分失败时由扩展回传的提示（如 WeTransfer 个别文件取直链失败）。
+  // 与 error 互斥：warning 出现时解析整体成功，仅个别文件缺失。
+  warning?: string
 }
 
 // 平台识别规则必须与 extension/background.js 的 detectNetdiskPlatform 保持一致，
@@ -37,6 +40,13 @@ const PLATFORMS: { key: string; label: string; match: (h: string) => boolean }[]
   },
   { key: 'tianyi', label: '天翼云盘', match: (h) => h.includes('cloud.189') || h.includes('189.cn') },
   { key: 'xunlei', label: '迅雷云盘', match: (h) => h.includes('xunlei') },
+  {
+    key: 'wetransfer',
+    label: 'WeTransfer',
+    // 与扩展侧保持一致：只认短链域 we.tl 与官方主域（含子域），不做宽松 includes，
+    // 否则 weather.com / weibo.com 这类含 "we" 的域名会被误判成网盘链接。
+    match: (h) => h === 'we.tl' || h === 'wetransfer.com' || h.endsWith('.wetransfer.com'),
+  },
 ]
 
 function detectPlatform(u: string): { key: string | null; label: string } {
@@ -78,6 +88,7 @@ export function NetdiskPanel() {
   const [error, setError] = useState('')
   const [results, setResults] = useState<NetdiskFile[]>([])
   const [source, setSource] = useState('')
+  const [warning, setWarning] = useState('')
   // 解析请求是「投递到队列等扩展来取」的异步模型：扩展没装、没登录、
   // 或 Service Worker 被浏览器回收时，App 侧收不到任何回执。
   // 没有超时兜底的话界面会一直停在「解析中…」，用户无从判断是慢还是坏了。
@@ -99,6 +110,10 @@ export function NetdiskPanel() {
         setLoading(false)
         return
       }
+      // F9 修复：若前端 60s 兜底超时已先触发并写入红字 error，真实结果到达时必须清掉，
+      // 否则会出现「解析超时」红字与解析结果同屏。warning 与 error 互斥，这里一并复位。
+      setError('')
+      setWarning(p.warning || '')
       setResults(p.files || [])
       setSource(p.url || '')
       setLoading(false)
@@ -117,10 +132,11 @@ export function NetdiskPanel() {
     const p = detectPlatform(url)
     setPlatform(p.label)
     if (!p.key) {
-      setError('暂不支持该链接所属的网盘平台（当前支持：百度 / 阿里 / 夸克 / 123 / 天翼 / 迅雷）')
+      setError('暂不支持该链接所属的网盘平台（当前支持：百度 / 阿里 / 夸克 / 123 / 天翼 / 迅雷 / WeTransfer）')
       return
     }
     setError('')
+    setWarning('')
     setResults([])
     setLoading(true)
     clearResolveTimeout()
@@ -187,7 +203,9 @@ export function NetdiskPanel() {
             </div>
             <div className="flex gap-3">
               <div className="flex-1">
-                <label className="block text-xs text-gray-500 mb-1">提取码（可选）</label>
+                <label className="block text-xs text-gray-500 mb-1">
+                  提取码（可选）{platform === 'WeTransfer' ? ' · WeTransfer 填分享密码' : ''}
+                </label>
                 <input
                   type="text"
                   value={pwd}
@@ -217,6 +235,12 @@ export function NetdiskPanel() {
 
         {loading && (
           <div className="text-sm text-gray-500 text-center py-4">正在请浏览器扩展解析直链，请稍候…</div>
+        )}
+
+        {warning && !loading && (
+          <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            {warning}
+          </div>
         )}
 
         {results.length > 0 && (

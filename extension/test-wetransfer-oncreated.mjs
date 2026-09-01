@@ -19,7 +19,13 @@ import assert from 'node:assert/strict';
 // 以下实现与 extension/background.js 中对应函数保持一致（仅 buildWetransferHeaders 用 globalThis.chrome 打桩）
 // ---------------------------------------------------------------------------
 
-// 判定是否为 WeTransfer 原生下载代理地址（host 精确为 wetransfer.com，且路径以 /download/ 开头）
+// 判定是否为 WeTransfer 下载地址（与 extension/background.js 实现保持一致）
+// 覆盖三类真实形态：
+//   1) 流式代理 wetransfer.com/download/<slug>?id=<base64>
+//   2) 直连下载域 download./filedownload./transfer.wetransfer.com
+//   3) 2026 实际文件 CDN *-files.wetransfer.net（Expires= + Signature= 签名 URL）
+// 注意：CDN 判定用 endsWith('files.wetransfer.net')，绝不用 endsWith('.wetransfer.net')，
+// 否则 ekstrom / bsp-proxy / preview-eu 等 API/预览域名会被误判，破坏页面下载初始化。
 function isWetransferDownloadUrl(url) {
   if (!url || typeof url !== 'string') return false;
   let u;
@@ -30,7 +36,12 @@ function isWetransferDownloadUrl(url) {
   }
   const host = u.hostname.toLowerCase();
   const path = u.pathname.toLowerCase();
-  return host === 'wetransfer.com' && path.indexOf('/download/') === 0;
+  if (host === 'wetransfer.com' && path.indexOf('/download/') === 0) return true;
+  if (host === 'download.wetransfer.com') return true;
+  if (host === 'filedownload.wetransfer.com') return true;
+  if (host === 'transfer.wetransfer.com') return true;
+  if (host.endsWith('files.wetransfer.net')) return true;
+  return false;
 }
 
 // 由会话 Cookie 串组装下载请求头（纯函数）
@@ -137,13 +148,63 @@ test('非 wetransfer 域的普通文件 URL 不应判定为 WeTransfer 下载', 
   assert.equal(isWetransferDownloadUrl(url), false);
 });
 
-// 4) 非 wetransfer 域不应带任何 wetransfer 头（assembleWetransferHeaders 只在判定命中时调用）
-test('非 wetransfer 域调用 assembleWetransferHeaders 不应产生 wetransfer 头（逻辑隔离校验）', () => {
-  // 即便误调用，组装出的头也应仅含浏览器头、且 Cookie 来自传入串；
-  // 此处校验“非 wetransfer 域不调用此函数”的隔离：判定函数返回 false。
-  assert.equal(isWetransferDownloadUrl('https://download.wetransfer.com/abc.zip'), false);
-  assert.equal(isWetransferDownloadUrl('https://eu-west-1-files.wetransfer.net/abc'), false);
+// 4) 误判隔离：CDN 判定必须限定在 files.wetransfer.net，
+//    绝不能把预览 / API / 代理子域（preview-eu / ekstrom / bsp-proxy）误判为文件，
+//    否则会破坏页面下载初始化；分享短链 we.tl 与无关域名同样不应命中。
+test('预览/API 子域、分享短链、无关域名均不应判定为 WeTransfer 下载', () => {
+  // 预览与 API 子域：误判会破坏页面下载初始化（content-script 会短路真实请求）
+  assert.equal(isWetransferDownloadUrl('https://preview-eu.wetransfer.net/preview.pdf'), false);
+  assert.equal(isWetransferDownloadUrl('https://ekstrom.wetransfer.net/api/v1/x'), false);
+  assert.equal(isWetransferDownloadUrl('https://bsp-proxy.wetransfer.net/proxy'), false);
+  // 分享短链（需先展开为 downloads 页面，本身不是文件地址）
   assert.equal(isWetransferDownloadUrl('https://we.tl/t-FcwxddGsw8aNmQeh'), false);
+  // wetransfer.com 主域的非 /download/ 路径（下载落地页，不是文件）
+  assert.equal(isWetransferDownloadUrl('https://wetransfer.com/downloads/abc/123?t_exp=1'), false);
+  // 无关域名
+  assert.equal(isWetransferDownloadUrl('https://example.com/some/file.zip'), false);
+  assert.equal(isWetransferDownloadUrl('https://evil-files.wetransfer.net.attacker.com/x.zip'), false);
+})
+
+// 4b) 修复目标：直连下载域应判定为 WeTransfer 下载（旧版只认 /download/ 代理，导致漏加浏览器头）
+test('直连下载域 download./filedownload./transfer.wetransfer.com 应判定为 WeTransfer 下载', () => {
+  assert.equal(isWetransferDownloadUrl('https://download.wetransfer.com/abc.zip'), true);
+  assert.equal(isWetransferDownloadUrl('https://filedownload.wetransfer.com/abc.zip'), true);
+  assert.equal(isWetransferDownloadUrl('https://transfer.wetransfer.com/abc.zip'), true);
+});
+
+// 4c) 修复目标：2026 实际文件 CDN（*-files.wetransfer.net 签名 URL）应判定为 WeTransfer 下载。
+//     这是用户反馈「点了下载没正确接管」的核心形态 —— 单文件下载箭头直连签名 CDN，
+//     旧版判定漏掉它 → 走普通接管无浏览器头 → App 引擎被 WAF/鉴权拒绝。
+test('2026 文件 CDN *-files.wetransfer.net 签名 URL 应判定为 WeTransfer 下载', () => {
+  assert.equal(isWetransferDownloadUrl('https://eu-west-1-files.wetransfer.net/abc'), true);
+  assert.equal(
+    isWetransferDownloadUrl('https://eu-west-1-files.wetransfer.net/transfer/1/f.zip?Expires=1788195362&Signature=abc'),
+    true
+  );
+  assert.equal(isWetransferDownloadUrl('https://us-east-1-files.wetransfer.net/f.xlsx?Expires=1&Signature=b'), true);
+});
+
+// 4d) 三类形态都应组装出浏览器头（Referer/Origin/UA/Cookie），确保 App 引擎能带头下载
+test('三类 WeTransfer 形态均应组装出含 Referer/Origin/浏览器 UA/Cookie 的头', async () => {
+  globalThis.chrome = {
+    cookies: {
+      getAll: (opts, cb) => cb([{ name: '_wt_session', value: 'sess-1' }])
+    },
+    runtime: { lastError: null }
+  };
+  const urls = [
+    'https://wetransfer.com/download/local-bartender?id=eyJhIjoiYiJ9',
+    'https://download.wetransfer.com/abc.zip',
+    'https://eu-west-1-files.wetransfer.net/f.zip?Expires=1&Signature=s'
+  ];
+  for (const u of urls) {
+    assert.equal(isWetransferDownloadUrl(u), true, u + ' 应判定为 WeTransfer 下载');
+  }
+  const headers = await buildWetransferHeaders();
+  assert.equal(headers['Referer'], 'https://wetransfer.com/');
+  assert.equal(headers['Origin'], 'https://wetransfer.com');
+  assert.ok(headers['User-Agent'].includes('Chrome/120.0.0.0'));
+  assert.ok(headers['Cookie'].includes('_wt_session=sess-1'));
 });
 
 // 5) cookie 为空时仍带 UA/Referer/Origin，但不带 Cookie 头

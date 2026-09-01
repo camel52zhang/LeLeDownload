@@ -220,6 +220,14 @@ git commit -am "release: v26.08.11"
 git tag v26.8.11
 git push -u origin main
 git push origin v26.8.11
+
+# 每次修改后操作
+git add -A
+git commit -m "写修改内容，例如：fix(ext): 磁力超链接右键经 content-script 兜底拿 href + iframe 注入 (r24d)"
+git tag v26.08.21
+git push -u origin main
+git push origin v26.08.21
+
 ```
 
 ---
