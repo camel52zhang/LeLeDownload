@@ -404,11 +404,36 @@ pub fn open_extension_folder(app: tauri::AppHandle) -> Result<(), String> {
 /// 添加磁力链接或 .torrent 文件下载任务。
 /// source: "magnet:?xt=..." / "http(s)://.../x.torrent" / 本地 ".torrent 文件路径"
 /// save_dir 可选（缺省用用户首选下载目录）
+/// only_files 可选：只下载这些文件索引（来自 bt_get_file_list 的 files[].index）；
+///   None = 全量下载（旧行为，HTTP 路由 / 用户确认降级走这条）
+/// metadata_cache_key 可选：bt_get_file_list 返回的 info_hash，命中进程内缓存可跳过二次 metadata 互换
 #[tauri::command]
-pub async fn bt_add_torrent(source: String, save_dir: Option<String>) -> Result<serde_json::Value, String> {
+pub async fn bt_add_torrent(
+    source: String,
+    save_dir: Option<String>,
+    only_files: Option<Vec<usize>>,
+    metadata_cache_key: Option<String>,
+) -> Result<serde_json::Value, String> {
     let default_dir = std::path::PathBuf::from(get_default_save_dir());
-    crate::torrent::add_torrent(source, save_dir, default_dir).await
+    crate::torrent::add_torrent(source, save_dir, default_dir, only_files, metadata_cache_key).await
 }
+
+/// 取磁力 / .torrent 内的完整文件清单（走 list_only 真实换 metadata，不下载）。
+/// 返回 { info_hash, name, can_download, reason?, message, total_bytes, file_count, seen_peers, files[] }，
+/// files[i] = { index, name, components[], length }。index 即 bt_add_torrent.only_files 的索引契约。
+/// can_download=false（reason="no_metadata"）表示当前拿不到清单，前端应弹确认让用户决定是否降级全量。
+#[tauri::command]
+pub async fn bt_get_file_list(source: String) -> Result<serde_json::Value, String> {
+    let default_dir = std::path::PathBuf::from(get_default_save_dir());
+    crate::torrent::get_file_list(source, default_dir).await
+}
+
+// Phase 2（下载中改选，接口已预留）：librqbit 支持运行时改选
+// Session::update_only_files(&handle, &HashSet<usize>)，实现即下述命令，本期不做。
+// #[tauri::command]
+// pub async fn bt_set_only_files(id: String, only_files: Vec<usize>) -> Result<(), String> {
+//     crate::torrent::set_only_files(&id, only_files).await
+// }
 
 /// 列出所有 BT 任务（含进度/速度/状态）
 #[tauri::command]

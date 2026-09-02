@@ -2,8 +2,8 @@
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { X, Play, Pause, Trash2 } from 'lucide-react'
-import { Header, DownloadForm, DownloadItem, StatusBar, EmptyState, SettingsPanel, NetdiskPanel } from './components'
-import type { DownloadTask, BtTask, BtPrecheckResult } from './types'
+import { Header, DownloadForm, DownloadItem, StatusBar, EmptyState, SettingsPanel, NetdiskPanel, BtFileSelectPanel } from './components'
+import type { DownloadTask, BtTask, BtFileList } from './types'
 import { formatBytes, formatSpeed } from './lib/format'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { checkForUpdate, downloadAndInstallUpdate, getUpdate } from './lib/updater'
@@ -18,6 +18,8 @@ function App() {
   const [filterStatus, setFilterStatus] = useState<'all' | 'downloading' | 'completed' | 'failed'>('all')
   const [downloadDir, setDownloadDir] = useState('')
   const [activeTab, setActiveTab] = useState<'downloads' | 'netdisk'>('downloads')
+  // 待用户勾选文件的 BT 来源（非 null 时弹出 BtFileSelectPanel）
+  const [btPending, setBtPending] = useState<{ list: BtFileList; source: string; saveDir?: string } | null>(null)
 
   // 镜像最新任务列表，供事件回调在无闭包陷阱的情况下读取（避免把副作用写进 setState 更新函数）
   const tasksRef = useRef<DownloadTask[]>([])
@@ -95,24 +97,29 @@ function App() {
     try {
       const dir = saveDir || downloadDir || undefined
       if (isBtSource(url)) {
-        // 磁力 / torrent → BT 会话（后端 15s+60s 双重超时；前端 70s 兜底保险）
-        // 先快速预检：判断资源是否有活跃做种者（list_only 真实取 metadata，不下载）。
-        // 首次运行时预检会顺带初始化 BT 会话（≤15s），故前端超时放宽到 45s。
-        const pre = await withTimeout(
-          invoke<BtPrecheckResult>('bt_precheck', { source: url.trim() }),
+        // 磁力 / torrent → 强制先取种子内文件清单供勾选，确认后只下勾选项
+        // （list_only 真实换 metadata，不下载；后端顺带缓存 .torrent 字节供 add 复用，
+        //   所以 add 阶段不会再握手一次 metadata）。
+        // 首次运行会顺带初始化 BT 会话（≤15s）+ 12s 取 metadata，故前端超时放宽到 45s。
+        const list = await withTimeout(
+          invoke<BtFileList>('bt_get_file_list', { source: url.trim() }),
           45000,
-          'BT 资源预检',
+          'BT 文件清单获取',
         )
-        // 资源当前无活跃做种者：明确告知，让用户决定是否仍要尝试添加（避免误以为软件坏了）
-        if (pre && pre.can_download === false) {
-          const ok = window.confirm(pre.message + '\n\n仍要尝试添加吗？')
+        // 拿不到清单（无做种者）：不做静默降级，必须用户显式确认才回退全量下载，
+        // 避免用户本想过滤垃圾文件却被默默全下。
+        if (!list || list.can_download === false) {
+          const ok = window.confirm((list?.message || '拿不到该资源的文件清单。') + '\n\n仍要按「全量下载」尝试添加吗？')
           if (!ok) {
             setIsAdding(false)
             return
           }
+          await withTimeout(invoke('bt_add_torrent', { source: url.trim(), saveDir: dir }), 70000, '添加 BT 任务')
+          await loadBtTasks()
+          return
         }
-        await withTimeout(invoke('bt_add_torrent', { source: url.trim(), saveDir: dir }), 70000, '添加 BT 任务')
-        await loadBtTasks()
+        // 有清单 → 弹面板，实际添加在 handleBtConfirmSelection 里继续
+        setBtPending({ list, source: url.trim(), saveDir: dir })
       } else {
         await invoke('create_download', { url, saveDir: dir })
         loadDownloads()
@@ -124,6 +131,27 @@ function App() {
       // 兼容 string | Error | unknown。
       const msg = typeof err === 'string' ? err : (err instanceof Error ? err.message : String(err))
       // 先恢复按钮，避免 alert 阻塞期间仍显示"添加中"的卡顿错觉
+      setIsAdding(false)
+      setTimeout(() => alert('创建下载失败: ' + msg), 0)
+    } finally { setIsAdding(false) }
+  }
+  // 用户在清单面板确认勾选后真正添加任务：only_files 原样回传（索引契约由后端产生，前端不重排），
+  // metadataCacheKey 命中后端缓存即跳过第二次 metadata 互换，任务几乎瞬时启动。
+  async function handleBtConfirmSelection(onlyFiles: number[]) {
+    if (!btPending) return
+    const { list, source, saveDir } = btPending
+    setBtPending(null)
+    setIsAdding(true)
+    try {
+      await withTimeout(
+        invoke('bt_add_torrent', { source, saveDir, onlyFiles, metadataCacheKey: list.info_hash }),
+        70000,
+        '添加 BT 任务',
+      )
+      await loadBtTasks()
+    } catch (err) {
+      console.error('Failed to add BT task:', err)
+      const msg = typeof err === 'string' ? err : (err instanceof Error ? err.message : String(err))
       setIsAdding(false)
       setTimeout(() => alert('创建下载失败: ' + msg), 0)
     } finally { setIsAdding(false) }
@@ -188,6 +216,7 @@ function App() {
                       {t.state === 'downloading' ? '下载中' : t.state === 'paused' ? '已暂停' : t.state === 'completed' ? '已完成' : t.state === 'fetching_metadata' ? '获取元数据中…' : '异常'}
                     </span>
                     <span>{t.progress.toFixed(1)}%</span>
+                    {t.selected_count != null && <span className="text-indigo-500">已选 {t.selected_count} 个文件</span>}
                     <span>{formatBytes(t.downloaded_bytes)} / {formatBytes(t.total_bytes)}</span>
                     {(t.state === 'downloading' || t.state === 'fetching_metadata') && <span>↓ {formatSpeed(t.download_rate)} ↑ {formatSpeed(t.upload_rate)}</span>}
                   </div>
@@ -208,6 +237,13 @@ function App() {
       <StatusBar totalTasks={tasks.length} downloadingCount={downloadingCount} onClearCompleted={handleClearCompleted} hasCompleted={hasCompleted} />
       </>)}
       {activeTab === 'netdisk' && <NetdiskPanel />}
+      {btPending && (
+        <BtFileSelectPanel
+          list={btPending.list}
+          onConfirm={handleBtConfirmSelection}
+          onCancel={() => setBtPending(null)}
+        />
+      )}
       <SettingsPanel isOpen={showSettings} onClose={() => setShowSettings(false)} onSave={handleSaveSettings} />
     </div>
   )

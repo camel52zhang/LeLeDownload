@@ -172,6 +172,7 @@ fn main() {
             commands::open_extension_folder,
             commands::bt_add_torrent, commands::bt_list_tasks,
             commands::bt_task_stats, commands::bt_precheck,
+            commands::bt_get_file_list,
             commands::bt_pause,
             commands::bt_resume, commands::bt_remove,
         ])
@@ -586,7 +587,11 @@ fn run_http(dm: Arc<DownloadManager>, app: tauri::AppHandle) -> Result<(), Box<d
                                         "[bt-route] magnet -> bt_add_torrent, has_headers={}",
                                         has_headers
                                     ));
-                                    match commands::bt_add_torrent(url.clone(), Some(dir)).await {
+                                    // 该路径无 UI 交互机会（扩展右键菜单/深链），故保持**全量下载**：
+                                    // only_files=None、metadata_cache_key=None（等同旧行为）。
+                                    match commands::bt_add_torrent(url.clone(), Some(dir), None, None)
+                                        .await
+                                    {
                                         Ok(v) => {
                                             let id = v
                                                 .get("id")
