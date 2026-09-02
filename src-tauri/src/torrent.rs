@@ -34,8 +34,26 @@ static BT_TASKS: OnceLock<Mutex<HashMap<String, Arc<ManagedTorrent>>>> = OnceLoc
 /// 进程内 metadata 缓存：info_hash(hex) -> 完整 bencoded .torrent 字节。
 /// 由 `get_file_list` 写入（来自 `ListOnlyResponse.torrent_bytes`），`add_torrent` 命中后
 /// 改用 `AddTorrent::from_bytes` 直接建任务，跳过第二次 BEP9 metadata 互换。
-/// 语义：**只读不移除**（用户取消后重新选择仍可命中）；不持久化，进程退出自然失效并回退常规流程。
+///
+/// **存储语义（别误以为它会持久化）**：
+///   - 仅存在于**进程内存**，没有任何落盘 / 数据库 / 配置文件参与；
+///   - **app 重启即全部失效**，不做迁移、不做预热；
+///   - 失效后 `add_torrent` 自动回退常规 `AddTorrent::from_url` 流程重新拉取 metadata
+///     （代价只是多等一次 BEP9 握手的十几秒，不是错误，无需任何额外处理）；
+///   - **只写不移除**：`add_torrent` 命中后不清除条目，因此用户取消选择后重新勾选仍能命中。
+///     单次会话内 list→add 必然连续发生，条目数受用户手工添加次数限制，内存占用可忽略
+///     （单条 = 一个 .torrent 的字节数，通常几 KB ~ 几百 KB）。
 static BT_METADATA_CACHE: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+
+/// metadata 互换（BEP9）的等待预算，`precheck_torrent` 与 `get_file_list` 共用同一基线。
+///
+/// 为什么是 20s 而不是 12s：`Session::new_with_opts` 返回只代表 session 对象**构造完成**，
+/// DHT bootstrap（连引导节点 + 填充路由表）和后续 get_peers 都在**这段预算里**继续跑。
+/// 因此 warm 路径（路由表已热）实测几百 ms 拿到 metadata，但**用户第一次添加磁力时路由表是空的**，
+/// 冷启动的 DHT bootstrap 会吃掉大部分时间。12s 会把活种误判成「无做种者」，
+/// 且症状随「是不是第一次用」漂移，极难排查 —— 故统一放宽到 20s。
+/// 前端 `App.tsx` 的 invoke 超时是 45s，仍有充足余量。
+const METADATA_TIMEOUT_SECS: u64 = 20;
 
 pub fn bt_tasks() -> &'static Mutex<HashMap<String, Arc<ManagedTorrent>>> {
     BT_TASKS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -230,9 +248,9 @@ pub async fn add_torrent(
 /// （与真正下载走同一条 DHT/peer 路径）。成功后返回 `AddTorrentResponse::ListOnly`——
 /// **不下载、不留常驻任务、无需清理**，正是理想的预检原语。
 ///
-/// 判定矩阵：
-///   - 12s 内取到 metadata  → can_download=true（资源活着，有 peer 愿意提供 metadata）
-///   - 12s 超时（DHT 找到的 peer 都连不上 / 无人提供 metadata）→ can_download=false
+/// 判定矩阵（超时见 `METADATA_TIMEOUT_SECS`）：
+///   - 预算内取到 metadata → can_download=true（资源活着，有 peer 愿意提供 metadata）
+///   - 超时（DHT 找到的 peer 都连不上 / 无人提供 metadata）→ can_download=false
 ///     （"DHT 有 peer 记录" ≠ 资源活着；这里是真要求完成 metadata 传输，判别力远高于只看 tracker seeders）
 ///   - magnet 本身非法（缺 infohash 等）→ Err（真实错误，前端按创建失败处理，不要给"仍要添加"）
 pub async fn precheck_torrent(
@@ -266,10 +284,10 @@ pub async fn precheck_torrent(
         .collect();
     opts.trackers = Some(tr_strs);
 
-    // 12s 预检超时：真实 metadata 互换通常秒级完成（活跃资源实测 <10s）；
-    // 超过即视为该资源当前无活跃做种者 / 所有发现的 peer 均不可达。
+    // 预检超时：见 METADATA_TIMEOUT_SECS 注释（必须容纳冷启动的 DHT bootstrap）。
+    // 注意计时起点在 ensure_session 之后 —— session 初始化的 15s 额度不会吃掉这里的预算。
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(METADATA_TIMEOUT_SECS),
         session.add_torrent(add, Some(opts)),
     )
     .await;
@@ -280,8 +298,8 @@ pub async fn precheck_torrent(
         return Ok(serde_json::json!({
             "can_download": false,
             "reason": "no_metadata",
-            "message": "预检超时（12s）：该磁力资源当前无活跃做种者（DHT 发现的 peer 均无法连接或无人提供 metadata），可能无法下载。\
-建议换一个磁力链接，或让原分享者提供带 metadata 的 .torrent 文件。",
+            "message": format!("预检超时（{METADATA_TIMEOUT_SECS}s）：该磁力资源当前无活跃做种者（DHT 发现的 peer 均无法连接或无人提供 metadata），可能无法下载。\
+建议换一个磁力链接，或让原分享者提供带 metadata 的 .torrent 文件。"),
         }));
     }
 
@@ -384,7 +402,7 @@ struct BtFileList {
 ///   1. 枚举 `iter_file_details()` 下发每个文件的 index/name/components/length；
 ///   2. 把 `ListOnlyResponse.torrent_bytes`（完整 bencoded .torrent）以 info_hash 为 key
 ///      存入 `BT_METADATA_CACHE`，随后的 `add_torrent` 命中缓存即可跳过第二次 metadata
-///      互换 —— 消除旧「precheck(12s) + add(60s) 两次握手」的重复开销。
+///      互换 —— 消除旧「precheck + add 两次 metadata 握手」的重复开销。
 ///
 /// 拿不到 metadata（冷门种子 / 无做种者）时返回 `can_download=false, reason="no_metadata"`，
 /// 由前端弹确认让用户显式决定是否降级为全量下载（不做静默降级）。
@@ -419,9 +437,11 @@ pub async fn get_file_list(
         .collect();
     opts.trackers = Some(tr_strs);
 
-    // 12s 超时：与 precheck 同一基线（活跃资源实测 <15s 拿到 metadata）。
+    // 超时：与 precheck 同一基线，见 METADATA_TIMEOUT_SECS 注释。
+    // 计时起点在 ensure_session 之后，session 初始化不占用这里的预算；但 DHT bootstrap
+    // 是在 session 构造完成后才继续跑的，冷启动时它就落在这段预算内 —— 这正是取 20s 的原因。
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(METADATA_TIMEOUT_SECS),
         session.add_torrent(add, Some(opts)),
     )
     .await;
@@ -432,9 +452,8 @@ pub async fn get_file_list(
             name: String::new(),
             can_download: false,
             reason: Some("no_metadata".to_string()),
-            message: "获取文件清单超时（12s）：该资源当前无活跃做种者（DHT 发现的 peer 均无法连接或无人提供 metadata），\
-拿不到种子内的文件列表。可以选择仍按全量尝试下载，或换一个磁力 / 让原分享者提供 .torrent 文件。"
-                .to_string(),
+            message: format!("获取文件清单超时（{METADATA_TIMEOUT_SECS}s）：该资源当前无活跃做种者（DHT 发现的 peer 均无法连接或无人提供 metadata），\
+拿不到种子内的文件列表。可以选择仍按全量尝试下载，或换一个磁力 / 让原分享者提供 .torrent 文件。"),
             total_bytes: 0,
             file_count: 0,
             seen_peers: 0,
@@ -792,8 +811,207 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **冷启动预算验证（联网，默认跳过）**：验证「进程刚起、session 尚未建立」时
+    /// 第一次调 `get_file_list` 能否在 `METADATA_TIMEOUT_SECS` 内拿到清单。
+    ///
+    /// 必须**单独**运行才有意义（同进程内任何先跑的联网用例都会把 session 和 DHT 路由表焐热）：
+    ///   cargo test bt_cold_start -- --ignored --nocapture
+    ///
+    /// 把两段耗时拆开计时，因为它们花的是**两份不同的预算**：
+    ///   1. `ensure_session` —— 自带 15s 超时，**不占** metadata 预算（生产代码里它在
+    ///      `timeout(METADATA_TIMEOUT_SECS, add_torrent)` 之前 await，见 `get_file_list` 开头）；
+    ///   2. `get_file_list` —— 此时 session 已走快速路径，实测耗时≈纯 `add_torrent`，
+    ///      即真正受 `METADATA_TIMEOUT_SECS` 约束的那段（DHT get_peers + BEP9 互换都在这里）。
+    ///
+    /// 注意 librqbit 默认**把 DHT 路由表持久化到磁盘**
+    /// （`librqbit-dht-9.0.0/src/persistence.rs:97-101`，`<cache_dir>/dht/dht.json`，60s 一次快照），
+    /// 所以「重启 app」并不等于「DHT 路由表为空」—— 只有**首次安装后的第一次运行**才是真空。
+    /// 本用例会打印该文件是否存在及其大小，报告时必须一并说明是哪种冷度，否则数字没有意义。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "冷启动验证，需真实网络且必须单独运行: cargo test bt_cold_start -- --ignored --nocapture"]
+    async fn bt_cold_start_get_file_list_within_budget() {
+        let out = temp_dir("cold");
+
+        // 报告 DHT 路由表持久化文件的状态 —— 决定这次到底有多"冷"。
+        // 路径来自 librqbit-dht 的 `get_configuration_directory("dht")`（directories crate），
+        // Windows 下即 %LOCALAPPDATA%\rqbit\dht\cache\dht.json。这里手算路径而不引 directories 依赖。
+        let dht_json = std::env::var("LOCALAPPDATA").ok().map(|p| {
+            PathBuf::from(p)
+                .join("rqbit")
+                .join("dht")
+                .join("cache")
+                .join("dht.json")
+        });
+        match dht_json.as_ref().map(|p| (p, std::fs::metadata(p))) {
+            Some((p, Ok(m))) => println!(
+                "[cold] DHT 路由表持久化文件存在: {} ({} 字节) → 本次为「进程冷、DHT 温」（等价用户非首次运行 app）",
+                p.display(),
+                m.len()
+            ),
+            Some((p, Err(_))) => println!(
+                "[cold] DHT 路由表持久化文件不存在: {} → 本次为「真正冷启动」（等价首次安装后第一次运行）",
+                p.display()
+            ),
+            None => println!("[cold] 无法定位 DHT 持久化路径（非 Windows？）"),
+        }
+
+        // 阶段 1：session 初始化（生产代码里它有独立的 15s 预算，不吃 metadata 额度）
+        let t0 = std::time::Instant::now();
+        let _s = ensure_session(out.clone())
+            .await
+            .expect("ensure_session 失败");
+        let session_ms = t0.elapsed().as_millis();
+
+        // 阶段 2：真正受 METADATA_TIMEOUT_SECS 约束的那段（session 已热，走快速路径）
+        let t1 = std::time::Instant::now();
+        let list = get_file_list(SINTEL_MAGNET.to_string(), out.clone())
+            .await
+            .expect("get_file_list 返回 Err");
+        let meta_ms = t1.elapsed().as_millis();
+
+        println!(
+            "[cold] session 初始化={session_ms}ms（预算 15000ms）  metadata 互换={meta_ms}ms（预算 {}ms）  合计={}ms",
+            METADATA_TIMEOUT_SECS * 1000,
+            session_ms + meta_ms
+        );
+        println!(
+            "[cold] 结果: can_download={} name={} files={} peers={}",
+            list["can_download"],
+            list["name"].as_str().unwrap_or(""),
+            list["file_count"],
+            list["seen_peers"]
+        );
+
+        assert_eq!(
+            list["can_download"],
+            serde_json::json!(true),
+            "冷启动下应能拿到清单，实测 metadata 阶段 {meta_ms}ms"
+        );
+        assert!(
+            meta_ms < (METADATA_TIMEOUT_SECS * 1000) as u128,
+            "metadata 阶段 {meta_ms}ms 超过预算 {}ms，需要放宽 METADATA_TIMEOUT_SECS",
+            METADATA_TIMEOUT_SECS * 1000
+        );
+
+        // ---- 对照组：**强制 DHT 路由表为空**的真正最坏情况 ----
+        // 上面那次即便 app 刚重启，也会从 <cache>/dht/dht.json 读回上次的路由表（只要用户不是
+        // 首次运行）；而且只要机器上还有别的 librqbit 进程在跑，它每 60s 就会把热表 dump 回该文件，
+        // 光把文件移走也造不出真空。这里用 `persistence: None` 让 DHT **必定**从零 bootstrap，
+        // 精确复现「首次安装后第一次添加磁力」，且不受其它进程干扰。
+        let cold_out = temp_dir("cold_dht");
+        let t2 = std::time::Instant::now();
+        let cold_session = Session::new_with_opts(
+            cold_out.clone(),
+            SessionOptions {
+                trackers: default_public_trackers().into_iter().collect(),
+                dht: Some(librqbit::DhtSessionConfig {
+                    persistence: None, // 关键：不读不写 dht.json → 路由表必定为空
+                    ..Default::default()
+                }),
+                ..SessionOptions::default()
+            },
+        )
+        .await
+        .expect("冷 DHT session 初始化失败");
+        let cold_session_ms = t2.elapsed().as_millis();
+
+        let mut cold_opts = AddTorrentOptions::default();
+        cold_opts.list_only = true;
+        cold_opts.overwrite = true;
+        cold_opts.trackers = Some(
+            default_public_trackers()
+                .into_iter()
+                .map(|u| u.to_string())
+                .collect(),
+        );
+        let t3 = std::time::Instant::now();
+        let cold_resp = tokio::time::timeout(
+            std::time::Duration::from_secs(METADATA_TIMEOUT_SECS),
+            cold_session.add_torrent(
+                AddTorrent::from_url(enrich_magnet(SINTEL_MAGNET)),
+                Some(cold_opts),
+            ),
+        )
+        .await;
+        let cold_meta_ms = t3.elapsed().as_millis();
+        let cold_ok = matches!(cold_resp, Ok(Ok(AddTorrentResponse::ListOnly(_))));
+        println!(
+            "[cold] 【DHT 路由表强制为空】session 初始化={cold_session_ms}ms  metadata 互换={cold_meta_ms}ms  拿到清单={cold_ok}"
+        );
+        assert!(
+            cold_ok,
+            "DHT 路由表为空时 {METADATA_TIMEOUT_SECS}s 内未能拿到清单（实测 {cold_meta_ms}ms）—— \
+说明 20s 预算对首次安装的用户不够，需要加大或让前端预热 session"
+        );
+
+        let _ = std::fs::remove_dir_all(&out);
+        let _ = std::fs::remove_dir_all(&cold_out);
+    }
+
+    /// 极限参考值（联网，默认跳过，**必须单独运行**）：DHT 路由表为空 **且完全禁用 tracker**，
+    /// 隔离出「磁力没有任何可用 tracker、只能靠 DHT」时纯 DHT 的 metadata 成本。
+    ///
+    ///   cargo test bt_pure_dht -- --ignored --nocapture
+    ///
+    /// 必须单独跑：同进程内每个 Session 各自带一套 DHT + UDP socket，多个 session 并存会互相
+    /// 抢占资源、显著拖慢 bootstrap（实测在 `bt_cold_start` 里连跑第三个 session 时 60s 都拿不到，
+    /// 单独跑则正常）。
+    ///
+    /// 用 60s 宽松上限**只测量不断言** —— 生产路径必定注入 tracker（`SessionOptions.trackers` +
+    /// `AddTorrentOptions.trackers` 两层），这个数字仅用于判断 `METADATA_TIMEOUT_SECS` 的余量。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "极限参考值，需真实网络且必须单独运行: cargo test bt_pure_dht -- --ignored --nocapture"]
+    async fn bt_pure_dht_no_tracker_cost() {
+        let pure_out = temp_dir("pure_dht");
+        let pure_session = Session::new_with_opts(
+            pure_out.clone(),
+            SessionOptions {
+                disable_trackers: true, // 关键：只剩 DHT
+                dht: Some(librqbit::DhtSessionConfig {
+                    persistence: None, // 关键：路由表为空
+                    ..Default::default()
+                }),
+                ..SessionOptions::default()
+            },
+        )
+        .await
+        .expect("纯 DHT session 初始化失败");
+
+        let mut pure_opts = AddTorrentOptions::default();
+        pure_opts.list_only = true;
+        pure_opts.overwrite = true;
+        pure_opts.disable_trackers = true;
+        let t = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            pure_session.add_torrent(
+                // 注意：不能用 enrich_magnet（它会追补 tr=），这里要的就是无 tracker
+                AddTorrent::from_url(SINTEL_MAGNET.to_string()),
+                Some(pure_opts),
+            ),
+        )
+        .await;
+        let ms = t.elapsed().as_millis();
+        let ok = matches!(resp, Ok(Ok(AddTorrentResponse::ListOnly(_))));
+        println!(
+            "[pure-dht] 路由表为空 + 禁用 tracker: metadata={ms}ms 拿到清单={ok}（60s 上限，预算 {}ms）",
+            METADATA_TIMEOUT_SECS * 1000
+        );
+        println!(
+            "[pure-dht] 结论: {}",
+            if ok && ms < (METADATA_TIMEOUT_SECS * 1000) as u128 {
+                "纯 DHT 也在预算内 → 20s 余量充足"
+            } else if ok {
+                "纯 DHT 超出 20s 预算 → 生产靠注入 tracker 兜底，DHT-only 磁力会走降级确认"
+            } else {
+                "纯 DHT 60s 内拿不到 → 该场景无论 12s/20s/60s 都救不回来，只能靠 tracker"
+            }
+        );
+        let _ = std::fs::remove_dir_all(&pure_out);
+    }
+
     /// 诊断探针（联网，默认跳过）：对多个 magnet 逐个跑 get_file_list 并打印耗时/结果。
-    /// 控制组用一个不存在的 info_hash —— 它必须**超时**（12s）才能证明"其它 magnet 的
+    /// 控制组用一个不存在的 info_hash —— 它必须**超时**（METADATA_TIMEOUT_SECS）才能证明"其它 magnet 的
     /// 报错是真的拿到 metadata 之后才发生的"，而不是我们代码路径的问题。
     /// 手动运行: cargo test bt_probe_file_list -- --ignored --nocapture
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
