@@ -43,7 +43,14 @@ static BT_TASKS: OnceLock<Mutex<HashMap<String, Arc<ManagedTorrent>>>> = OnceLoc
 ///   - **只写不移除**：`add_torrent` 命中后不清除条目，因此用户取消选择后重新勾选仍能命中。
 ///     单次会话内 list→add 必然连续发生，条目数受用户手工添加次数限制，内存占用可忽略
 ///     （单条 = 一个 .torrent 的字节数，通常几 KB ~ 几百 KB）。
-static BT_METADATA_CACHE: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+/// 缓存项：完整 bencoded .torrent 字节 + 种子内文件总数。
+/// `file_count` 由 `get_file_list` 在解析 metadata 时一并算出，供 `add_torrent` 对
+/// `only_files` 做精确边界校验（命中缓存 = 从 UI 勾选面板来的添加，后端确知文件总数）。
+struct CachedTorrent {
+    pub bytes: Vec<u8>,
+    pub file_count: usize,
+}
+static BT_METADATA_CACHE: OnceLock<Mutex<HashMap<String, CachedTorrent>>> = OnceLock::new();
 
 /// metadata 互换（BEP9）的等待预算，`precheck_torrent` 与 `get_file_list` 共用同一基线。
 ///
@@ -59,7 +66,7 @@ pub fn bt_tasks() -> &'static Mutex<HashMap<String, Arc<ManagedTorrent>>> {
     BT_TASKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn bt_metadata_cache() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+fn bt_metadata_cache() -> &'static Mutex<HashMap<String, CachedTorrent>> {
     BT_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -146,13 +153,46 @@ pub async fn add_torrent(
     source: String,
     save_dir: Option<String>,
     default_dir: PathBuf,
-    only_files: Option<Vec<usize>>,
+    mut only_files: Option<Vec<usize>>,
     metadata_cache_key: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // 边界校验：显式传了空选集等于「一个文件都不下」，属无意义任务，直接拒绝
     // （librqbit 会接受空 Vec 并建出永不完成的任务）。
     if only_files.as_ref().is_some_and(|v| v.is_empty()) {
         return Err("未选择任何文件，请至少勾选一个文件后再添加".to_string());
+    }
+
+    // 去重 + 升序：索引契约要求 only_files 升序（对应 librqbit 文件枚举序），
+    // 重复索引会被当成多余文件请求，无意义，先归一化。
+    if let Some(v) = only_files.as_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+
+    // 优先命中 get_file_list 缓存：取出完整 .torrent 字节 + 文件总数。
+    // 命中缓存 = 来自 UI 勾选面板的添加，后端确知文件总数，可做精确边界校验；
+    // 未命中（直连 URL 的 HTTP 路由等）则交给 librqbit 在文件映射阶段报错（不会静默下错文件）。
+    let (cached_bytes, cached_file_count) = match metadata_cache_key.as_deref() {
+        Some(key) if !key.is_empty() => {
+            let c = bt_metadata_cache()
+                .lock()
+                .map_err(|_| "metadata 缓存锁被污染")?;
+            match c.get(key) {
+                Some(ct) => (Some(ct.bytes.clone()), Some(ct.file_count)),
+                None => (None, None),
+            }
+        }
+        _ => (None, None),
+    };
+    let from_cache = cached_bytes.is_some();
+
+    // 边界校验：only_files 各索引必须在 [0, file_count) 内。命中缓存才有精确上界。
+    if let (Some(files), Some(fc)) = (only_files.as_ref(), cached_file_count) {
+        if let Some(&bad) = files.iter().find(|&&idx| idx >= fc) {
+            return Err(format!(
+                "勾选的文件索引 {bad} 超出范围（该资源共 {fc} 个文件，合法索引为 0..{fc}）"
+            ));
+        }
     }
 
     let session = ensure_session(default_dir).await?;
@@ -184,17 +224,6 @@ pub async fn add_torrent(
     } else {
         source.clone()
     };
-
-    // 优先命中 get_file_list 缓存的完整 .torrent 字节：省掉一次 metadata 互换。
-    let cached_bytes = match metadata_cache_key.as_deref() {
-        Some(key) if !key.is_empty() => bt_metadata_cache()
-            .lock()
-            .map_err(|_| "metadata 缓存锁被污染")?
-            .get(key)
-            .cloned(),
-        _ => None,
-    };
-    let from_cache = cached_bytes.is_some();
 
     let add = if let Some(bytes) = cached_bytes {
         AddTorrent::from_bytes(bytes)
@@ -465,18 +494,24 @@ pub async fn get_file_list(
     match resp.unwrap() {
         Ok(AddTorrentResponse::ListOnly(r)) => {
             let info_hash = r.info_hash.as_string();
-            // 缓存完整 bencoded .torrent 供 add 复用（只写不移除，见 BT_METADATA_CACHE 注释）。
-            {
-                let mut cache = bt_metadata_cache()
-                    .lock()
-                    .map_err(|_| "metadata 缓存锁被污染")?;
-                cache.insert(info_hash.clone(), r.torrent_bytes.to_vec());
-            }
 
             let files = build_file_entries(&r.info);
 
             let total_bytes: u64 = files.iter().map(|f| f.length).sum();
             let file_count = files.len();
+
+            // 缓存完整 bencoded .torrent 字节 + 文件总数（只写不移除，见 BT_METADATA_CACHE 注释）。
+            // file_count 供随后 add_torrent 对 only_files 做精确边界校验——命中缓存即来自 UI 勾选面板，
+            // 后端此时确知文件总数，能拦掉越界索引。
+            {
+                let mut cache = bt_metadata_cache()
+                    .lock()
+                    .map_err(|_| "metadata 缓存锁被污染")?;
+                cache.insert(
+                    info_hash.clone(),
+                    CachedTorrent { bytes: r.torrent_bytes.to_vec(), file_count },
+                );
+            }
             let seen_peers = r.seen_peers.len();
             let name = r
                 .info
@@ -713,26 +748,92 @@ mod tests {
         dir
     }
 
-    /// 离线：metadata 缓存读写语义（写入可读回、未知 key 必 miss、重复写覆盖）。
+    /// 离线：metadata 缓存读写语义（写入可读回、未知 key 必 miss、重复写覆盖、file_count 随条目存读）。
     #[test]
     fn bt_metadata_cache_read_write() {
         let key = "0123456789abcdef0123456789abcdef01234567".to_string();
         {
             let mut c = bt_metadata_cache().lock().unwrap();
-            c.insert(key.clone(), vec![1, 2, 3]);
+            c.insert(
+                key.clone(),
+                CachedTorrent { bytes: vec![1, 2, 3], file_count: 3 },
+            );
         }
         {
             let c = bt_metadata_cache().lock().unwrap();
-            assert_eq!(c.get(&key).map(|v| v.as_slice()), Some(&[1u8, 2, 3][..]));
+            assert_eq!(c.get(&key).map(|v| v.bytes.as_slice()), Some(&[1u8, 2, 3][..]));
+            assert_eq!(c.get(&key).map(|v| v.file_count), Some(3));
             assert!(c.get("ffffffffffffffffffffffffffffffffffffffff").is_none());
         }
         // 同 key 重复 get_file_list 应覆盖而非追加
         {
             let mut c = bt_metadata_cache().lock().unwrap();
-            c.insert(key.clone(), vec![9]);
-            assert_eq!(c.get(&key).map(|v| v.len()), Some(1));
+            c.insert(key.clone(), CachedTorrent { bytes: vec![9], file_count: 1 });
+            assert_eq!(c.get(&key).map(|v| v.bytes.len()), Some(1));
+            assert_eq!(c.get(&key).map(|v| v.file_count), Some(1));
             c.remove(&key); // 不污染同进程内其它测试
         }
+    }
+
+    /// 离线：only_files 越界索引必须被边界校验拦截（命中缓存路径，file_count 已知）。
+    ///
+    /// 不依赖 get_file_list（避免触网），直接把本地造的种子字节 + file_count 写入缓存，
+    /// 再以越界索引调用 add_torrent（带 metadata_cache_key 命中缓存）。边界校验在 ensure_session
+    /// 之前就返回 Err，所以本测试完全离线、且不依赖网络。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bt_add_torrent_rejects_out_of_range_index() {
+        let src = temp_dir("mk_oob");
+        std::fs::write(src.join("a.mp4"), vec![7u8; 1000]).unwrap();
+        std::fs::write(src.join("b.txt"), vec![1u8; 10]).unwrap();
+        let res = librqbit::create_torrent(
+            &src,
+            librqbit::CreateTorrentOptions {
+                name: Some("oob_sample"),
+                ..Default::default()
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("造种失败");
+        let torrent_bytes = res.as_bytes().expect("序列化失败").to_vec();
+        let torrent_path = src.join("oob_sample.torrent");
+        std::fs::write(&torrent_path, torrent_bytes.clone()).unwrap();
+
+        // 直接以「本地种 key」写入缓存：bytes + file_count=2（绕开 get_file_list，保持离线）。
+        let cache_key = "oob_cache_key_0123456789abcdef".to_string();
+        bt_metadata_cache()
+            .lock()
+            .unwrap()
+            .insert(cache_key.clone(), CachedTorrent { bytes: torrent_bytes, file_count: 2 });
+
+        let out = temp_dir("oob_add");
+        let err = add_torrent(
+            torrent_path.to_string_lossy().to_string(),
+            Some(out.to_string_lossy().to_string()),
+            out.clone(),
+            Some(vec![999]),
+            Some(cache_key.clone()),
+        )
+        .await
+        .expect_err("越界索引应被边界校验拒绝");
+        assert!(err.contains("超出范围"), "错误信息不符: {err}");
+
+        // 边界值 2 也越界（合法为 0..2）：再确认一次，防 off-by-one
+        let out2 = temp_dir("oob_add2");
+        let err2 = add_torrent(
+            torrent_path.to_string_lossy().to_string(),
+            Some(out2.to_string_lossy().to_string()),
+            out2.clone(),
+            Some(vec![2]),
+            Some(cache_key.clone()),
+        )
+        .await
+        .expect_err("索引 == file_count 应越界");
+        assert!(err2.contains("超出范围"), "错误信息不符: {err2}");
+
+        // 清理缓存，避免污染同进程其它测试
+        bt_metadata_cache().lock().unwrap().remove(&cache_key);
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     /// 离线：magnet 追补默认 trackers；非 magnet 原样返回。

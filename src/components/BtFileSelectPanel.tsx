@@ -31,6 +31,11 @@ export function toOnlyFiles(selected: Set<number>): number[] {
   return Array.from(selected).sort((a, b) => a - b)
 }
 
+/** 确认按钮是否禁用：未勾选任何文件时禁用（纯函数，供单测验证空选禁用逻辑）。 */
+export function isConfirmDisabled(selected: Set<number>): boolean {
+  return selected.size === 0
+}
+
 interface Props {
   list: BtFileList
   onConfirm: (onlyFiles: number[]) => void
@@ -149,7 +154,7 @@ export function BtFileSelectPanel({ list, onConfirm, onCancel }: Props) {
           <button onClick={onCancel} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">取消</button>
           <button
             onClick={() => onConfirm(toOnlyFiles(selected))}
-            disabled={selected.size === 0}
+            disabled={isConfirmDisabled(selected)}
             title={selected.size === 0 ? '请至少勾选一个文件' : ''}
             className="px-5 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-colors"
           >

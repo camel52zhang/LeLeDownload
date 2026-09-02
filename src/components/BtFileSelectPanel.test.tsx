@@ -2,7 +2,7 @@
 // 覆盖的是「只下选中文件」这条链路上最容易出错的一环：过滤后勾选集合与 only_files 数组的构造。
 // 运行：npx vitest run
 import { describe, it, expect } from 'vitest'
-import { filterFiles, selectedBytes, toOnlyFiles } from './BtFileSelectPanel'
+import { filterFiles, selectedBytes, toOnlyFiles, isConfirmDisabled } from './BtFileSelectPanel'
 import type { BtFileEntry } from '../types'
 
 const MB = 1024 * 1024
@@ -81,6 +81,16 @@ describe('selectedBytes', () => {
 
   it('忽略不存在的 index（防御：面板 state 与清单不一致时不应崩）', () => {
     expect(selectedBytes(files, new Set([99]))).toBe(0)
+  })
+})
+
+describe('isConfirmDisabled', () => {
+  it('未勾选任何文件时禁用（对应确认按钮 disabled）', () => {
+    expect(isConfirmDisabled(new Set())).toBe(true)
+  })
+  it('勾选至少一个文件时不禁用', () => {
+    expect(isConfirmDisabled(new Set([0]))).toBe(false)
+    expect(isConfirmDisabled(new Set([0, 3, 4]))).toBe(false)
   })
 })
 

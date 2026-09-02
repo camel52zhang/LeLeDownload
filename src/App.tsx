@@ -118,7 +118,31 @@ function App() {
           await loadBtTasks()
           return
         }
-        // 有清单 → 弹面板，实际添加在 handleBtConfirmSelection 里继续
+        // 单文件种子：勾选面板只有一个复选框，没有意义，直接下载这唯一文件
+        // （onlyFiles=[0] 即下载全集；metadataCacheKey 命中后台缓存，任务瞬时启动）。
+        if (list.file_count === 1) {
+          setIsAdding(true)
+          try {
+            await withTimeout(
+              invoke('bt_add_torrent', {
+                source: url.trim(),
+                saveDir: dir,
+                onlyFiles: [0],
+                metadataCacheKey: list.info_hash,
+              }),
+              70000,
+              '添加 BT 任务',
+            )
+            await loadBtTasks()
+          } catch (err) {
+            console.error('Failed to add single-file BT task:', err)
+            const msg = typeof err === 'string' ? err : (err instanceof Error ? err.message : String(err))
+            setIsAdding(false)
+            setTimeout(() => alert('创建下载失败: ' + msg), 0)
+          } finally { setIsAdding(false) }
+          return
+        }
+        // 多文件 → 弹面板，实际添加在 handleBtConfirmSelection 里继续
         setBtPending({ list, source: url.trim(), saveDir: dir })
       } else {
         await invoke('create_download', { url, saveDir: dir })
