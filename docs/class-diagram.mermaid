@@ -1,0 +1,221 @@
+%% LeLeDownload · 磁力文件清单解析 + 选择性下载 —— 类图 / 数据结构与接口
+%% 源码位置：docs/class-diagram.mermaid
+%% 前置阅读：docs/system_design.md §4
+%% 说明：为避免 Mermaid 解析歧义，成员类型中的泛型一律写平（Vec~String~），
+%%       方法返回类型写在括号后，复杂签名放在 note 里。
+
+classDiagram
+    %% ============ Rust · torrent_meta.rs（新建 · 纯逻辑，可无网单测） ============
+    class TorrentFileEntry {
+        +usize index
+        +String path
+        +Vec~String~ components
+        +String name
+        +u64 length
+        +bool is_padding
+    }
+    note for TorrentFileEntry "JSON 字段名 snake_case。index 是唯一权威标识，等于 info.iter_file_details().enumerate() 的下标，也就是 torrent info.files 数组下标（info-hash 保证恒定）。is_padding 为 BEP-47 padding 文件，UI 置灰且不计入 selected_bytes。禁止用 path 或 name 当文件身份（种子里重名合法）。"
+
+    class TorrentFileList {
+        +String info_hash
+        +String name
+        +Vec~TorrentFileEntry~ files
+        +usize total_file_count
+        +u64 total_bytes
+        +u64 selected_bytes
+        +bool truncated
+        +bool from_cache
+        +OptionVecUsize only_files
+    }
+    note for TorrentFileList "truncated 为 true 时 files 被截断到 MAX_LIST_FILES，但 total_file_count 仍是真实总数。from_cache 为 true 表示清单来自本地 .torrent 缓存，未走网络。only_files 为 None 表示未筛选即全选；Some 表示明确选择且顺序已排序归一化。"
+
+    class torrent_meta {
+        <<module>>
+        +MAX_LIST_FILES usize
+        +build_file_list() TorrentFileList
+        +file_list_from_bytes() Result
+        +compute_selected_bytes() u64
+        +validate_selection() Result
+        +parse_info_hash() Option
+        +cache_dir() PathBuf
+        +cache_path() PathBuf
+        +save_to_cache() Result
+        +load_from_cache() Option
+        +remove_from_cache() void
+    }
+    note for torrent_meta "签名（System Design 4.1）：build_file_list(info_hash, info, only_files, max_files) / file_list_from_bytes(bytes) 返回 (String, TorrentFileList) / compute_selected_bytes(files, selected) / validate_selection(file_count, only_files) / parse_info_hash(source) / save_to_cache(info_hash, bytes)。纯逻辑，不持有 Session、不依赖网络，因此可脱离 BT 环境单测（T02 必测项基础）。save_to_cache 用 tmp 写 + rename 保证原子性。validate_selection 做排序 + 去重 + 越界 Err + 空集 Err。"
+
+    %% ============ Rust · torrent.rs（修改） ============
+    class torrent {
+        <<module>>
+        -BT_SESSION OnceLock
+        -BT_TASKS OnceLock
+        +bt_tasks() Mutex
+        -ensure_session() Result
+        -enrich_magnet() String
+        -default_public_trackers() Vec
+        -format_bytes() String
+        +precheck_torrent() Result
+        +add_torrent() Result
+        +task_files() Result
+        +update_selected_files() Result
+        +task_stats() Option
+        +list_tasks() Vec
+        +pause_task() Result
+        +resume_task() Result
+        +remove_task() Result
+    }
+    note for torrent "改动：precheck_torrent 新增 timeout_secs 参数（12s 放宽到 20s）并在返回体增加 file_list；add_torrent 新增 only_files 参数，命中缓存时走 AddTorrent::from_bytes 并把超时从 60s 降到 30s，未命中回退原路径保持 60s，成功后 with_metadata 补写缓存；新增 task_files 与 update_selected_files。BT_TASKS 是 info_hash 到 Arc(ManagedTorrent) 的映射。不新增选择状态旁表：真值在 librqbit 内，需要时用 handle.only_files() 读。"
+
+    %% ============ Rust · commands.rs（修改 + 新增） ============
+    class commands {
+        <<module>>
+        +bt_precheck() Result
+        +bt_add_torrent() Result
+        +bt_task_files() Result
+        +bt_update_files() Result
+        +bt_list_tasks() Vec
+        +bt_task_stats() Option
+        +bt_pause() Result
+        +bt_resume() Result
+        +bt_remove() Result
+    }
+    note for commands "bt_precheck(source, timeout_secs) 与 bt_add_torrent(source, save_dir, only_files) 为修改（新增可选参数，不传则行为不变，向后兼容）。bt_task_files(id) 与 bt_update_files(id, only_files) 为新增。错误一律 Result 的 String 分支，中文可直接展示给用户。"
+
+    %% ============ librqbit 9.0.0（外部依赖，只列用到的部分） ============
+    class Session {
+        <<librqbit>>
+        +add_torrent() Future
+        +update_only_files() Future
+        +pause() Future
+        +unpause() Future
+        +delete() Future
+    }
+    note for Session "关键签名：update_only_files(self: &Arc(Self), handle, only_files: &HashSet(usize))，见 session.rs:1617，这是唯一公开的改选入口，参数类型是 HashSet 不是 Vec。add_torrent(add, opts) 中 opts 为 AddTorrentOptions，其 only_files 字段类型是 Option(Vec(usize))，见 session.rs:252。"
+
+    class ManagedTorrent {
+        <<librqbit>>
+        +info_hash() Id20
+        +name() Option
+        +stats() TorrentStats
+        +with_state() void
+        +with_metadata() Result
+        +only_files() Option
+    }
+    note for ManagedTorrent "with_metadata（torrent_state/mod.rs:239）与 only_files（:252）都是 pub，可离线重列清单与回显当前选择。注意 update_only_files（:617）是 pub(crate)，外部不可直接调用。注意 only_files() 回读的数组来自 HashSet 收集（:644），顺序随机，前端比较前必须先排序。"
+
+    class FileDetails {
+        <<librqbit-core>>
+        +FileIteratorName filename
+        +u64 len
+        +attrs() FileDetailsAttrs
+    }
+    note for FileDetails "重要修正：真实字段是 filename 与 len，没有 name、length、components、included（后四者是 HTTP API 层 TorrentDetailsResponseFile 的字段）。path 用 filename.to_string()（Display 实现，用平台主分隔符拼接，Windows 上是反斜杠）；components 用 filename.to_vec()；is_padding 用 attrs().padding。构造清单的 make_torrent_details（api.rs:562）是私有 fn，不能复用，必须自己遍历。"
+
+    class AddTorrentResponse {
+        <<librqbit>>
+        +AlreadyManaged
+        +ListOnly
+        +Added
+        +into_handle() Option
+    }
+    note for AddTorrentResponse "关键能力：ListOnly 变体的 torrent_bytes 字段（session.rs:302）对 magnet 也是一份完整合法的 .torrent 文件字节 —— magnet 分支由 torrent_file_from_info_bytes(info_bytes, trackers) 用 BEP9 拿到的 info 字节重建（session.rs:1663）。这是 metadata 落盘缓存、消灭二次 handshake 的基石。"
+
+    %% ============ TypeScript · 前端 ============
+    class TorrentFileEntryTS {
+        <<interface>>
+        +index number
+        +path string
+        +components stringArray
+        +name string
+        +length number
+        +is_padding boolean
+    }
+    class TorrentFileListTS {
+        <<interface>>
+        +info_hash string
+        +name string
+        +files TorrentFileEntryArray
+        +total_file_count number
+        +total_bytes number
+        +selected_bytes number
+        +truncated boolean
+        +from_cache boolean
+        +only_files numberArrayOrNull
+    }
+    class BtPrecheckResultTS {
+        <<interface>>
+        +can_download boolean
+        +reason string
+        +info_hash string
+        +name string
+        +file_count number
+        +total_bytes number
+        +seen_peers number
+        +message string
+        +file_list TorrentFileList
+    }
+    note for BtPrecheckResultTS "file_list 为本次新增；can_download 为 true 时必定存在。only_files 为 null 表示未筛选（全选）。所有字段名与 Rust 侧 serde 输出逐字一致，一律 snake_case。"
+
+    class torrentFilesTS {
+        <<module>>
+        +JUNK_EXTENSIONS stringArray
+        +MEDIA_EXTENSIONS stringArray
+        +extOf() string
+        +computeSelectedBytes() number
+        +toggleIndex() Set
+        +selectByExt() Set
+        +deselectByExt() Set
+        +filterByKeyword() Array
+        +groupByDir() Array
+        +sameSelection() boolean
+    }
+    note for torrentFilesTS "computeSelectedBytes 必须跳过 is_padding。sameSelection 先排序再比较（对应陷阱 C 的回归测试）。JUNK_EXTENSIONS 与 MEDIA_EXTENSIONS 只用于快捷按钮，绝不做自动过滤。groupByDir 把 components 长度为 1 的文件归入空目录名。"
+
+    class BtFilePicker {
+        <<React FC>>
+        +mode PickerMode
+        +source string
+        +taskId string
+        +fileList TorrentFileList
+        +saving boolean
+        +onCancel() void
+        +onSubmit() void
+        -selection Set
+        -page number
+        -keyword string
+    }
+    note for BtFilePicker "props：mode 为 create 或 update；mode 为 create 时传 source，mode 为 update 时传 taskId。每页 200 条 + 显示更多按钮。四个快捷操作：全选、全不选、仅影音字幕、取消常见垃圾。selection 大小为 0 时提交按钮 disabled。truncated 为 true 时顶部黄色提示。样式沿用 NetdiskPanel.tsx 的卡片与配色规范。"
+
+    class BtFileRow {
+        <<React FC>>
+        +file TorrentFileEntry
+        +checked boolean
+        +disabled boolean
+        +onToggle() void
+    }
+    note for BtFileRow "缩进量等于 components.length - 1。用 truncate 加 title 悬浮显示完整 path 防超长溢出。is_padding 为 true 时禁用复选框并显示 padding 徽标。"
+
+    %% ============ 关系 ============
+    torrent_meta ..> TorrentFileEntry : 构造
+    torrent_meta ..> TorrentFileList : 构造
+    torrent_meta ..> FileDetails : 遍历 iter_file_details
+    torrent ..> torrent_meta : 调用清单/缓存/校验
+    torrent o-- ManagedTorrent : BT_TASKS 持有
+    torrent ..> Session : ensure_session 与 add_torrent 与 update_only_files
+    torrent ..> AddTorrentResponse : 匹配 ListOnly 与 Added
+    commands ..> torrent : 委托
+    Session ..> AddTorrentResponse : 返回
+    Session ..> ManagedTorrent : 管理
+    ManagedTorrent "1" *-- "1" FileDetails : metadata.info 迭代产出
+
+    TorrentFileListTS "1" *-- "*" TorrentFileEntryTS : files
+    BtPrecheckResultTS "1" o-- "1" TorrentFileListTS : file_list
+
+    commands <.. TorrentFileListTS : Tauri IPC JSON
+    TorrentFileEntry "1" <.. "1" TorrentFileEntryTS : serde 契约
+    TorrentFileList "1" <.. "1" TorrentFileListTS : serde 契约
+
+    BtFilePicker ..> torrentFilesTS : 调用纯函数
+    BtFilePicker "1" *-- "*" BtFileRow : 渲染
+    BtFilePicker ..> TorrentFileListTS : 消费

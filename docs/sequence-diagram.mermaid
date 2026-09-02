@@ -1,0 +1,124 @@
+%% LeLeDownload · 磁力文件清单解析 + 选择性下载 —— 关键调用时序图
+%% 源码位置：docs/sequence-diagram.mermaid
+%% 前置阅读：docs/system_design.md §0（librqbit 9.0.0 源码核实结论）
+%%
+%% 图例说明：
+%%   ★ = 本次新增/改造的关键路径
+%%   ⚠ = 易踩的 librqbit 语义陷阱
+
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant DF as DownloadForm.tsx
+    participant AP as App.tsx
+    participant FP as BtFilePicker.tsx
+    participant TF as lib/torrentFiles.ts
+    participant CM as commands.rs
+    participant TR as torrent.rs
+    participant TM as torrent_meta.rs
+    participant SQ as librqbit Session
+    participant FS as 本地磁盘缓存
+
+    rect rgb(238, 242, 255)
+    Note over U,FS: 阶段一：粘贴 magnet → 预检并返回文件清单
+    U->>DF: 粘贴 magnet:?xt=urn:btih:9C08... 并提交
+    DF->>AP: onAdd(url, saveDir)
+    AP->>AP: isBtSource(url) === true
+    AP->>CM: invoke bt_precheck(source, timeoutSecs=20)
+    CM->>TR: precheck_torrent(source, defaultDir, timeoutSecs=20)
+    TR->>SQ: ensure_session(defaultDir)  [15s 超时]
+    SQ-->>TR: Arc<Session>（注入 4 个公开 tracker）
+    TR->>SQ: add_torrent(add, opts{list_only=true})  [★ 超时 12s → 20s]
+    SQ->>SQ: DHT bootstrap + tracker 下发 peers
+    SQ->>SQ: BEP9 ut_metadata 互换
+    SQ-->>TR: ListOnlyResponse{info, torrent_bytes, seen_peers}
+    TR->>TM: ★ build_file_list(info_hash, info, None, MAX_LIST_FILES=1000)
+    Note right of TM: ⚠ FileDetails 字段是 filename / len<br/>不是 name / length / components<br/>path = filename.to_string()<br/>components = filename.to_vec()<br/>is_padding = filename.attrs().padding
+    TM-->>TR: TorrentFileList{files[], total_file_count, truncated}
+    TR->>TM: ★ save_to_cache(info_hash, torrent_bytes)
+    TM->>FS: tmp 写 + rename 原子落盘<br/>data_local_dir/lele_download/torrent_cache/hex.torrent
+    FS-->>TM: Ok
+    TM-->>TR: 缓存路径
+    TR-->>CM: {can_download:true, file_list, seen_peers, message}
+    CM-->>AP: BtPrecheckResult
+    end
+
+    rect rgb(240, 253, 244)
+    Note over U,FS: 阶段二：按文件数分流
+    alt file_count <= 1 或 设置 bt_ask_files=false
+        AP->>CM: invoke bt_add_torrent(source, saveDir)  [不传 only_files]
+        Note over AP,CM: 与改造前行为完全一致（回归路径）
+    else file_count >= 2 且 开关开启
+        AP->>FP: setPicker({mode:'create', source, fileList, saveDir})
+        FP->>TF: 初始 selection = 全选（排除 is_padding）
+        TF-->>FP: Set<number>
+        FP-->>U: 渲染清单（每页 200 + 搜索 + 目录分组 + 4 个快捷按钮）
+        U->>FP: 取消勾选垃圾文件（.nfo / .url / 广告样本 …）
+        FP->>TF: computeSelectedBytes(files, selection)
+        TF-->>FP: 已选 M 个 / Y MB（padding 不计入）
+        U->>FP: 点击「下载选中项」
+        FP->>AP: onSubmit([...selection].sort((a,b)=>a-b))
+        AP->>CM: invoke bt_add_torrent(source, saveDir, onlyFiles)
+    end
+    end
+
+    rect rgb(255, 247, 237)
+    Note over U,FS: 阶段三：只下载选中索引（★ 缓存命中则跳过 DHT 与 BEP9）
+    CM->>TR: add_torrent(source, saveDir, defaultDir, only_files)
+    TR->>TM: validate_selection(file_count?, only_files)
+    Note right of TM: ⚠ 空集 = 一个都不下，必须拒绝<br/>排序 + 去重 + 越界拒绝
+    TM-->>TR: Ok(Vec<usize>) 归一化
+    TR->>TM: ★ parse_info_hash(source)  [离线，无网络]
+    TM-->>TR: Some(info_hash_hex)
+    TR->>TM: load_from_cache(info_hash)
+    TM->>FS: 读 <hex>.torrent
+    alt 缓存命中且 bencode 校验通过
+        FS-->>TM: torrent_bytes
+        TM-->>TR: Some(bytes)
+        TR->>SQ: add_torrent(AddTorrent::from_bytes(bytes), opts{only_files})  [30s 超时]
+        Note over TR,SQ: ★★ 跳过 DHT bootstrap 与 BEP9 metadata 互换<br/>整体从"两遍握手"降为"一遍"，秒级返回
+    else 未命中 / 缓存损坏
+        TM-->>TR: None 或 Err
+        TR->>TM: remove_from_cache(info_hash)  [自愈]
+        TR->>SQ: add_torrent(AddTorrent::from_url(enrich_magnet(src)), opts{only_files})  [60s 超时]
+        Note over TR,SQ: 回退原路径，需完整 metadata 互换（冷门种）
+    end
+    SQ-->>TR: AddTorrentResponse::Added(id, handle)
+    TR->>TR: handle.with_metadata(|m| save_to_cache(id, m.torrent_bytes))  [补写/覆盖]
+    TR->>TR: BT_TASKS.insert(id, handle)
+    TR-->>CM: task_stats(id)
+    CM-->>AP: BtTask{id, name, state, progress, total_bytes…}
+    AP->>AP: loadBtTasks() + setPicker(null)
+    AP-->>U: BT 任务出现在列表（total_bytes = 选中文件字节和）
+    end
+
+    rect rgb(253, 242, 248)
+    Note over U,FS: 阶段四：下载中改选（★ 本期实现）
+    U->>AP: 点击 BT 任务卡片「选择文件」
+    AP->>CM: invoke bt_task_files(id)
+    CM->>TR: task_files(id)
+    TR->>TR: handle.with_metadata(|m| …)  [离线，不联网]
+    TR->>TM: build_file_list(id, m.info, handle.only_files(), 1000)
+    Note right of TM: ⚠ only_files() 回读顺序随机（HashSet 收集）<br/>build_file_list 内部排序归一化
+    TM-->>TR: TorrentFileList{only_files: 当前选择}
+    TR-->>CM: file_list
+    CM-->>AP: TorrentFileList
+    AP->>FP: setPicker({mode:'update', taskId, fileList})
+    FP-->>U: 回显当前选择
+    U->>FP: 改选并提交
+    FP->>AP: onSubmit(sortedArray)
+    AP->>CM: invoke bt_update_files(id, onlyFiles)
+    CM->>TR: update_selected_files(id, only_files)
+    TR->>TR: file_count = with_metadata(|m| m.file_infos.len())
+    TR->>TM: validate_selection(file_count, only_files)
+    TM-->>TR: Ok(selection)
+    TR->>SQ: ★ Session::update_only_files(&handle, &HashSet(usize))
+    Note over TR,SQ: ⚠ 必须走 Session（ManagedTorrent 版本是 pub(crate)）<br/>⚠ 参数是 HashSet 不是 Vec<br/>⚠ 只停止调度 piece，不删除已下载部分
+    SQ->>SQ: chunk_tracker.update_only_files → 重算 selected 位图
+    SQ-->>TR: Ok
+    TR-->>CM: Ok
+    CM-->>AP: Ok
+    AP->>CM: invoke bt_task_files(id)  [回读确认选择已生效]
+    AP->>AP: loadBtTasks() + setPicker(null)
+    AP-->>U: 任务 total_bytes 下降，进度条重算
+    end

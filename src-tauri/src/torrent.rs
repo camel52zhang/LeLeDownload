@@ -795,20 +795,137 @@ mod tests {
     }
 
     /// 离线：空选集必须被拒绝（否则 librqbit 会建出一个永不完成的空任务）。
+    ///
+    /// 注意：本用例刻意用**本地造的合法种子**（不触网、文件名不含路径分隔符），让「空选集校验」
+    /// 成为唯一被测逻辑。早期版本用 `SAMPLE_MAGNET`（元数据能取到但文件名含分隔符会被 librqbit
+    /// 安全校验拒绝）来测空选集——那样即便删掉空选集校验，magnet 仍会另因"分隔符"报错，测试照样
+    /// 红，但红的**原因错了**，等于没测到空选集逻辑（变异测试会误判"已保护"）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bt_add_torrent_rejects_empty_selection() {
-        let dir = temp_dir("empty");
+        let src = temp_dir("empty_src");
+        std::fs::write(src.join("a.mp4"), vec![7u8; 1000]).unwrap();
+        std::fs::write(src.join("b.txt"), vec![1u8; 10]).unwrap();
+        let res = librqbit::create_torrent(
+            &src,
+            librqbit::CreateTorrentOptions {
+                name: Some("empty_sample"),
+                ..Default::default()
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("造种失败");
+        let torrent_path = src.join("empty_sample.torrent");
+        std::fs::write(&torrent_path, res.as_bytes().expect("序列化失败").to_vec()).unwrap();
+
+        let dir = temp_dir("empty_out");
         let err = add_torrent(
-            SAMPLE_MAGNET.to_string(),
+            torrent_path.to_string_lossy().to_string(),
             Some(dir.to_string_lossy().to_string()),
             dir.clone(),
             Some(Vec::new()),
             None,
         )
         .await
-        .expect_err("空选集应直接报错，且不应触碰网络");
+        .expect_err("空选集应直接报错，且不触网、不建任务");
         assert!(err.contains("未选择任何文件"), "错误信息不符: {err}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// 离线：**only_files 透传保护（最关键的不变量）**。
+    ///
+    /// 核心不变量是「`add_torrent` 必须真的把 `only_files` 传给 librqbit」——一旦被静默吞成
+    /// `None`，Sintel 那种 6.6GB 电影会被全量下载且**无任何报错**，正是本项目最怕的静默下错内容。
+    /// 用本地造的多文件种子离线添加任务，断言回传的 `only_files` / `selected_count` 正是传入的索引，
+    /// 而非被吞成 `null`。这正好覆盖「`options.only_files` 被改成 `None`」的变异——改后本测试必红。
+    ///
+    /// 反向再证：`only_files=None` 时回传必须是 `null`（与 `Some` 明确区分），确认不是随便返回。
+    /// 注意：两次添加用**不同的本地种子**（不同 info_hash），避免 session 按 info_hash 去重复用
+    /// 到同一个常驻任务、导致第二次的 only_files 仍显示第一次的 [1]。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bt_add_torrent_propagates_only_files() {
+        // —— 场景 A：只选 index=1，验证 only_files 真正透传 ——
+        let src = temp_dir("mk_only");
+        std::fs::write(src.join("big.mkv"), vec![7u8; 5000]).unwrap();
+        std::fs::write(src.join("b.txt"), vec![1u8; 20]).unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub").join("a.srt"), vec![2u8; 80]).unwrap();
+        let res = librqbit::create_torrent(
+            &src,
+            librqbit::CreateTorrentOptions {
+                name: Some("offline_sample"),
+                ..Default::default()
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("造种失败");
+        let torrent_path = src.join("offline_sample.torrent");
+        std::fs::write(&torrent_path, res.as_bytes().expect("序列化失败").to_vec()).unwrap();
+
+        let out = temp_dir("add_only");
+        let added = add_torrent(
+            torrent_path.to_string_lossy().to_string(),
+            Some(out.to_string_lossy().to_string()),
+            out.clone(),
+            Some(vec![1]),
+            None,
+        )
+        .await
+        .expect("本地种子 add_torrent 应离线成功");
+
+        let id = added["id"].as_str().expect("应有 id").to_string();
+        let of = added["only_files"].as_array().expect("only_files 应为数组");
+        assert_eq!(of.len(), 1, "only_files 长度应为 1");
+        assert_eq!(
+            of[0].as_u64(),
+            Some(1),
+            "only_files 必须透传为 [1]（若被吞成 None，selected_count 也会是 null）"
+        );
+        assert_eq!(added["selected_count"].as_u64(), Some(1), "selected_count 应为 1");
+
+        // —— 场景 B：一个完全不同的种子，传 None（全量），回传必须是 null ——
+        let src2 = temp_dir("mk_full");
+        std::fs::write(src2.join("c.mp4"), vec![3u8; 4000]).unwrap();
+        std::fs::write(src2.join("d.log"), vec![9u8; 40]).unwrap();
+        let res2 = librqbit::create_torrent(
+            &src2,
+            librqbit::CreateTorrentOptions {
+                name: Some("offline_full"),
+                ..Default::default()
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("造种失败");
+        let torrent_path2 = src2.join("offline_full.torrent");
+        std::fs::write(&torrent_path2, res2.as_bytes().expect("序列化失败").to_vec()).unwrap();
+
+        let out2 = temp_dir("add_full");
+        let added_full = add_torrent(
+            torrent_path2.to_string_lossy().to_string(),
+            Some(out2.to_string_lossy().to_string()),
+            out2.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("全量 add_torrent 应离线成功");
+        let id2 = added_full["id"].as_str().expect("应有 id").to_string();
+        assert!(
+            added_full["only_files"].is_null(),
+            "only_files=None 时回传必须是 null，却得到 {:?}",
+            added_full["only_files"]
+        );
+        assert!(
+            added_full["selected_count"].is_null(),
+            "全量任务 selected_count 必须是 null"
+        );
+
+        let _ = remove_task(&id).await;
+        let _ = remove_task(&id2).await;
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&src2);
     }
 
     /// **冷启动预算验证（联网，默认跳过）**：验证「进程刚起、session 尚未建立」时
@@ -1219,6 +1336,126 @@ mod tests {
             files.len() - 1,
             format_bytes(spill_total),
             format_bytes(total_bytes)
+        );
+
+        let _ = remove_task(&id).await;
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// **独立正确性验证（联网，默认跳过）：选「中间」文件而非 index 0，确认只有它被完整下载**。
+    ///
+    /// 与 `test_only_files_download_writes_only_selected`（固定 index=0）互补：index=0 只触及 piece 0，
+    /// 分片溢出几乎为 0，弱测试可能"碰巧通过"。本用例刻意挑一个 index>0 的小文件（Sintel 里是中间某条
+    /// srt），它的 piece 落在种子中部、会与相邻文件发生分片边界溢出，从而真正考验「只下选中」与
+    /// 「溢出上限」两条断言。同时断言 `downloaded_bytes << total_bytes`——若 only_files 失效会整包下载，
+    /// 此处必红，这是「静默下错内容」的核心反向证据。
+    ///
+    /// 必须**单独运行**（同进程多 Session 各带一套 DHT + UDP socket 会互抢资源）：
+    ///   cargo test only_files_mid -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "需真实网络与做种者，耗时约 30-180s。手动运行: cargo test only_files_mid -- --ignored --nocapture"]
+    async fn test_only_files_middle_index_download() {
+        let out = temp_dir("dl_mid");
+        let list = get_file_list(SINTEL_MAGNET.to_string(), out.clone())
+            .await
+            .expect("get_file_list 返回 Err");
+        assert_eq!(
+            list["can_download"],
+            serde_json::json!(true),
+            "Sintel 应能取到 metadata"
+        );
+        let files = list["files"].as_array().expect("files 不是数组").clone();
+        assert!(!files.is_empty());
+
+        // 挑一个 index>0 且体积 < 1MiB 的小文件（Sintel 里是中间某条 srt），避开 index 0 边界巧合
+        let pick = files
+            .iter()
+            .find(|f| {
+                let idx = f["index"].as_u64().unwrap() as usize;
+                let len = f["length"].as_u64().unwrap();
+                idx != 0 && len > 0 && len < 1024 * 1024
+            })
+            .expect("应存在 index>0 的小文件可供挑选")
+            .clone();
+        let pick_idx = pick["index"].as_u64().unwrap() as usize;
+        let pick_len = pick["length"].as_u64().unwrap();
+        let pick_name = pick["name"].as_str().unwrap().to_string();
+        assert_ne!(pick_idx, 0, "本用例必须选非 0 的中间文件");
+        println!("[mid] 只下: index={pick_idx} len={pick_len} name={pick_name}");
+
+        let info_hash = list["info_hash"].as_str().unwrap().to_string();
+        let added = add_torrent(
+            SINTEL_MAGNET.to_string(),
+            Some(out.to_string_lossy().to_string()),
+            out.clone(),
+            Some(vec![pick_idx]),
+            Some(info_hash.clone()),
+        )
+        .await
+        .expect("add_torrent 返回 Err");
+        let id = added["id"].as_str().unwrap().to_string();
+        assert_eq!(added["selected_count"].as_u64(), Some(1), "应记录已选 1 个文件");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut done = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let s = task_stats(&id).expect("任务应在表中");
+            let state = s["state"].as_str().unwrap_or("");
+            if state == "completed" {
+                done = true;
+                break;
+            }
+            assert_ne!(state, "error", "任务进入错误态: {s}");
+        }
+        assert!(done, "180s 内未完成");
+
+        const SPILL_LIMIT: u64 = 16 * 1024 * 1024;
+        let path_of = |name: &str| {
+            let mut p = out.clone();
+            for c in name.split('/') {
+                p.push(c);
+            }
+            p
+        };
+        let target = path_of(&pick_name);
+        let meta = std::fs::metadata(&target)
+            .unwrap_or_else(|e| panic!("选中的文件不存在 {target:?}: {e}"));
+        assert_eq!(meta.len(), pick_len, "选中文件大小应等于其 length");
+
+        let mut spill_total = 0u64;
+        for f in files.iter() {
+            let idx = f["index"].as_u64().unwrap() as usize;
+            if idx == pick_idx {
+                continue;
+            }
+            let name = f["name"].as_str().unwrap();
+            let len = f["length"].as_u64().unwrap();
+            let on_disk = std::fs::metadata(path_of(name)).map(|m| m.len()).unwrap_or(0);
+            spill_total += on_disk;
+            if len > SPILL_LIMIT {
+                assert!(
+                    on_disk < len / 10,
+                    "未选中的大文件被下载了: {name} 磁盘 {on_disk} / 应有 {len}"
+                );
+            }
+        }
+        let total_bytes = list["total_bytes"].as_u64().unwrap();
+        assert!(
+            spill_total < SPILL_LIMIT,
+            "未选中文件被写入过多数据: {spill_total}（总大小 {total_bytes}）"
+        );
+
+        // 关键反向证据：只下了一个小文件，已下载字节必须远小于种子总大小
+        let dl = task_stats(&id).expect("任务应在表中")["downloaded_bytes"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            dl < total_bytes / 100,
+            "已下载 {dl} 字节，接近或超过种子总大小 {total_bytes} —— only_files 疑似失效（整包下载）"
+        );
+        println!(
+            "[mid] 通过：index={pick_idx} 完整写出 {pick_len} 字节；已下载 {dl} << 总大小 {total_bytes}；其余文件溢出合计 {spill_total}"
         );
 
         let _ = remove_task(&id).await;
