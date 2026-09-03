@@ -389,6 +389,9 @@ struct BtFileEntry {
     /// 路径分量；单文件种子即 [文件名]（无目录），与多文件种子同一结构。
     components: Vec<String>,
     length: u64,
+    /// 默认是否勾选下载。广告类快捷方式（.url/.lnk，畸形种子常夹带推广链接）
+    /// 默认不勾选，避免把推广文件当资源下下来；用户仍可手动勾选。
+    selected: bool,
 }
 
 /// 由 metadata 枚举出文件清单。**index 契约的唯一产地**：`iter_file_details()` 的枚举序
@@ -400,11 +403,19 @@ fn build_file_entries<B: AsRef<[u8]>>(
         .enumerate()
         .map(|(index, d)| {
             let components = d.filename.to_vec();
+            let name = components.join("/");
+            // 广告类快捷方式：畸形种子常夹带 .url/.lnk 推广链接，默认不勾选。
+            // 用 join 后的完整 name 判断（覆盖「路径数组单元素内嵌 '/'」的畸形情况）。
+            let is_ad_shortcut = {
+                let lower = name.to_lowercase();
+                lower.ends_with(".url") || lower.ends_with(".lnk")
+            };
             BtFileEntry {
                 index,
-                name: components.join("/"),
+                name,
                 components,
                 length: d.len,
+                selected: !is_ad_shortcut,
             }
         })
         .collect()

@@ -1,6 +1,6 @@
 [package]
 name = "lele_download"
-version = "26.9.1"
+version = "26.9.3"
 description = "LeLe Download Manager"
 authors = ["DownloadMaster"]
 edition = "2021"
@@ -38,6 +38,10 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [patch.crates-io]
 schemars = { path = "../vpatch/schemars-0.8.22" }
+# 落盘洗路径补丁：vendor 两个 crate 并在本地打补丁，使文件名含路径分隔符/遍历段的
+# 畸形种子也能解析并下载（仅存储层改名，info_hash 由 raw_bytes 派生、不受影响）。
+librqbit = { path = "../vpatch/librqbit-9.0.0" }
+librqbit-core = { path = "../vpatch/librqbit-core-9.0.0" }
 
 [profile.release]
 panic = "abort"

@@ -129,6 +129,15 @@ export function NetdiskPanel() {
       setError('请粘贴网盘分享链接')
       return
     }
+    // 磁力链接 / .torrent 不属于网盘解析，引导到「下载列表」标签，避免被误判为网盘平台
+    const isBt =
+      url.trim().toLowerCase().startsWith('magnet:') ||
+      /\.torrent($|\?|#)/i.test(url.trim())
+    if (isBt) {
+      setPlatform('')
+      setError('这是磁力链接 / .torrent 文件，请到上方「下载列表」标签粘贴，不要放在网盘解析。')
+      return
+    }
     const p = detectPlatform(url)
     setPlatform(p.label)
     if (!p.key) {

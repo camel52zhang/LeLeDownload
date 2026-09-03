@@ -1,6 +1,6 @@
 {
     "productName": "LeLeDownload",
-    "version": "26.9.1",
+    "version": "26.9.3",
     "identifier": "com.lele.download",
     "build": {
         "beforeDevCommand": "npm run dev",
