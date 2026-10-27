@@ -1804,57 +1804,71 @@ async function resolveBaidu(url, pwd) {
         //（用户实测 r30 9019(needverify) 根因 = chrome.cookies.set 静默失败导致 BDCLND 没进 Cookie 头）。
         // r28 曾试 /api/download?origin=dlna：登录态实测 errno 113（tplconfig sign 对该端点无效），已弃。
         const jumpNow = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
+        let nolimitOk = false; // r33：候选令牌任一成功即置位，用于退出 attempt 循环
         if ((jumpNow || en === -20) && !triedNolimit) {
           triedNolimit = true;
-          try {
-            // r32：BDCLND 令牌优先级 = 浏览器 jar 真实 BDCLND > verify randsk > wxlist seckey。
-            // 用户实测 r31：合成令牌（seckey/randsk）显式注入后仍 9019——百度很可能只认
-            // 浏览器打开分享并输入提取码后真实下发的 BDCLND。jar 里有就用真的。
-            let bdclnd = '';
-            let bdclndSrc = '';
-            const mBdclnd = cookie && cookie.match(/(?:^|;\s*)BDCLND=([^;]+)/);
-            if (mBdclnd) { bdclnd = mBdclnd[1]; bdclndSrc = 'jar'; }
-            else if (lastRandsk) { bdclnd = lastRandsk; bdclndSrc = 'verify-randsk'; }
-            else if (sekey) { bdclnd = sekey; bdclndSrc = 'wxlist-seckey'; }
-            if (!bdclnd) {
-              nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)';
-            } else {
-              // 显式把 BDCLND 追加进 DNR 注入的 Cookie 头（去重；jar 已有则原样）；
-              // 下载引擎 headers 同步带上（dlink 下载也需要 BDCLND）
-              cookie = cookie
-                ? (/(?:^|;\s*)BDCLND=/.test(cookie) ? cookie : cookie + '; BDCLND=' + bdclnd)
-                : ('BDCLND=' + bdclnd);
-              await ensureBaiduAuthHeaders(cookie);
-              const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
-                method: 'POST',
-                credentials: 'include',
-                headers: {
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                  // r32：去掉 X-Requested-With，完全对齐 baiduwp-php 的请求头（UA/Cookie/Referer 而已）
-                  'Referer': 'https://pan.baidu.com/disk/home',
-                },
-                body: 'encrypt=0'
-                  + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: bdclnd }))
-                  + '&fid_list=[' + Number(f.fs_id) + ']'
-                  + '&primaryid=' + shareid
-                  + '&uk=' + uk
-                  + '&product=share&type=nolimit',
-              });
-              const nl0 = Array.isArray(nl.list) ? nl.list[0] : null;
-              const ndl = nl0 && nl0.dlink;
-              if (ndl) {
-                dlink = /^https?:\/\//i.test(ndl) ? ndl : 'https://d.pcs.baidu.com' + (ndl.startsWith('/') ? ndl : '/' + ndl);
-                nolimitDiag = 'ok';
-                break;
+          // r33：多令牌循环兜底 —— 逐个候选令牌试 nolimit，任一成功即用。
+          // r32 实测 [token=jar] 仍 9019 的根因：浏览器 jar 里的 BDCLND 是 URL 编码形态
+          //（服务器 Set-Cookie 下发的编码值），而 baiduwp-php 用的是 urldecode 后的明文
+          // → 取 jar 值必须先 decodeURIComponent，否则服务端认不出 sekey → 9019。
+          // 且跳端路径（errno 0 + list:string）主流程 verify 从未执行，randsk 令牌没被尝试 → 惰性补调。
+          // 候选顺序：jar BDCLND(解码) > verify randsk(惰性补调) > wxlist seckey(解码)；解码后去重。
+          const stripBdclnd = (c) => c ? c.replace(/(^|;\s*)BDCLND=[^;]*/g, '').replace(/^;+|;+$/g, '') : '';
+          const mBdclnd = cookie && cookie.match(/(?:^|;\s*)BDCLND=([^;]+)/);
+          const cands = [];
+          if (mBdclnd) cands.push({ tok: safeDecode(mBdclnd[1]), src: 'jar' });
+          if (!lastRandsk) {
+            const rk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp); // 跳端路径 verify 未跑过，惰性补调
+            if (rk) { lastRandsk = rk; cands.push({ tok: rk, src: 'verify-randsk' }); }
+          } else {
+            cands.push({ tok: lastRandsk, src: 'verify-randsk' });
+          }
+          if (sekey) cands.push({ tok: sekey, src: 'wxlist-seckey' }); // sekey 在提取时已 safeDecode（L1706），勿二次解码
+          const seenTok = new Set();
+          const uniq = cands.filter((c) => { if (!c.tok || seenTok.has(c.tok)) return false; seenTok.add(c.tok); return true; });
+          if (uniq.length === 0) {
+            nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)';
+          } else {
+            const fails = [];
+            for (const cand of uniq) {
+              try {
+                const baseCk = stripBdclnd(cookie);
+                cookie = baseCk ? (baseCk + '; BDCLND=' + cand.tok) : ('BDCLND=' + cand.tok);
+                await ensureBaiduAuthHeaders(cookie);
+                const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    // r32：去掉 X-Requested-With，完全对齐 baiduwp-php 的请求头（UA/Cookie/Referer 而已）
+                    'Referer': 'https://pan.baidu.com/disk/home',
+                  },
+                  body: 'encrypt=0'
+                    + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: cand.tok }))
+                    + '&fid_list=[' + Number(f.fs_id) + ']'
+                    + '&primaryid=' + shareid
+                    + '&uk=' + uk
+                    + '&product=share&type=nolimit',
+                });
+                const nl0 = Array.isArray(nl.list) ? nl.list[0] : null;
+                const ndl = nl0 && nl0.dlink;
+                if (ndl) {
+                  dlink = /^https?:\/\//i.test(ndl) ? ndl : 'https://d.pcs.baidu.com' + (ndl.startsWith('/') ? ndl : '/' + ndl);
+                  nolimitDiag = 'ok';
+                  nolimitOk = true;
+                  break;
+                }
+                const nen = (typeof nl.errno !== 'undefined') ? Number(nl.errno) : '?';
+                fails.push('errno:' + nen + ((nl.show_msg || nl.errmsg) ? '(' + (nl.show_msg || nl.errmsg) + ')' : '') + '[token=' + cand.src + ']');
+              } catch (e) {
+                fails.push('network: ' + String((e && e.message) || e).slice(0, 120) + '[token=' + cand.src + ']');
               }
-              const nen = (typeof nl.errno !== 'undefined') ? Number(nl.errno) : '?';
-              nolimitDiag = 'errno:' + nen + ((nl.show_msg || nl.errmsg) ? '(' + (nl.show_msg || nl.errmsg) + ')' : '') + '[token=' + bdclndSrc + ']';
             }
-          } catch (e) {
-            nolimitDiag = 'network: ' + String((e && e.message) || e).slice(0, 120);
+            if (nolimitDiag !== 'ok') nolimitDiag = fails.join('|') || 'no_candidate_token';
           }
           // 兜底失败 → 落到下方原有错误文案（附 nolimit 诊断标签）
         }
+        if (nolimitOk) break; // r33：nolimit 兜底拿到 dlink，退出 attempt 循环
         const dl = sd.list && sd.list[0] && sd.list[0].dlink;
         if (dl) {
           // 百度 sharedownload 的 dlink 字段常常只返回相对路径（如 '/rest/2.0/pcs/file?...'），
