@@ -207,6 +207,10 @@ function parseBaiduSurl(url) {
   return { surl, apiShorturl };
 }
 
+// r34 镜像：页面上下文解析路径。真实实现在 SW 里靠 chrome.scripting 注入 pan.baidu.com 页面执行；
+// 单测无 chrome.scripting，恒返回 null（等价于测试只覆盖 SW 链路）。
+async function resolveBaiduViaPage() { return null; }
+
 async function resolveBaidu(url, pwd) {
   await ensureBaiduAuthHeaders();
   let cookie = await getCookieString('https://pan.baidu.com');
@@ -218,11 +222,23 @@ async function resolveBaidu(url, pwd) {
   const BAIDU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   const safeDecode = (s) => { try { return decodeURIComponent(s); } catch (_) { return s; } };
 
+  // r34 镜像：页面上下文快速路径（单测里恒 null）
+  try {
+    const pgFast = await resolveBaiduViaPage(apiShorturl, pwd, cookie, false);
+    if (pgFast && pgFast.length) return pgFast;
+  } catch (_) {}
+
   const topList = await baiduWxList(apiShorturl, pwd);
   const list = topList.list;
   const uk = topList.uk;
   const shareid = topList.shareid;
   const sekey = topList.seckey ? safeDecode(topList.seckey) : '';
+  // r34 镜像：wxlist 响应头会 Set-Cookie 下发本分享专属 BDCLND，浏览器写入 jar；
+  // 函数开头读的可能是别的分享留下的旧值 → 必须在此重读（实证：BDCLND == verify randsk，≠ seckey）
+  try {
+    const freshCookie = await getCookieString('https://pan.baidu.com');
+    if (freshCookie) cookie = freshCookie;
+  } catch (_) { /* 读 jar 失败就用旧值 */ }
   let { sign, timestamp, diag: signDiag } = await baiduGetSign(apiShorturl);
   // r20 镜像：登录态取 bdstoken，sharedownload 带上可降低 errno -20 风控
   const bdstoken = await baiduGetBdstoken();
@@ -300,34 +316,40 @@ async function resolveBaidu(url, pwd) {
           }
           continue;
         }
-        // r33 镜像：跳端下载/-20 → clienttype=12 + type=nolimit 多令牌循环兜底（baiduwp-php 流派）
-        // r32 实测 [token=jar] 仍 9019 根因：jar 里的 BDCLND 是 URL 编码形态，必须先 decodeURIComponent；
-        // 跳端路径主流程 verify 从未执行 → randsk 惰性补调。候选：jar(解码) > randsk > seckey，解码后去重。
+        // r34 镜像：多令牌循环兜底（baiduwp-php 流派）
+        // extra.sekey 用「含 % 时 urldecode」值；Cookie 里 BDCLND 用 jar 原始编码形态。
+        // 候选：jar BDCLND（wxlist 刚下发）> verify randsk（惰性补调）> wxlist seckey
         const jumpNow = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
         let nolimitOk = false; // r33 镜像：候选任一成功即置位，用于退出 attempt 循环
         if ((jumpNow || en === -20) && !triedNolimit) {
           triedNolimit = true;
           const stripBdclnd = (c) => c ? c.replace(/(^|;\s*)BDCLND=[^;]*/g, '').replace(/^;+|;+$/g, '') : '';
-          const mBdclnd = cookie && cookie.match(/(?:^|;\s*)BDCLND=([^;]+)/);
+          const rawJar = (cookie && (cookie.match(/(?:^|;\s*)BDCLND=([^;]*)/) || [])[1]) || '';
           const cands = [];
-          if (mBdclnd) cands.push({ tok: safeDecode(mBdclnd[1]), src: 'jar' });
+          if (rawJar) cands.push({ tok: rawJar.includes('%') ? safeDecode(rawJar) : rawJar, raw: rawJar, src: 'jar' });
+          let verifyNote = '';
           if (!lastRandsk) {
             const rk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp); // 跳端路径 verify 未跑过，惰性补调
-            if (rk) { lastRandsk = rk; cands.push({ tok: rk, src: 'verify-randsk' }); }
+            if (rk) { lastRandsk = rk; cands.push({ tok: rk, raw: rk, src: 'verify-randsk' }); }
+            else verifyNote = 'verify=none';
           } else {
-            cands.push({ tok: lastRandsk, src: 'verify-randsk' });
+            cands.push({ tok: lastRandsk, raw: lastRandsk, src: 'verify-randsk' });
           }
-          if (sekey) cands.push({ tok: sekey, src: 'wxlist-seckey' }); // sekey 在提取时已 safeDecode，勿二次解码
+          if (sekey) cands.push({ tok: sekey, raw: sekey, src: 'wxlist-seckey' }); // sekey 在提取时已 safeDecode，勿二次解码
           const seenTok = new Set();
           const uniq = cands.filter((c) => { if (!c.tok || seenTok.has(c.tok)) return false; seenTok.add(c.tok); return true; });
+          // r34 镜像：登录态自证（匿名 4 种令牌实测全 9019 → 9019 本质看登录态）
+          const authTag = '[bdu=' + (/(?:^|;\s*)BDUSS=/.test(cookie || '') ? '1' : '0')
+            + ';stk=' + (/(?:^|;\s*)STOKEN=/.test(cookie || '') ? '1' : '0') + ']';
           if (uniq.length === 0) {
-            nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)';
+            nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)' + authTag;
           } else {
             const fails = [];
             for (const cand of uniq) {
               try {
                 const baseCk = stripBdclnd(cookie);
-                cookie = baseCk ? (baseCk + '; BDCLND=' + cand.tok) : ('BDCLND=' + cand.tok);
+                // Cookie 用原始形态（raw）；extra.sekey 用解码形态（tok）
+                cookie = baseCk ? (baseCk + '; BDCLND=' + (cand.raw || cand.tok)) : ('BDCLND=' + (cand.raw || cand.tok));
                 await ensureBaiduAuthHeaders(cookie);
                 const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
                   method: 'POST',
@@ -358,7 +380,7 @@ async function resolveBaidu(url, pwd) {
                 fails.push('network: ' + String((e && e.message) || e).slice(0, 120) + '[token=' + cand.src + ']');
               }
             }
-            if (nolimitDiag !== 'ok') nolimitDiag = fails.join('|') || 'no_candidate_token';
+            if (nolimitDiag !== 'ok') nolimitDiag = authTag + (verifyNote ? verifyNote + '|' : '') + (fails.join('|') || 'no_candidate_token');
           }
         }
         if (nolimitOk) break; // r33 镜像：nolimit 兜底拿到 dlink，退出 attempt 循环
@@ -386,11 +408,15 @@ async function resolveBaidu(url, pwd) {
             ? '（百度判定触发风控/验证码。建议：若已登录百度网盘账号会显著降低风控；未登录请先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
               + (nolimitDiag ? '（nolimit兜底: ' + nolimitDiag + '）' : '')
             : '');
+        // r34 镜像：bdu=0 时直接给「未登录」可执行指引（匿名 4 种令牌实测全 9019）
+        const noLoginHint = /bdu=0/.test(nolimitDiag)
+          ? '（诊断显示 bdu=0：该浏览器的百度 cookie jar 里没有 BDUSS，即未登录。大文件 nolimit 通道必须先登录——请在同一浏览器登录 pan.baidu.com 后再解析；匿名状态下任何令牌都会返回 9019）'
+          : '';
         if (en !== 9019) {
           throw new Error(
             '百度接口提示：' + (serverMsg || (isJumpToClient ? '该文件被限制网页端直接下载' : '未返回 dlink')) +
             '（' + enPart + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）' +
-            hint + en2diag + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
+            hint + en2diag + noLoginHint + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
           );
         }
       }
@@ -1084,7 +1110,7 @@ test('r30: 跳端下载且 nolimit 兜底失败 → 错误信息带 nolimit 诊�
         const msg = String(err.message);
         return /该文件被限制网页端直接下载/.test(msg)
           && /跳端下载/.test(msg)
-          && /（nolimit兜底: errno:-6[)\[]/.test(msg) // r32：diag 会追加 [token=xxx] 后缀
+          && /（nolimit兜底: \[bdu=1;stk=1\].*errno:-6\[token=/.test(msg) // r34：authTag 前缀 + 逐候选失败
           && !/未返回 dlink/.test(msg);
       }
     );
@@ -1142,7 +1168,7 @@ test('r30: sharedownload -20 且 nolimit 兜底失败 → 风控提示带 nolimi
         const msg = String(err.message);
         return /errno -20/.test(msg)
           && /风控/.test(msg)
-          && /（nolimit兜底: errno:-6[)\[]/.test(msg) // r32：diag 会追加 [token=xxx] 后缀
+          && /（nolimit兜底: \[bdu=1;stk=1\].*errno:-6\[token=/.test(msg) // r34：authTag 前缀 + 逐候选失败
           && /原始响应/.test(msg);
       }
     );
@@ -1192,7 +1218,7 @@ test('r33: jar BDCLND 先解码再作 sekey，多令牌按序尝试，diag 依�
         const iJar = msg.indexOf('[token=jar]');
         const iRk = msg.indexOf('[token=verify-randsk]');
         const iSek = msg.indexOf('[token=wxlist-seckey]');
-        return /（nolimit兜底: errno:-6\(Invalid Bduss\)\[token=jar\]/.test(msg) // 首个失败必须是 jar 候选
+        return /（nolimit兜底: \[bdu=1;stk=1\]errno:-6\(Invalid Bduss\)\[token=jar\]/.test(msg) // 首个失败必须是 jar 候选
           && iJar > -1 && iRk > iJar && iSek > iRk // r33: 候选按序尝试，diag 依序记录
           && iSek === msg.lastIndexOf('[token=wxlist-seckey]');
       }
@@ -1200,6 +1226,282 @@ test('r33: jar BDCLND 先解码再作 sekey，多令牌按序尝试，diag 依�
     assert.ok(findCall(rec.calls, 'share/verify'), 'r33: jar 失败后应继续惰性补调 verify 取 randsk 候选');
   } finally {
     mockCookie = prevCookie;
+    delete globalThis.fetch;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// r34: BDCLND 真源 = wxlist 响应头 Set-Cookie（浏览器写入 jar），必须在 wxlist 之后重读。
+// 形态规则（对齐 baiduwp-php）：extra.sekey 用「含 % 时 urldecode」值；Cookie 里 BDCLND 用原始编码值。
+// 附带：bdu/stk 登录态自证（匿名 4 种令牌实测全 9019）。
+// ---------------------------------------------------------------------------
+test('r34: wxlist 后重读 jar 拿本分享 BDCLND，extra.sekey 解码 / Cookie 保留原始编码，一次命中', async () => {
+  const prevCookie = mockCookie;
+  const prevChrome = globalThis.chrome;
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789'; // 初始 jar 无 BDCLND（模拟别的分享留下的旧状态）
+  const dnrCookies = [];
+  globalThis.chrome = {
+    declarativeNetRequest: {
+      updateSessionRules: async (o) => {
+        const rule = (o.addRules || [])[0];
+        if (rule) for (const h of rule.action.requestHeaders) if (h.header === 'Cookie') dnrCookies.push(h.value);
+      },
+    },
+  };
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s, opts) => {
+    if (s.includes('share/wxlist')) {
+      // 模拟 wxlist 的 Set-Cookie: BDCLND=...：浏览器把它写进 jar（mockCookie 即 jar）
+      mockCookie = mockCookie + '; BDCLND=QS8%2BABC%3D';
+      return json({ errno: 0, data: { uk: '3825497888', shareid: '48346510787', seckey: 'SEK~', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    }
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
+    if (s.includes('share/verify')) return json({ errno: 0, randsk: 'QS8%2BABC%3D' }); // 与 BDCLND 相同（实测结论）
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) {
+        assert.ok((opts.body || '').includes(encodeURIComponent('{"sekey":"QS8+ABC="}')), 'r34: extra.sekey 必须是 urldecode 后的值: ' + opts.body);
+        assert.ok(!(opts.body || '').includes('QS8%2BABC%253D'), 'r34: 不得双重编码: ' + opts.body);
+        return json({ errno: 0, list: [{ dlink: '/rest/2.0/pcs/file?nolimit=OK' }] });
+      }
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' });
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const r = await resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', '');
+    assert.ok(r[0].url.includes('nolimit=OK'), 'r34: jar BDCLND 候选应命中: ' + r[0].url);
+    const nlCalls = rec.calls.filter((x) => x.url.includes('clienttype=12'));
+    assert.equal(nlCalls.length, 1, 'r34: 首个候选（jar）即成功，不应再试其他令牌');
+    assert.ok(dnrCookies.length > 0, 'r34: 应通过 DNR 注入 Cookie');
+    const last = dnrCookies[dnrCookies.length - 1];
+    assert.ok(/BDCLND=QS8%2BABC%3D/.test(last), 'r34: Cookie 里 BDCLND 必须是 jar 原始编码形态: ' + last);
+    assert.ok(!/BDCLND=QS8\+ABC=/.test(last), 'r34: Cookie 不得用解码值: ' + last);
+    assert.ok(/BDUSS=abc123deadbeef/.test(last), 'r34: 登录 cookie 必须保留: ' + last);
+  } finally {
+    mockCookie = prevCookie;
+    globalThis.chrome = prevChrome;
+    delete globalThis.fetch;
+  }
+});
+
+test('r34: jar 无 BDCLND 且 verify 失败 → diag 记 verify=none 并只留 seckey 候选', async () => {
+  const prevCookie = mockCookie;
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789'; // 有登录态、无 BDCLND
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
+    if (s.includes('share/verify')) return json({ errno: -9, show_msg: '提取码错误' }); // verify 失败 → 拿不到 randsk
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) return json({ errno: 9019, show_msg: 'needverify' });
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' });
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    await assert.rejects(
+      () => resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', ''),
+      (err) => {
+        const msg = String(err.message);
+        return /\[bdu=1;stk=1\]verify=none\|errno:9019\(needverify\)\[token=wxlist-seckey\]/.test(msg)
+          && !/\[token=jar\]/.test(msg)
+          && !/\[token=verify-randsk\]/.test(msg);
+      }
+    );
+  } finally {
+    mockCookie = prevCookie;
+    delete globalThis.fetch;
+  }
+});
+
+// ===== r34 镜像：页面上下文实现（与 background.js baiduApiFetch 逐字一致）=====
+async function baiduApiFetch(apiShorturl, pwd) {
+  const out = { ok: false, step: 'init', diag: {}, files: [] };
+  try {
+    const jget = async (u, opt) => {
+      const r = await fetch(u, opt);
+      const t = await r.text();
+      try { return JSON.parse(t); } catch (_) { return { _raw: t.slice(0, 200) }; }
+    };
+    const ck = (name) => {
+      const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+      return m ? m[1] : '';
+    };
+    const dec = (s) => { try { return decodeURIComponent(s); } catch (_) { return s; } };
+    const wxBody = (dir, root) => 'shorturl=' + encodeURIComponent(apiShorturl)
+      + '&dir=' + encodeURIComponent(dir || '') + '&root=' + (root ? '1' : '0')
+      + '&pwd=' + encodeURIComponent(pwd || '') + '&page=1&num=1000&order=time';
+    const wxOpts = (body) => ({
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    out.diag.auth = '[bdu=' + (ck('BDUSS') ? '1' : '0') + ';stk=' + (ck('STOKEN') ? '1' : '0') + ';bdclnd=' + (ck('BDCLND') ? '1' : '0') + ']';
+
+    out.step = 'wxlist';
+    const w = await jget('https://pan.baidu.com/share/wxlist?channel=weixin&version=2.2.2&clienttype=25&web=1', wxOpts(wxBody('', 1)));
+    if (w.errno !== 0) {
+      out.reason = 'wxlist errno ' + w.errno + (w.show_msg ? '(' + w.show_msg + ')' : '');
+      return out;
+    }
+    const d = w.data || {};
+    const uk = d.uk, shareid = d.shareid;
+    const seckey = d.seckey ? dec(d.seckey) : '';
+
+    out.step = 'tplconfig';
+    const tc = await jget('https://pan.baidu.com/share/tplconfig?fields=sign,timestamp&channel=chunlei&web=1&app_id=250528&clienttype=0&surl=' + encodeURIComponent(apiShorturl));
+    const sign = (tc && tc.data && tc.data.sign) || '';
+    const ts = (tc && tc.data && tc.data.timestamp) || '';
+
+    // 递归收集文件（与 SW 侧 expandBaiduItems 等价，文件夹最多 5 层）
+    const files = [];
+    const walk = async (items, prefix, depth) => {
+      if (depth > 5) return;
+      for (const f of items) {
+        const isDir = (f.isdir === 1 || f.isdir === '1' || f.type === 'folder');
+        if (isDir) {
+          out.step = 'wxlist-dir';
+          const sub = await jget('https://pan.baidu.com/share/wxlist?channel=weixin&version=2.2.2&clienttype=25&web=1', wxOpts(wxBody(f.path || '', 0)));
+          if (sub.errno === 0 && sub.data && sub.data.list) {
+            await walk(sub.data.list, prefix + (f.server_filename || '') + '/', depth + 1);
+          }
+        } else {
+          files.push({ fs_id: f.fs_id, name: prefix + (f.server_filename || 'file'), size: f.size });
+        }
+      }
+    };
+    await walk(d.list || [], '', 0);
+
+    const abs = (u) => /^https?:/i.test(u) ? u : ('https://d.pcs.baidu.com' + (u.charAt(0) === '/' ? u : '/' + u));
+    for (const f of files) {
+      out.step = 'sharedownload';
+      const sd = await jget('https://pan.baidu.com/api/sharedownload?channel=chunlei&clienttype=0&app_id=250528'
+        + (sign ? '&sign=' + encodeURIComponent(sign) : '') + (ts ? '&timestamp=' + encodeURIComponent(ts) : '') + '&web=1', {
+        method: 'POST', credentials: 'include',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-Requested-With': 'XMLHttpRequest',
+          Referer: 'https://pan.baidu.com/share/link?shareid=' + shareid + '&uk=' + uk,
+        },
+        body: 'encrypt=0&product=share&primaryid=' + shareid + '&shareid=' + shareid + '&uk=' + uk
+          + '&fid_list=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
+          + (seckey ? '&extra=' + encodeURIComponent(JSON.stringify({ sekey: seckey })) : ''),
+      });
+      const dl0 = sd.list && sd.list[0] && sd.list[0].dlink;
+      if (dl0) { out.files.push({ name: f.name, size: f.size, url: abs(dl0) }); out.diag['f' + f.fs_id] = 'ct0'; continue; }
+      const jump = (sd.errno === 0) && (typeof sd.list === 'string');
+      if (!jump && sd.errno !== -20) {
+        out.diag['f' + f.fs_id] = 'ct0-errno:' + sd.errno;
+        continue;
+      }
+      // 大文件跳端 / -20 风控 → clienttype=12 nolimit（baiduwp-php 流派）
+      out.step = 'nolimit';
+      // 本分享的 BDCLND：页面 document.cookie 里就是真值（wxlist/verify 下发）。
+      // extra.sekey 用解码形态（对齐 baiduwp），Cookie 头由浏览器自动携带（无需手工拼）。
+      let raw = ck('BDCLND');
+      if (!raw) {
+        const v = await jget('https://pan.baidu.com/share/verify?shareid=' + shareid + '&uk=' + uk
+          + (sign ? '&sign=' + encodeURIComponent(sign) : '') + (ts ? '&timestamp=' + ts : '') + '&web=1', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+          body: 'pwd=' + encodeURIComponent(pwd || ''),
+        });
+        out.diag.verify = 'errno:' + v.errno + (v.randsk ? ' randsk' : ' none');
+        raw = ck('BDCLND') || (v.randsk ? String(v.randsk) : '');
+      }
+      const tk = raw ? dec(raw) : seckey;
+      const nl = await jget('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12'
+        + (sign ? '&sign=' + encodeURIComponent(sign) : '') + (ts ? '&timestamp=' + ts : '') + '&web=1', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://pan.baidu.com/disk/home' },
+        body: 'encrypt=0&extra=' + encodeURIComponent(JSON.stringify({ sekey: tk }))
+          + '&fid_list=[' + Number(f.fs_id) + ']&primaryid=' + shareid + '&uk=' + uk
+          + '&product=share&type=nolimit',
+      });
+      const ndl = nl.list && nl.list[0] && nl.list[0].dlink;
+      if (ndl) { out.files.push({ name: f.name, size: f.size, url: abs(ndl) }); out.diag.nolimit = 'ok'; continue; }
+      out.diag.nolimit = 'errno:' + nl.errno + (nl.show_msg ? '(' + nl.show_msg + ')' : '') + '[tk=' + (raw ? 'page-cookie' : 'seckey') + ']';
+    }
+    out.ok = out.files.length > 0;
+    out.step = out.ok ? 'done' : 'no-dlink';
+    return out;
+  } catch (e) {
+    out.error = String((e && e.message) || e);
+    return out;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// r34: 页面上下文链路（pan.baidu.com 内 fetch）—— 真实 cookie 语义，绕开 SW+DNR 的 Cookie 注入。
+// 这两条用例锁死：BDCLND 取自 document.cookie；extra.sekey 用解码值；无 BDCLND 时 verify 补。
+// ---------------------------------------------------------------------------
+test('r34-page: document.cookie 的 BDCLND 用于 nolimit，跳端后成功拿到 dlink', async () => {
+  const prevDoc = globalThis.document;
+  globalThis.document = { cookie: 'BDUSS=bdu; STOKEN=stk; BDCLND=ABC%2BDEF%3D' };
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s, opts) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK~', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'S', timestamp: '1700000000' } });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) {
+        assert.ok((opts.body || '').includes(encodeURIComponent('{"sekey":"ABC+DEF="}')), 'r34-page: extra.sekey 必须是 document.cookie BDCLND 的解码值: ' + opts.body);
+        return json({ errno: 0, list: [{ dlink: '/rest/2.0/pcs/file?nolimit=OK' }] });
+      }
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' }); // ct0 跳端
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const r = await baiduApiFetch('12xYw1a81ACEi4wvbixn0EA', '6tpu');
+    assert.equal(r.ok, true, 'r34-page 应成功: ' + JSON.stringify(r.diag));
+    assert.equal(r.files.length, 1);
+    assert.ok(r.files[0].url.startsWith('https://d.pcs.baidu.com/') && r.files[0].url.includes('nolimit=OK'));
+    assert.equal(r.files[0].name, 'big.dmg');
+    assert.equal(r.diag.nolimit, 'ok');
+    assert.ok(/bdu=1;stk=1;bdclnd=1/.test(r.diag.auth), 'r34-page: 必须自证页面 cookie 三件套: ' + r.diag.auth);
+  } finally {
+    globalThis.document = prevDoc;
+    delete globalThis.fetch;
+  }
+});
+
+test('r34-page: 页面无 BDCLND 时先 verify，Set-Cookie 落地后用它走 nolimit', async () => {
+  const prevDoc = globalThis.document;
+  globalThis.document = { cookie: 'BDUSS=bdu; STOKEN=stk' };
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s, opts) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK~', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'S', timestamp: '1700000000' } });
+    if (s.includes('share/verify')) {
+      globalThis.document.cookie += '; BDCLND=R%2BS%3D'; // 模拟浏览器接收 Set-Cookie
+      return json({ errno: 0, randsk: 'R%2BS%3D' });
+    }
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) {
+        assert.ok((opts.body || '').includes(encodeURIComponent('{"sekey":"R+S="}')), 'r34-page: verify 后 extra.sekey 应为解码 randsk: ' + opts.body);
+        return json({ errno: 0, list: [{ dlink: '/rest/2.0/pcs/file?nolimit=OK' }] });
+      }
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' });
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const r = await baiduApiFetch('12xYw1a81ACEi4wvbixn0EA', '6tpu');
+    assert.equal(r.ok, true, 'r34-page verify 路径应成功: ' + JSON.stringify(r.diag));
+    assert.ok(/errno:0 randsk/.test(r.diag.verify), 'r34-page: 应记录 verify 成功: ' + r.diag.verify);
+    assert.ok(r.files[0].url.includes('nolimit=OK'));
+  } finally {
+    globalThis.document = prevDoc;
     delete globalThis.fetch;
   }
 });
