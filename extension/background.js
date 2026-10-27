@@ -1800,7 +1800,9 @@ async function resolveBaidu(url, pwd) {
         // 但 /api/download?origin=dlna 匿名报 errno -6（=需登录）而非参数错 → 端点可用，
         // App 内带 BDUSS（DNR 注入 Cookie）时应能返回 dlink（社区通行的大文件绕法）。
         const jumpNow = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
-        if (jumpNow && !triedDlna) {
+        // r29：errno -20（验证码/风控）同样走 dlna 兜底——DLNA 通道风控更弱，
+        // 登录态下 sharedownload 报 -20 时 /api/download?origin=dlna 常可绕过（baiduwp-php 系工具同款思路）
+        if ((jumpNow || en === -20) && !triedDlna) {
           triedDlna = true;
           const dlnaUrl = 'https://pan.baidu.com/api/download?origin=dlna'
             + (sign ? '&sign=' + encodeURIComponent(sign) : '')
@@ -1861,6 +1863,7 @@ async function resolveBaidu(url, pwd) {
             + (dlnaDiag ? '（dlna兜底: ' + dlnaDiag + '）' : '')
           : ((en === -20)
             ? '（百度判定触发风控/验证码。建议：若已登录百度网盘账号会显著降低风控；未登录请先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
+              + (dlnaDiag ? '（dlna兜底: ' + dlnaDiag + '）' : '')
             : '');
         throw new Error(
           '百度接口提示：' + (serverMsg || (isJumpToClient ? '该文件被限制网页端直接下载' : '未返回 dlink')) +

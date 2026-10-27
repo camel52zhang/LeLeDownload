@@ -301,8 +301,9 @@ async function resolveBaidu(url, pwd) {
           continue;
         }
         // r28 镜像：跳端下载（errno 0 + list:string）→ /api/download?origin=dlna 兜底
+        // r29 镜像：errno -20（验证码/风控）同样走 dlna 兜底
         const jumpNow = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
-        if (jumpNow && !triedDlna) {
+        if ((jumpNow || en === -20) && !triedDlna) {
           triedDlna = true;
           const dlnaUrl = 'https://pan.baidu.com/api/download?origin=dlna'
             + (sign ? '&sign=' + encodeURIComponent(sign) : '')
@@ -356,6 +357,7 @@ async function resolveBaidu(url, pwd) {
             + (dlnaDiag ? '（dlna兜底: ' + dlnaDiag + '）' : '')
           : ((en === -20)
             ? '（百度判定触发风控/验证码。建议：若已登录百度网盘账号会显著降低风控；未登录请先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
+              + (dlnaDiag ? '（dlna兜底: ' + dlnaDiag + '）' : '')
             : '');
         if (en !== 9019) {
           throw new Error(
@@ -1038,6 +1040,58 @@ test('r28: dlna 兜底失败（errno -6）→ 错误信息带 dlna 诊断标签'
           && /跳端下载/.test(msg)
           && /（dlna兜底: errno:-6）/.test(msg)
           && !/未返回 dlink/.test(msg);
+      }
+    );
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// r29: errno -20（验证码/风控）同样走 dlna 兜底（2026-10-27 用户实测 v26.10.27：
+// 登录态下 sharedownload 返回 -20；DLNA 通道风控更弱，登录态常可绕过验证码）
+// ---------------------------------------------------------------------------
+test('r29: sharedownload -20 → dlna 兜底成功拿到 dlink', async () => {
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
+    if (s.includes('api/sharedownload')) return json({ errno: -20, show_msg: '验证码输入错误，请重试' });
+    if (s.includes('api/download')) return json({ errno: 0, dlink: [{ dlink: '/rest/2.0/pcs/file?dlna=OK' }] });
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const r = await resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', '');
+    assert.ok(r[0].url.startsWith('https://d.pcs.baidu.com/') && r[0].url.includes('dlna=OK'), '-20 应触发 dlna 兜底并成功: ' + r[0].url);
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+test('r29: sharedownload -20 且 dlna 失败 → 风控提示带 dlna 诊断标签', async () => {
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
+    if (s.includes('api/sharedownload')) return json({ errno: -20, show_msg: '验证码输入错误，请重试' });
+    if (s.includes('api/download')) return json({ errno: -6 });
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    await assert.rejects(
+      () => resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', ''),
+      (err) => {
+        const msg = String(err.message);
+        return /errno -20/.test(msg)
+          && /风控/.test(msg)
+          && /（dlna兜底: errno:-6）/.test(msg)
+          && /原始响应/.test(msg);
       }
     );
   } finally {
