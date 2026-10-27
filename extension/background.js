@@ -1718,6 +1718,8 @@ async function resolveBaidu(url, pwd) {
   const out = [];
   let triedVerify = false;
   let retriedSign = false; // r27：errno 2（sign/timestamp 缺失）时自愈重取 tplconfig 一次
+  let triedDlna = false; // r28：跳端下载（大文件）时 /api/download?origin=dlna 兜底，只试一次
+  let dlnaDiag = ''; // r28：兜底结果诊断（ok / errno:N / network:...）
   let lastRandsk = '';
   const MAX_DEPTH = 5; // 防无限嵌套（分享循环引用/极深结构）
 
@@ -1793,6 +1795,45 @@ async function resolveBaidu(url, pwd) {
           }
           continue; // 用 randsk 作 sekey 重试一次
         }
+        // r28：跳端下载（errno 0 + list:string = 百度对大文件只给客户端下载指令）。
+        // 匿名探针实测（2026-10-27）：sharedownload 加 origin=dlna 无效（仍 list:string）；
+        // 但 /api/download?origin=dlna 匿名报 errno -6（=需登录）而非参数错 → 端点可用，
+        // App 内带 BDUSS（DNR 注入 Cookie）时应能返回 dlink（社区通行的大文件绕法）。
+        const jumpNow = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
+        if (jumpNow && !triedDlna) {
+          triedDlna = true;
+          const dlnaUrl = 'https://pan.baidu.com/api/download?origin=dlna'
+            + (sign ? '&sign=' + encodeURIComponent(sign) : '')
+            + (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '');
+          const dlnaBody = 'fidlist=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
+            + '&type=dlink&appid=250528&clienttype=0&web=1&channel=chunlei'
+            + (curSekey ? '&extra=' + encodeURIComponent(JSON.stringify({ sekey: curSekey })) : '');
+          try {
+            const dres = await fetchJson(dlnaUrl, {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': 'https://pan.baidu.com/share/link?shareid=' + shareid + '&uk=' + uk,
+              },
+              body: dlnaBody,
+            });
+            // /api/download 成功形态：{ errno:0, dlink:[{ dlink:'https://...' }] }；兼容 list 数组形态
+            const darr = Array.isArray(dres.dlink) ? dres.dlink : (Array.isArray(dres.list) ? dres.list : null);
+            const ddl = darr && darr[0] && (darr[0].dlink || darr[0].link);
+            if (ddl) {
+              dlink = /^https?:\/\//i.test(ddl) ? ddl : 'https://d.pcs.baidu.com' + (ddl.startsWith('/') ? ddl : '/' + ddl);
+              dlnaDiag = 'ok';
+              break;
+            }
+            const den = (typeof dres.errno !== 'undefined') ? Number(dres.errno) : '?';
+            dlnaDiag = 'errno:' + den + ((dres.show_msg || dres.errmsg) ? '(' + (dres.show_msg || dres.errmsg) + ')' : '');
+          } catch (e) {
+            dlnaDiag = 'network: ' + String((e && e.message) || e).slice(0, 120);
+          }
+          // 兜底失败 → 落到下方原有错误文案（跳端提示 + dlna 诊断标签）
+        }
         const dl = sd.list && sd.list[0] && sd.list[0].dlink;
         if (dl) {
           // 百度 sharedownload 的 dlink 字段常常只返回相对路径（如 '/rest/2.0/pcs/file?...'），
@@ -1817,6 +1858,7 @@ async function resolveBaidu(url, pwd) {
           : '';
         const hint = isJumpToClient
           ? '（百度限制该文件在网页端直接下载（返回 list:string 跳端下载指令，官方要求跳转 PC 客户端）。建议：换一个分享链接；或直接在浏览器打开该分享并用百度网盘客户端下载）'
+            + (dlnaDiag ? '（dlna兜底: ' + dlnaDiag + '）' : '')
           : ((en === -20)
             ? '（百度判定触发风控/验证码。建议：若已登录百度网盘账号会显著降低风控；未登录请先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
             : '');
