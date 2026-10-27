@@ -478,11 +478,13 @@ async function getCookieString(url) {
 // 用 declarativeNetRequest 会话规则给 pan.baidu.com 的子资源请求显式注入
 // Cookie / Referer 头（fetch 无法手动设置这两个头）。Firefox 不支持时静默降级。
 let BAIDU_AUTH_RULE_ID = 5001;
-async function ensureBaiduAuthHeaders() {
+// r31：cookieOverride —— 显式指定注入的 Cookie 头（如 verify 后追加 BDCLND，
+// 不依赖 chrome.cookies.set 是否成功写进 jar）。缺省仍读 jar。
+async function ensureBaiduAuthHeaders(cookieOverride) {
   try {
     if (typeof chrome === 'undefined' || !chrome.declarativeNetRequest ||
         typeof chrome.declarativeNetRequest.updateSessionRules !== 'function') return;
-    const cookie = await getCookieString('https://pan.baidu.com');
+    const cookie = cookieOverride || await getCookieString('https://pan.baidu.com');
     if (!cookie) return;
     const rules = [{
       id: BAIDU_AUTH_RULE_ID,
@@ -1797,25 +1799,26 @@ async function resolveBaidu(url, pwd) {
         }
         // r30：跳端下载（errno 0 + list:string）/-20（风控）→ clienttype=12 + type=nolimit 重试。
         // baiduwp-php 流派（>50MB 大文件正解）：同一 sharedownload 端点换 PC 客户端通道。
-        // 匿名探针实测（2026-10-27）：clienttype=12 报 9019（需 BDCLND/randsk）而非跳端/-20
-        // → 大文件绕行 = 先 verify 提取码拿 randsk，再走 clienttype=12。
+        // 匿名探针实测（2026-10-27）：clienttype=12 报 9019（需 BDCLND）而非跳端/-20。
+        // r31：BDCLND 直接取 verify randsk 或 wxlist seckey，并显式追加进 DNR Cookie 注入
+        //（用户实测 r30 9019(needverify) 根因 = chrome.cookies.set 静默失败导致 BDCLND 没进 Cookie 头）。
         // r28 曾试 /api/download?origin=dlna：登录态实测 errno 113（tplconfig sign 对该端点无效），已弃。
         const jumpNow = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
         if ((jumpNow || en === -20) && !triedNolimit) {
           triedNolimit = true;
           try {
-            // randsk（即 BDCLND 令牌）：clienttype=12 必需；尚未 verify 过则先取并桥接进 cookie jar
+            // r31：BDCLND 令牌 = verify 的 randsk（若已有），否则直接用 wxlist 的 seckey
+            //（baiduwp-php 的 get_BDCLND 即从 wxlist 取，verify 非必需）。
+            if (!lastRandsk) lastRandsk = sekey;
             if (!lastRandsk) {
-              const rk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
-              if (rk) {
-                lastRandsk = rk;
-                const newCookie = await getCookieString('https://pan.baidu.com');
-                if (newCookie) cookie = newCookie;
-              }
-            }
-            if (!lastRandsk) {
-              nolimitDiag = 'no_randsk(verify未返回令牌)';
+              nolimitDiag = 'no_bdclnd(无randsk/seckey)';
             } else {
+              // 关键：显式把 BDCLND 追加进 DNR 注入的 Cookie 头——
+              // chrome.cookies.set 可能静默失败，不能只赌 cookie jar；下载引擎 headers 同步带上
+              cookie = cookie
+                ? (/(?:^|;\s*)BDCLND=/.test(cookie) ? cookie : cookie + '; BDCLND=' + lastRandsk)
+                : ('BDCLND=' + lastRandsk);
+              await ensureBaiduAuthHeaders(cookie);
               const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
                 method: 'POST',
                 credentials: 'include',
@@ -1826,7 +1829,7 @@ async function resolveBaidu(url, pwd) {
                 },
                 body: 'encrypt=0'
                   + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: lastRandsk }))
-                  + '&fid_list=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
+                  + '&fid_list=[' + Number(f.fs_id) + ']'  // r31：对齐 baiduwp 原样字面量（不再 JSON 编码）
                   + '&primaryid=' + shareid
                   + '&uk=' + uk
                   + '&product=share&type=nolimit',

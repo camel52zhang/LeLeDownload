@@ -52,11 +52,11 @@ async function getCookieString(_url) {
   return mockCookie;
 }
 
-async function ensureBaiduAuthHeaders() {
+async function ensureBaiduAuthHeaders(cookieOverride) {
   try {
     if (typeof chrome === 'undefined' || !chrome.declarativeNetRequest ||
         typeof chrome.declarativeNetRequest.updateSessionRules !== 'function') return;
-    const cookie = await getCookieString('https://pan.baidu.com');
+    const cookie = cookieOverride || await getCookieString('https://pan.baidu.com');
     if (!cookie) return;
     const rules = [{
       id: 5001, priority: 1,
@@ -305,18 +305,15 @@ async function resolveBaidu(url, pwd) {
         if ((jumpNow || en === -20) && !triedNolimit) {
           triedNolimit = true;
           try {
-            // randsk（即 BDCLND 令牌）：clienttype=12 必需；尚未 verify 过则先取并桥接进 cookie jar
+            // r31 镜像：BDCLND = verify randsk（若已有）否则 wxlist seckey；显式追加进 DNR Cookie
+            if (!lastRandsk) lastRandsk = sekey;
             if (!lastRandsk) {
-              const rk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
-              if (rk) {
-                lastRandsk = rk;
-                const newCookie = await getCookieString('https://pan.baidu.com');
-                if (newCookie) cookie = newCookie;
-              }
-            }
-            if (!lastRandsk) {
-              nolimitDiag = 'no_randsk(verify未返回令牌)';
+              nolimitDiag = 'no_bdclnd(无randsk/seckey)';
             } else {
+              cookie = cookie
+                ? (/(?:^|;\s*)BDCLND=/.test(cookie) ? cookie : cookie + '; BDCLND=' + lastRandsk)
+                : ('BDCLND=' + lastRandsk);
+              await ensureBaiduAuthHeaders(cookie);
               const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
                 method: 'POST',
                 credentials: 'include',
@@ -327,7 +324,7 @@ async function resolveBaidu(url, pwd) {
                 },
                 body: 'encrypt=0'
                   + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: lastRandsk }))
-                  + '&fid_list=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
+                  + '&fid_list=[' + Number(f.fs_id) + ']'
                   + '&primaryid=' + shareid
                   + '&uk=' + uk
                   + '&product=share&type=nolimit',
@@ -1017,7 +1014,8 @@ test('r30: 跳端下载 → clienttype=12 + type=nolimit 兜底成功拿到 dlin
         const c = rec.calls.find((x) => x.url.includes('clienttype=12'));
         assert.ok(c.url.includes('sign=SIGNVAL') && c.url.includes('timestamp=1700000000'), 'nolimit URL 必须带 sign/timestamp: ' + c.url);
         assert.ok(c.body.includes('type=nolimit'), 'nolimit body 必须带 type=nolimit: ' + c.body);
-        assert.ok(c.body.includes(encodeURIComponent('{"sekey":"RANDSK"}')), 'nolimit extra.sekey 必须用 verify 的 randsk: ' + c.body);
+        assert.ok(c.body.includes(encodeURIComponent('{"sekey":"SEK"}')), 'nolimit extra.sekey 必须用 BDCLND 令牌(wxlist seckey): ' + c.body);
+        assert.ok(c.body.includes('fid_list=[42]'), 'nolimit fid_list 必须为字面量 [42]: ' + c.body);
         assert.ok(c.body.includes('primaryid=283') && c.body.includes('uk=110'), 'nolimit body 必须带 primaryid/uk');
         return json({ errno: 0, list: [{ dlink: '/rest/2.0/pcs/file?nolimit=OK' }] });
       }
