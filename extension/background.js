@@ -1671,6 +1671,42 @@ async function baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp) {
   }
 }
 
+// r35：转存到自己网盘再取直链兜底 —— 绕开 nolimit 通道的账号/权限限制。
+// 当 clienttype=12 nolimit 仍报 9019/errno -20（通道权限/风控）时，把文件 transfer 到
+// 用户自己的 /LeLeDownload 目录，再用 /api/filemetas 取 dlink。该 dlink 走用户个人网盘，
+// 不受分享 nolimit 通道权限约束，是 baiduwp 之外的另一条可用路径。
+// 仅在 bdstoken 有效（= 真正登录态）时可用；其余情况直接返回空 dlink + 诊断。
+async function baiduTransferToOwnDrive(shareid, uk, seckey, fsId, fileName, bdstoken, cookie) {
+  if (!bdstoken) return { dlink: '', diag: 'no_bdstoken' };
+  const dir = '/LeLeDownload';
+  const q = '&channel=chunlei&web=1&app_id=250528&clienttype=0&bdstoken=' + encodeURIComponent(bdstoken);
+  const H = { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest', Referer: 'https://pan.baidu.com/disk/home' };
+  try {
+    await ensureBaiduAuthHeaders(cookie);
+    // 建目录（已存在会返回非 0，忽略）
+    try {
+      await fetchJson('https://pan.baidu.com/api/create?a=commit&isdir=1' + q + '&path=' + encodeURIComponent(dir), { method: 'POST', credentials: 'include', headers: H, body: '' });
+    } catch (_) {}
+    const t = await fetchJson('https://pan.baidu.com/share/transfer?shareid=' + shareid + '&from=' + uk + '&sekey=' + encodeURIComponent(seckey) + '&ondup=overwrite' + q, {
+      method: 'POST', credentials: 'include', headers: H,
+      body: 'fsidlist=[' + Number(fsId) + ']&path=' + encodeURIComponent(dir),
+    });
+    const te = (typeof t.errno !== 'undefined') ? Number(t.errno) : '?';
+    let target = dir + '/' + fileName;
+    if (t.extra && Array.isArray(t.extra.list) && t.extra.list[0] && t.extra.list[0].to) target = t.extra.list[0].to;
+    if (!(te === 0 || te === -8 || te === 12)) return { dlink: '', diag: 'transfer:errno:' + te + (t.show_msg ? '(' + t.show_msg + ')' : '') };
+    const fm = await fetchJson('https://pan.baidu.com/api/filemetas?target=' + encodeURIComponent(JSON.stringify([target])) + '&dlink=1' + q, {
+      method: 'GET', credentials: 'include', headers: { Referer: 'https://pan.baidu.com/disk/home' },
+    });
+    const info = fm && fm.info && fm.info[0];
+    const dl = info && info.dlink;
+    if (!dl) return { dlink: '', diag: 'filemetas:errno:' + (fm && fm.errno) + ' target=' + target };
+    return { dlink: /^https?:/i.test(dl) ? dl : 'https://d.pcs.baidu.com' + (dl.charAt(0) === '/' ? dl : '/' + dl), diag: 'ok' };
+  } catch (e) {
+    return { dlink: '', diag: 'network:' + String((e && e.message) || e).slice(0, 100) };
+  }
+}
+
 // ===========================================================================
 // r34：百度解析「页面上下文」实现（根治 MV3 Cookie 注入的不确定性）
 // 为什么必须注入 pan.baidu.com 页面而不是在 SW 里发请求：
@@ -1801,11 +1837,15 @@ async function baiduApiFetch(apiShorturl, pwd) {
   }
 }
 
+// r35：页面路径失败诊断外露 —— 最近一次 resolveBaiduViaPage 的失败原因（step/diag/reason/err）。
+// resolveBaidu 每次开头重置，错误文案里拼出，便于用户看到「页面路径为什么没救回来」。
+let lastBaiduPageDiag = '';
+
 // SW 侧：在 pan.baidu.com 页面执行 baiduApiFetch 并把结果映射成下载项。
 // allowTempTab=false 时只在已有 pan.baidu.com 标签页上尝试（快速路径）；
 // allowTempTab=true 时允许临时开后台标签页（慢，但成功率高），用完即关。
 async function resolveBaiduViaPage(apiShorturl, pwd, cookie, allowTempTab) {
-  if (typeof chrome === 'undefined' || !chrome.scripting || !chrome.tabs) return null;
+  if (typeof chrome === 'undefined' || !chrome.scripting || !chrome.tabs) { lastBaiduPageDiag = 'no-scripting'; return null; }
   let tabId = null;
   try {
     const tabs = await chrome.tabs.query({ url: 'https://pan.baidu.com/*' });
@@ -1813,13 +1853,13 @@ async function resolveBaiduViaPage(apiShorturl, pwd, cookie, allowTempTab) {
   } catch (_) {}
   let tempTabId = null;
   if (tabId == null) {
-    if (!allowTempTab) return null;
+    if (!allowTempTab) { lastBaiduPageDiag = 'no-tab'; return null; }
     try {
       const tab = await chrome.tabs.create({ url: 'https://pan.baidu.com/disk/home', active: false });
       tempTabId = tab.id;
       await waitTabComplete(tempTabId);
       tabId = tempTabId;
-    } catch (_) { return null; }
+    } catch (_) { lastBaiduPageDiag = 'tab-create-failed'; return null; }
   }
   try {
     await new Promise((r) => setTimeout(r, 600)); // 等 SPA 稳定，避免注入时上下文被销毁
@@ -1830,7 +1870,18 @@ async function resolveBaiduViaPage(apiShorturl, pwd, cookie, allowTempTab) {
     });
     const r = res && res[0] && res[0].result;
     console.log('[baidu-page] diag=', JSON.stringify(r && r.diag), '| step=', r && r.step, '| err=', r && (r.reason || r.error));
-    if (!r || !r.ok || !r.files || !r.files.length) return null;
+    if (!r || !r.ok || !r.files || !r.files.length) {
+      // r35：页面路径失败诊断外露（step/diag/reason/err 一并提供）
+      if (r) {
+        lastBaiduPageDiag = 'step=' + r.step
+          + ' ' + JSON.stringify(r.diag || {})
+          + (r.reason ? ' reason=' + r.reason : '')
+          + (r.error ? ' err=' + r.error : '');
+      } else {
+        lastBaiduPageDiag = 'step=no-result';
+      }
+      return null;
+    }
     return r.files.map((f) => ({
       name: f.name,
       size: bytesToSize(f.size),
@@ -1839,6 +1890,7 @@ async function resolveBaiduViaPage(apiShorturl, pwd, cookie, allowTempTab) {
     }));
   } catch (e) {
     console.log('[baidu-page] inject failed:', String((e && e.message) || e));
+    lastBaiduPageDiag = 'inject:' + String((e && e.message) || e);
     return null;
   } finally {
     if (tempTabId != null) { try { await chrome.tabs.remove(tempTabId); } catch (_) {} }
@@ -1847,6 +1899,7 @@ async function resolveBaiduViaPage(apiShorturl, pwd, cookie, allowTempTab) {
 
 async function resolveBaidu(url, pwd) {
   // MV3 SW 跨域 fetch 带不上 SameSite=Lax 登录 cookie → 用 DNR 会话规则显式注入 Cookie/Referer
+  lastBaiduPageDiag = ''; // r35：每次解析前重置页面路径诊断
   await ensureBaiduAuthHeaders();
   let cookie = await getCookieString('https://pan.baidu.com');
   const u = new URL(url);
@@ -1915,6 +1968,7 @@ async function resolveBaidu(url, pwd) {
   let triedVerify = false;
   let retriedSign = false; // r27：errno 2（sign/timestamp 缺失）时自愈重取 tplconfig 一次
   let triedNolimit = false; // r30：跳端下载/-20 时 clienttype=12 + type=nolimit 兜底，只试一次
+  let transferTried = false; // r35：整个分享只试一次「转存到自己网盘」兜底
   let pageTried = false; // r34：SW 链路失败后，是否已尝试过页面上下文慢路径
   let nolimitDiag = ''; // r30：兜底结果诊断（ok / no_randsk / errno:N / network:...）
   let lastRandsk = '';
@@ -2024,7 +2078,8 @@ async function resolveBaidu(url, pwd) {
           // r34：登录态自证 —— 9019 与令牌形态无关（匿名 4 种令牌实测全 9019），
           // 真正决定因素是 Cookie 里有没有登录态（BDUSS/STOKEN）。诊断必须把它暴露出来。
           const authTag = '[bdu=' + (/(?:^|;\s*)BDUSS=/.test(cookie || '') ? '1' : '0')
-            + ';stk=' + (/(?:^|;\s*)STOKEN=/.test(cookie || '') ? '1' : '0') + ']';
+            + ';stk=' + (/(?:^|;\s*)STOKEN=/.test(cookie || '') ? '1' : '0')
+            + ';bdstk=' + (bdstoken ? '1' : '0') + ']';
           if (uniq.length === 0) {
             nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)' + authTag;
           } else {
@@ -2069,6 +2124,18 @@ async function resolveBaidu(url, pwd) {
           // 兜底失败 → 落到下方原有错误文案（附 nolimit 诊断标签）
         }
         if (nolimitOk) break; // r33：nolimit 兜底拿到 dlink，退出 attempt 循环
+        // r35：nolimit 失败时，尝试「转存到自己网盘再取直链」兜底（绕开 nolimit 通道权限限制）。
+        // 顺序：nolimit 失败 → transfer → 页面慢路径 → 抛错。整个分享只试一次。
+        if (!dlink && !transferTried && bdstoken) {
+          transferTried = true;
+          const tr = await baiduTransferToOwnDrive(shareid, uk, sekey, f.fs_id, f.server_filename, bdstoken, cookie);
+          if (tr.dlink) {
+            dlink = tr.dlink;
+            nolimitDiag = (nolimitDiag ? nolimitDiag + '|' : '') + 'transfer=ok';
+            break;
+          }
+          nolimitDiag = (nolimitDiag ? nolimitDiag + '|' : '') + 'transfer=' + tr.diag;
+        }
         const dl = sd.list && sd.list[0] && sd.list[0].dlink;
         if (dl) {
           // 百度 sharedownload 的 dlink 字段常常只返回相对路径（如 '/rest/2.0/pcs/file?...'），
@@ -2119,7 +2186,9 @@ async function resolveBaidu(url, pwd) {
         throw new Error(
           '百度接口提示：' + (serverMsg || (isJumpToClient ? '该文件被限制网页端直接下载' : '未返回 dlink')) +
           '（' + enPart + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）' +
-          hint + en2diag + noLoginHint + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
+          hint + en2diag + noLoginHint
+          + (lastBaiduPageDiag ? '（页面路径: ' + lastBaiduPageDiag + '）' : '')
+          + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
         );
       }
       if (!dlink) {

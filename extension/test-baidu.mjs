@@ -189,6 +189,38 @@ async function baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp) {
   }
 }
 
+// r35 镜像：转存到自己网盘再取直链兜底（与 background.js baiduTransferToOwnDrive 逐字一致）
+async function baiduTransferToOwnDrive(shareid, uk, seckey, fsId, fileName, bdstoken, cookie) {
+  if (!bdstoken) return { dlink: '', diag: 'no_bdstoken' };
+  const dir = '/LeLeDownload';
+  const q = '&channel=chunlei&web=1&app_id=250528&clienttype=0&bdstoken=' + encodeURIComponent(bdstoken);
+  const H = { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest', Referer: 'https://pan.baidu.com/disk/home' };
+  try {
+    await ensureBaiduAuthHeaders(cookie);
+    // 建目录（已存在会返回非 0，忽略）
+    try {
+      await fetchJson('https://pan.baidu.com/api/create?a=commit&isdir=1' + q + '&path=' + encodeURIComponent(dir), { method: 'POST', credentials: 'include', headers: H, body: '' });
+    } catch (_) {}
+    const t = await fetchJson('https://pan.baidu.com/share/transfer?shareid=' + shareid + '&from=' + uk + '&sekey=' + encodeURIComponent(seckey) + '&ondup=overwrite' + q, {
+      method: 'POST', credentials: 'include', headers: H,
+      body: 'fsidlist=[' + Number(fsId) + ']&path=' + encodeURIComponent(dir),
+    });
+    const te = (typeof t.errno !== 'undefined') ? Number(t.errno) : '?';
+    let target = dir + '/' + fileName;
+    if (t.extra && Array.isArray(t.extra.list) && t.extra.list[0] && t.extra.list[0].to) target = t.extra.list[0].to;
+    if (!(te === 0 || te === -8 || te === 12)) return { dlink: '', diag: 'transfer:errno:' + te + (t.show_msg ? '(' + t.show_msg + ')' : '') };
+    const fm = await fetchJson('https://pan.baidu.com/api/filemetas?target=' + encodeURIComponent(JSON.stringify([target])) + '&dlink=1' + q, {
+      method: 'GET', credentials: 'include', headers: { Referer: 'https://pan.baidu.com/disk/home' },
+    });
+    const info = fm && fm.info && fm.info[0];
+    const dl = info && info.dlink;
+    if (!dl) return { dlink: '', diag: 'filemetas:errno:' + (fm && fm.errno) + ' target=' + target };
+    return { dlink: /^https?:/i.test(dl) ? dl : 'https://d.pcs.baidu.com' + (dl.charAt(0) === '/' ? dl : '/' + dl), diag: 'ok' };
+  } catch (e) {
+    return { dlink: '', diag: 'network:' + String((e && e.message) || e).slice(0, 100) };
+  }
+}
+
 // 提取 surl 与 apiShorturl 形态（与 background.js resolveBaidu 一致）
 function parseBaiduSurl(url) {
   const u = new URL(url);
@@ -247,6 +279,7 @@ async function resolveBaidu(url, pwd) {
   let triedVerify = false;
   let retriedSign = false; // r27 镜像：errno 2（sign/timestamp 缺失）时自愈重取 tplconfig 一次
   let triedNolimit = false; // r30 镜像：跳端下载/-20 时 clienttype=12 + type=nolimit 兜底
+  let transferTried = false; // r35 镜像：整个分享只试一次「转存到自己网盘」兜底
   let nolimitDiag = ''; // r30 镜像：兜底结果诊断
   let lastRandsk = '';
   const MAX_DEPTH = 5;
@@ -340,7 +373,8 @@ async function resolveBaidu(url, pwd) {
           const uniq = cands.filter((c) => { if (!c.tok || seenTok.has(c.tok)) return false; seenTok.add(c.tok); return true; });
           // r34 镜像：登录态自证（匿名 4 种令牌实测全 9019 → 9019 本质看登录态）
           const authTag = '[bdu=' + (/(?:^|;\s*)BDUSS=/.test(cookie || '') ? '1' : '0')
-            + ';stk=' + (/(?:^|;\s*)STOKEN=/.test(cookie || '') ? '1' : '0') + ']';
+            + ';stk=' + (/(?:^|;\s*)STOKEN=/.test(cookie || '') ? '1' : '0')
+            + ';bdstk=' + (bdstoken ? '1' : '0') + ']';
           if (uniq.length === 0) {
             nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)' + authTag;
           } else {
@@ -384,6 +418,18 @@ async function resolveBaidu(url, pwd) {
           }
         }
         if (nolimitOk) break; // r33 镜像：nolimit 兜底拿到 dlink，退出 attempt 循环
+        // r35 镜像：nolimit 失败时，尝试「转存到自己网盘再取直链」兜底
+        // 顺序：nolimit 失败 → transfer → 页面慢路径 → 抛错。整个分享只试一次。
+        if (!dlink && !transferTried && bdstoken) {
+          transferTried = true;
+          const tr = await baiduTransferToOwnDrive(shareid, uk, sekey, f.fs_id, f.server_filename, bdstoken, cookie);
+          if (tr.dlink) {
+            dlink = tr.dlink;
+            nolimitDiag = (nolimitDiag ? nolimitDiag + '|' : '') + 'transfer=ok';
+            break;
+          }
+          nolimitDiag = (nolimitDiag ? nolimitDiag + '|' : '') + 'transfer=' + tr.diag;
+        }
         const dl = sd.list && sd.list[0] && sd.list[0].dlink;
         if (dl) {
           if (/^https?:\/\//i.test(dl)) {
@@ -1110,7 +1156,7 @@ test('r30: 跳端下载且 nolimit 兜底失败 → 错误信息带 nolimit 诊�
         const msg = String(err.message);
         return /该文件被限制网页端直接下载/.test(msg)
           && /跳端下载/.test(msg)
-          && /（nolimit兜底: \[bdu=1;stk=1\].*errno:-6\[token=/.test(msg) // r34：authTag 前缀 + 逐候选失败
+          && /（nolimit兜底: \[bdu=1;stk=1;bdstk=[01]\].*errno:-6\[token=/.test(msg) // r34：authTag 前缀 + 逐候选失败
           && !/未返回 dlink/.test(msg);
       }
     );
@@ -1168,7 +1214,7 @@ test('r30: sharedownload -20 且 nolimit 兜底失败 → 风控提示带 nolimi
         const msg = String(err.message);
         return /errno -20/.test(msg)
           && /风控/.test(msg)
-          && /（nolimit兜底: \[bdu=1;stk=1\].*errno:-6\[token=/.test(msg) // r34：authTag 前缀 + 逐候选失败
+          && /（nolimit兜底: \[bdu=1;stk=1;bdstk=[01]\].*errno:-6\[token=/.test(msg) // r34：authTag 前缀 + 逐候选失败
           && /原始响应/.test(msg);
       }
     );
@@ -1218,7 +1264,7 @@ test('r33: jar BDCLND 先解码再作 sekey，多令牌按序尝试，diag 依�
         const iJar = msg.indexOf('[token=jar]');
         const iRk = msg.indexOf('[token=verify-randsk]');
         const iSek = msg.indexOf('[token=wxlist-seckey]');
-        return /（nolimit兜底: \[bdu=1;stk=1\]errno:-6\(Invalid Bduss\)\[token=jar\]/.test(msg) // 首个失败必须是 jar 候选
+        return /（nolimit兜底: \[bdu=1;stk=1;bdstk=[01]\]errno:-6\(Invalid Bduss\)\[token=jar\]/.test(msg) // 首个失败必须是 jar 候选
           && iJar > -1 && iRk > iJar && iSek > iRk // r33: 候选按序尝试，diag 依序记录
           && iSek === msg.lastIndexOf('[token=wxlist-seckey]');
       }
@@ -1309,7 +1355,7 @@ test('r34: jar 无 BDCLND 且 verify 失败 → diag 记 verify=none 并只留 s
       () => resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', ''),
       (err) => {
         const msg = String(err.message);
-        return /\[bdu=1;stk=1\]verify=none\|errno:9019\(needverify\)\[token=wxlist-seckey\]/.test(msg)
+        return /\[bdu=1;stk=1;bdstk=[01]\]verify=none\|errno:9019\(needverify\)\[token=wxlist-seckey\]/.test(msg)
           && !/\[token=jar\]/.test(msg)
           && !/\[token=verify-randsk\]/.test(msg);
       }
@@ -1502,6 +1548,75 @@ test('r34-page: 页面无 BDCLND 时先 verify，Set-Cookie 落地后用它走 n
     assert.ok(r.files[0].url.includes('nolimit=OK'));
   } finally {
     globalThis.document = prevDoc;
+    delete globalThis.fetch;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// r35: 转存到自己网盘再取直链兜底
+// 当 nolimit 通道（clienttype=12）因账号/通道权限返回 9019 时，把文件 transfer 到用户自己的
+// /LeLeDownload 目录，再用 /api/filemetas 取 dlink 绕开权限限制。仅在 bdstoken 有效（登录态）时触发。
+// ---------------------------------------------------------------------------
+test('r35: nolimit 失败 → 转存到自己网盘兜底成功拿到 dlink（transfer=ok）', async () => {
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s, opts) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    if (s.includes('gettemplatevariable')) return json({ errno: 0, result: { bdstoken: 'BDSTOKEN123' } }); // r35：bdstoken 有效 → 触发转存兜底
+    if (s.includes('share/verify')) return json({ errno: 0, randsk: 'RANDSk' });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) return json({ errno: 9019, show_msg: 'needverify' }); // nolimit 失败
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' }); // 跳端下载触发 nolimit
+    }
+    if (s.includes('/api/create')) return json({ errno: 0 }); // 建目录（已存在忽略）
+    if (s.includes('share/transfer')) {
+      assert.ok(s.includes('ondup=overwrite'), 'transfer URL 必须带 ondup=overwrite: ' + s);
+      assert.ok(s.includes('sekey=' + encodeURIComponent('SEK')), 'transfer 必须带 sekey: ' + s);
+      assert.ok((opts.body || '').includes('fsidlist=[42]'), 'transfer body 必须带 fsidlist=[42]');
+      return json({ errno: 0, extra: { list: [{ to: '/LeLeDownload/big.dmg' }] } });
+    }
+    if (s.includes('api/filemetas')) {
+      assert.ok(s.includes('dlink=1'), 'filemetas 必须带 dlink=1: ' + s);
+      return json({ errno: 0, info: [{ dlink: '/rest/2.0/pcs/file?transfer=OK' }] });
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const r = await resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', '');
+    assert.equal(r.length, 1, '应解析出 1 个文件');
+    assert.ok(r[0].url.startsWith('https://d.pcs.baidu.com/') && r[0].url.includes('transfer=OK'), '转存兜底应返回 transfer dlink: ' + r[0].url);
+    assert.ok(findCall(rec.calls, 'share/transfer'), '应调用 /share/transfer');
+    assert.ok(findCall(rec.calls, 'api/filemetas'), '应调用 /api/filemetas 取 dlink');
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+test('r35: nolimit 失败 + 转存兜底也失败 → 错误信息含 transfer 诊断（transfer:errno:-6(账号未登录)）', async () => {
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    if (s.includes('gettemplatevariable')) return json({ errno: 0, result: { bdstoken: 'BDSTOKEN123' } }); // bdstoken 有效 → 触发转存兜底
+    if (s.includes('share/verify')) return json({ errno: 0, randsk: 'RANDSk' });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) return json({ errno: 9019, show_msg: 'needverify' }); // nolimit 失败
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' }); // 跳端下载
+    }
+    if (s.includes('/api/create')) return json({ errno: 0 });
+    if (s.includes('share/transfer')) return json({ errno: -6, show_msg: '账号未登录' }); // 转存失败
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    await assert.rejects(
+      () => resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', ''),
+      (err) => String(err.message).includes('transfer=transfer:errno:-6(账号未登录)')
+    );
+  } finally {
     delete globalThis.fetch;
   }
 });
