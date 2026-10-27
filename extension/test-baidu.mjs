@@ -230,8 +230,8 @@ async function resolveBaidu(url, pwd) {
   const out = [];
   let triedVerify = false;
   let retriedSign = false; // r27 镜像：errno 2（sign/timestamp 缺失）时自愈重取 tplconfig 一次
-  let triedDlna = false; // r28 镜像：跳端下载（大文件）时 /api/download?origin=dlna 兜底，只试一次
-  let dlnaDiag = ''; // r28 镜像：兜底结果诊断
+  let triedNolimit = false; // r30 镜像：跳端下载/-20 时 clienttype=12 + type=nolimit 兜底
+  let nolimitDiag = ''; // r30 镜像：兜底结果诊断
   let lastRandsk = '';
   const MAX_DEPTH = 5;
 
@@ -300,39 +300,50 @@ async function resolveBaidu(url, pwd) {
           }
           continue;
         }
-        // r28 镜像：跳端下载（errno 0 + list:string）→ /api/download?origin=dlna 兜底
-        // r29 镜像：errno -20（验证码/风控）同样走 dlna 兜底
+        // r30 镜像：跳端下载/-20 → clienttype=12 + type=nolimit 兜底（baiduwp-php 流派）
         const jumpNow = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
-        if ((jumpNow || en === -20) && !triedDlna) {
-          triedDlna = true;
-          const dlnaUrl = 'https://pan.baidu.com/api/download?origin=dlna'
-            + (sign ? '&sign=' + encodeURIComponent(sign) : '')
-            + (timestamp ? '&timestamp=' + encodeURIComponent(timestamp) : '');
-          const dlnaBody = 'fidlist=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
-            + '&type=dlink&appid=250528&clienttype=0&web=1&channel=chunlei'
-            + (curSekey ? '&extra=' + encodeURIComponent(JSON.stringify({ sekey: curSekey })) : '');
+        if ((jumpNow || en === -20) && !triedNolimit) {
+          triedNolimit = true;
           try {
-            const dres = await fetchJson(dlnaUrl, {
-              method: 'POST',
-              credentials: 'include',
-              headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Referer': 'https://pan.baidu.com/share/link?shareid=' + shareid + '&uk=' + uk,
-              },
-              body: dlnaBody,
-            });
-            const darr = Array.isArray(dres.dlink) ? dres.dlink : (Array.isArray(dres.list) ? dres.list : null);
-            const ddl = darr && darr[0] && (darr[0].dlink || darr[0].link);
-            if (ddl) {
-              dlink = /^https?:\/\//i.test(ddl) ? ddl : 'https://d.pcs.baidu.com' + (ddl.startsWith('/') ? ddl : '/' + ddl);
-              dlnaDiag = 'ok';
-              break;
+            // randsk（即 BDCLND 令牌）：clienttype=12 必需；尚未 verify 过则先取并桥接进 cookie jar
+            if (!lastRandsk) {
+              const rk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
+              if (rk) {
+                lastRandsk = rk;
+                const newCookie = await getCookieString('https://pan.baidu.com');
+                if (newCookie) cookie = newCookie;
+              }
             }
-            const den = (typeof dres.errno !== 'undefined') ? Number(dres.errno) : '?';
-            dlnaDiag = 'errno:' + den + ((dres.show_msg || dres.errmsg) ? '(' + (dres.show_msg || dres.errmsg) + ')' : '');
+            if (!lastRandsk) {
+              nolimitDiag = 'no_randsk(verify未返回令牌)';
+            } else {
+              const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'Referer': 'https://pan.baidu.com/disk/home',
+                },
+                body: 'encrypt=0'
+                  + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: lastRandsk }))
+                  + '&fid_list=' + encodeURIComponent(JSON.stringify([Number(f.fs_id)]))
+                  + '&primaryid=' + shareid
+                  + '&uk=' + uk
+                  + '&product=share&type=nolimit',
+              });
+              const nl0 = Array.isArray(nl.list) ? nl.list[0] : null;
+              const ndl = nl0 && nl0.dlink;
+              if (ndl) {
+                dlink = /^https?:\/\//i.test(ndl) ? ndl : 'https://d.pcs.baidu.com' + (ndl.startsWith('/') ? ndl : '/' + ndl);
+                nolimitDiag = 'ok';
+                break;
+              }
+              const nen = (typeof nl.errno !== 'undefined') ? Number(nl.errno) : '?';
+              nolimitDiag = 'errno:' + nen + ((nl.show_msg || nl.errmsg) ? '(' + (nl.show_msg || nl.errmsg) + ')' : '');
+            }
           } catch (e) {
-            dlnaDiag = 'network: ' + String((e && e.message) || e).slice(0, 120);
+            nolimitDiag = 'network: ' + String((e && e.message) || e).slice(0, 120);
           }
         }
         const dl = sd.list && sd.list[0] && sd.list[0].dlink;
@@ -354,10 +365,10 @@ async function resolveBaidu(url, pwd) {
           : '';
         const hint = isJumpToClient
           ? '（百度限制该文件在网页端直接下载（返回 list:string 跳端下载指令，官方要求跳转 PC 客户端）。建议：换一个分享链接；或直接在浏览器打开该分享并用百度网盘客户端下载）'
-            + (dlnaDiag ? '（dlna兜底: ' + dlnaDiag + '）' : '')
+            + (nolimitDiag ? '（nolimit兜底: ' + nolimitDiag + '）' : '')
           : ((en === -20)
             ? '（百度判定触发风控/验证码。建议：若已登录百度网盘账号会显著降低风控；未登录请先在浏览器手动打开一次该分享链接并按提示完成验证，等几分钟后回 LeleDownload 再解析）'
-              + (dlnaDiag ? '（dlna兜底: ' + dlnaDiag + '）' : '')
+              + (nolimitDiag ? '（nolimit兜底: ' + nolimitDiag + '）' : '')
             : '');
         if (en !== 9019) {
           throw new Error(
@@ -988,46 +999,53 @@ test('r27: tplconfig 始终失败 → errno 2 错误信息携带 tplconfig 诊�
 });
 
 // ---------------------------------------------------------------------------
-// r28: 跳端下载（errno 0 + list:string）→ /api/download?origin=dlna 兜底
-// 匿名探针实测（2026-10-27）：sharedownload 加 origin=dlna 无效；/api/download?origin=dlna
-// 匿名报 errno -6（需登录）而非参数错 → 端点可用，App 内带 BDUSS 时应能返回 dlink。
+// r30: 跳端下载（errno 0 + list:string）/-20（风控）→ clienttype=12 + type=nolimit 兜底
+// baiduwp-php 流派（>50MB 大文件正解）。演进史：
+//   r28 试 /api/download?origin=dlna —— 登录态实测 errno 113（tplconfig sign 对该端点无效），弃；
+//   匿名探针：clienttype=12 报 9019（需 BDCLND/randsk）而非跳端 → 绕行 = verify 拿 randsk 再走 12 通道。
 // ---------------------------------------------------------------------------
-test('r28: 跳端下载 → dlna 兜底成功拿到 dlink', async () => {
+test('r30: 跳端下载 → clienttype=12 + type=nolimit 兜底成功拿到 dlink', async () => {
   const rec = makeRecorder();
   const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
   rec._handler = (s) => {
     if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
     if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
     if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
-    if (s.includes('api/sharedownload')) return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' });
-    if (s.includes('api/download')) {
-      const c = rec.calls.find((x) => x.url.includes('api/download'));
-      assert.ok(c.url.includes('origin=dlna'), 'dlna URL 必须带 origin=dlna: ' + c.url);
-      assert.ok(c.url.includes('sign=SIGNVAL') && c.url.includes('timestamp=1700000000'), 'dlna URL 必须带 sign/timestamp');
-      assert.ok(c.body.includes('fidlist=%5B42%5D') || c.body.includes('fidlist=[42]'), 'dlna body 必须带 fidlist: ' + c.body);
-      assert.ok(c.body.includes('type=dlink'), 'dlna body 必须带 type=dlink');
-      return json({ errno: 0, dlink: [{ dlink: '/rest/2.0/pcs/file?dlna=OK' }] });
+    if (s.includes('share/verify')) return json({ errno: 0, randsk: 'RANDSK' });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) {
+        const c = rec.calls.find((x) => x.url.includes('clienttype=12'));
+        assert.ok(c.url.includes('sign=SIGNVAL') && c.url.includes('timestamp=1700000000'), 'nolimit URL 必须带 sign/timestamp: ' + c.url);
+        assert.ok(c.body.includes('type=nolimit'), 'nolimit body 必须带 type=nolimit: ' + c.body);
+        assert.ok(c.body.includes(encodeURIComponent('{"sekey":"RANDSK"}')), 'nolimit extra.sekey 必须用 verify 的 randsk: ' + c.body);
+        assert.ok(c.body.includes('primaryid=283') && c.body.includes('uk=110'), 'nolimit body 必须带 primaryid/uk');
+        return json({ errno: 0, list: [{ dlink: '/rest/2.0/pcs/file?nolimit=OK' }] });
+      }
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' }); // 首次：跳端下载
     }
     throw new Error('unexpected ' + s);
   };
   globalThis.fetch = rec;
   try {
     const r = await resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', '');
-    assert.ok(r[0].url.startsWith('https://d.pcs.baidu.com/') && r[0].url.includes('dlna=OK'), 'dlna 兜底应返回相对 dlink 并拼前缀: ' + r[0].url);
+    assert.ok(r[0].url.startsWith('https://d.pcs.baidu.com/') && r[0].url.includes('nolimit=OK'), 'nolimit 兜底应返回相对 dlink 并拼前缀: ' + r[0].url);
   } finally {
     delete globalThis.fetch;
   }
 });
 
-test('r28: dlna 兜底失败（errno -6）→ 错误信息带 dlna 诊断标签', async () => {
+test('r30: 跳端下载且 nolimit 兜底失败 → 错误信息带 nolimit 诊断标签', async () => {
   const rec = makeRecorder();
   const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
   rec._handler = (s) => {
     if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
     if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
     if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
-    if (s.includes('api/sharedownload')) return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' });
-    if (s.includes('api/download')) return json({ errno: -6 });
+    if (s.includes('share/verify')) return json({ errno: 0, randsk: 'RANDSK' });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) return json({ errno: -6 });
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' });
+    }
     throw new Error('unexpected ' + s);
   };
   globalThis.fetch = rec;
@@ -1038,7 +1056,7 @@ test('r28: dlna 兜底失败（errno -6）→ 错误信息带 dlna 诊断标签'
         const msg = String(err.message);
         return /该文件被限制网页端直接下载/.test(msg)
           && /跳端下载/.test(msg)
-          && /（dlna兜底: errno:-6）/.test(msg)
+          && /（nolimit兜底: errno:-6）/.test(msg)
           && !/未返回 dlink/.test(msg);
       }
     );
@@ -1048,38 +1066,44 @@ test('r28: dlna 兜底失败（errno -6）→ 错误信息带 dlna 诊断标签'
 });
 
 // ---------------------------------------------------------------------------
-// r29: errno -20（验证码/风控）同样走 dlna 兜底（2026-10-27 用户实测 v26.10.27：
-// 登录态下 sharedownload 返回 -20；DLNA 通道风控更弱，登录态常可绕过验证码）
+// r30 续: errno -20（验证码/风控）同样走 clienttype=12 兜底
+// （2026-10-27 用户实测 v26.10.27：登录态下 sharedownload 返回 -20）
 // ---------------------------------------------------------------------------
-test('r29: sharedownload -20 → dlna 兜底成功拿到 dlink', async () => {
+test('r30: sharedownload -20 → clienttype=12 兜底成功拿到 dlink', async () => {
   const rec = makeRecorder();
   const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
   rec._handler = (s) => {
     if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
     if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
     if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
-    if (s.includes('api/sharedownload')) return json({ errno: -20, show_msg: '验证码输入错误，请重试' });
-    if (s.includes('api/download')) return json({ errno: 0, dlink: [{ dlink: '/rest/2.0/pcs/file?dlna=OK' }] });
+    if (s.includes('share/verify')) return json({ errno: 0, randsk: 'RANDSK' });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) return json({ errno: 0, list: [{ dlink: '/rest/2.0/pcs/file?nolimit=OK' }] });
+      return json({ errno: -20, show_msg: '验证码输入错误，请重试' });
+    }
     throw new Error('unexpected ' + s);
   };
   globalThis.fetch = rec;
   try {
     const r = await resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', '');
-    assert.ok(r[0].url.startsWith('https://d.pcs.baidu.com/') && r[0].url.includes('dlna=OK'), '-20 应触发 dlna 兜底并成功: ' + r[0].url);
+    assert.ok(r[0].url.startsWith('https://d.pcs.baidu.com/') && r[0].url.includes('nolimit=OK'), '-20 应触发 nolimit 兜底并成功: ' + r[0].url);
   } finally {
     delete globalThis.fetch;
   }
 });
 
-test('r29: sharedownload -20 且 dlna 失败 → 风控提示带 dlna 诊断标签', async () => {
+test('r30: sharedownload -20 且 nolimit 兜底失败 → 风控提示带 nolimit 诊断标签', async () => {
   const rec = makeRecorder();
   const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
   rec._handler = (s) => {
     if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
     if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
     if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
-    if (s.includes('api/sharedownload')) return json({ errno: -20, show_msg: '验证码输入错误，请重试' });
-    if (s.includes('api/download')) return json({ errno: -6 });
+    if (s.includes('share/verify')) return json({ errno: 0, randsk: 'RANDSK' });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) return json({ errno: -6 });
+      return json({ errno: -20, show_msg: '验证码输入错误，请重试' });
+    }
     throw new Error('unexpected ' + s);
   };
   globalThis.fetch = rec;
@@ -1090,7 +1114,7 @@ test('r29: sharedownload -20 且 dlna 失败 → 风控提示带 dlna 诊断标�
         const msg = String(err.message);
         return /errno -20/.test(msg)
           && /风控/.test(msg)
-          && /（dlna兜底: errno:-6）/.test(msg)
+          && /（nolimit兜底: errno:-6）/.test(msg)
           && /原始响应/.test(msg);
       }
     );
