@@ -123,7 +123,7 @@ async function baiduWxList(apiShorturl, pwd, dirPath) {
   return { list, uk, shareid, seckey };
 }
 
-// 令牌：tplconfig 取 sign/timestamp（失败不致命）
+// 令牌：tplconfig 取 sign/timestamp（失败不致命）。r27 镜像：带 diag 诊断标签
 async function baiduGetSign(apiShorturl) {
   let res;
   try {
@@ -131,14 +131,18 @@ async function baiduGetSign(apiShorturl) {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
-  } catch (_) {
-    return { sign: '', timestamp: '' };
+  } catch (e) {
+    return { sign: '', timestamp: '', diag: 'network: ' + String((e && e.message) || e).slice(0, 140) };
   }
   const d = (res && res.data) || {};
-  return {
-    sign: d.sign != null ? String(d.sign) : '',
-    timestamp: d.timestamp != null ? String(d.timestamp) : '',
-  };
+  const sign = d.sign != null ? String(d.sign) : '';
+  const timestamp = d.timestamp != null ? String(d.timestamp) : '';
+  let diag = 'ok';
+  if (!sign || !timestamp) {
+    const en = (typeof res.errno !== 'undefined') ? Number(res.errno) : '?';
+    diag = 'no_sign_in_data(errno:' + en + ')';
+  }
+  return { sign, timestamp, diag };
 }
 
 // r20 镜像：登录态取 bdstoken（GET /api/gettemplatevariable），匿名返回 ''
@@ -219,12 +223,13 @@ async function resolveBaidu(url, pwd) {
   const uk = topList.uk;
   const shareid = topList.shareid;
   const sekey = topList.seckey ? safeDecode(topList.seckey) : '';
-  const { sign, timestamp } = await baiduGetSign(apiShorturl);
+  let { sign, timestamp, diag: signDiag } = await baiduGetSign(apiShorturl);
   // r20 镜像：登录态取 bdstoken，sharedownload 带上可降低 errno -20 风控
   const bdstoken = await baiduGetBdstoken();
 
   const out = [];
   let triedVerify = false;
+  let retriedSign = false; // r27 镜像：errno 2（sign/timestamp 缺失）时自愈重取 tplconfig 一次
   let lastRandsk = '';
   const MAX_DEPTH = 5;
 
@@ -243,7 +248,7 @@ async function resolveBaidu(url, pwd) {
       }
       let dlink = '';
       let lastErr = '';
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         const curSekey = attempt === 0 ? sekey : (lastRandsk || sekey);
         const extra = JSON.stringify({ sekey: curSekey });
         const body = 'encrypt=0'
@@ -274,6 +279,15 @@ async function resolveBaidu(url, pwd) {
           throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
         }
         const en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
+        // r27 镜像自愈：errno 2 = sign/timestamp 缺失（tplconfig 偶发失败）。重取一次令牌再试
+        if (en === 2 && !retriedSign && (!sign || !timestamp)) {
+          retriedSign = true;
+          const again = await baiduGetSign(apiShorturl);
+          sign = again.sign;
+          timestamp = again.timestamp;
+          signDiag = again.diag || signDiag;
+          continue; // 用同样的 sekey + 新 sign/timestamp 重试
+        }
         if (en === 9019 && !triedVerify) {
           triedVerify = true;
           const randsk = await baiduVerifySetCookie(shareid, uk, pwd, sign, timestamp);
@@ -297,6 +311,10 @@ async function resolveBaidu(url, pwd) {
         const serverMsg = sd.show_msg || sd.errmsg || '';
         const enPart = (typeof en !== 'undefined' && en !== '') ? ('errno ' + en) : '无 errno';
         const isJumpToClient = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
+        // r27 镜像：errno 2 = sign/timestamp 缺失，附 tplconfig 诊断标签
+        const en2diag = (en === 2)
+          ? '（诊断：sign=' + (sign ? '有' : '无') + ', timestamp=' + (timestamp ? '有' : '无') + ', tplconfig=' + signDiag + '）'
+          : '';
         const hint = isJumpToClient
           ? '（百度限制该文件在网页端直接下载（返回 list:string 跳端下载指令，官方要求跳转 PC 客户端）。建议：换一个分享链接；或直接在浏览器打开该分享并用百度网盘客户端下载）'
           : ((en === -20)
@@ -306,7 +324,7 @@ async function resolveBaidu(url, pwd) {
           throw new Error(
             '百度接口提示：' + (serverMsg || (isJumpToClient ? '该文件被限制网页端直接下载' : '未返回 dlink')) +
             '（' + enPart + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）' +
-            hint + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
+            hint + en2diag + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
           );
         }
       }
@@ -444,13 +462,15 @@ test('baiduGetSign 请求 tplconfig 返回 sign/timestamp', async () => {
 // ---------------------------------------------------------------------------
 // T7: baiduGetSign 失败时非致命（返回空），不影响后续 sharedownload
 // ---------------------------------------------------------------------------
-test('baiduGetSign 请求失败非致命，返回空 sign/timestamp', async () => {
+test('baiduGetSign 请求失败非致命，返回空 sign/timestamp（r27：另带 diag 诊断）', async () => {
   globalThis.fetch = async (u) => {
     if (String(u).includes('share/tplconfig')) return { text: async () => '<html>500</html>', ok: false, status: 500 };
     throw new Error('unexpected ' + u);
   };
   const r = await baiduGetSign('1abc');
-  assert.deepStrictEqual(r, { sign: '', timestamp: '' });
+  assert.equal(r.sign, '');
+  assert.equal(r.timestamp, '');
+  assert.ok(String(r.diag).startsWith('network: '), '失败必须带 network 诊断，实际: ' + r.diag);
 });
 
 // ---------------------------------------------------------------------------
@@ -857,6 +877,70 @@ test('resolveBaidu errno 0 + list:string（跳端下载）→ 提示「限制网
           && /跳端下载/.test(msg)
           && /PC 客户端/.test(msg)
           && !/未返回 dlink/.test(msg);
+      }
+    );
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// r27: errno 2（sign/timestamp 缺失）自愈重试 + tplconfig 诊断标签
+// 外部探针实测（2026-10-27）：sharedownload errno 2「请求失败」= sign 或 timestamp 缺失
+// （任缺一个都报 2）；sign/timestamp 伪造 = 113；缺 extra = 118；errno 0 + list:string = 跳端下载。
+// tplconfig 在 SW 偶发失败被静默吞掉 → sign 空 → sharedownload 必报 errno 2。
+// ---------------------------------------------------------------------------
+test('r27: tplconfig 首次失败 → sharedownload errno 2 → 重取 sign 自愈成功', async () => {
+  let tplCalls = 0, sdCalls = 0;
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'a.txt', size: 10 }] } });
+    if (s.includes('share/tplconfig')) {
+      tplCalls++;
+      if (tplCalls === 1) throw new Error('sw network hiccup');
+      return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    }
+    if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
+    if (s.includes('api/sharedownload')) {
+      sdCalls++;
+      const hasSign = rec.calls.some((c) => c.url.includes('api/sharedownload') && c.url.includes('sign=SIGNVAL'));
+      if (!hasSign) return json({ errno: 2, show_msg: '请求失败' });
+      return json({ errno: 0, list: [{ dlink: '/rest/2.0/pcs/file?dlink=OK' }] });
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    const r = await resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', '');
+    assert.equal(tplCalls, 2, 'tplconfig 必须被重取一次，实际 ' + tplCalls);
+    assert.equal(sdCalls, 2, 'sharedownload 必须重试一次，实际 ' + sdCalls);
+    assert.ok(r[0].url.includes('d.pcs.baidu.com') && r[0].url.includes('dlink=OK'), '自愈后应拿到 dlink: ' + r[0].url);
+  } finally {
+    delete globalThis.fetch;
+  }
+});
+
+test('r27: tplconfig 始终失败 → errno 2 错误信息携带 tplconfig 诊断标签', async () => {
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'a.txt', size: 10 }] } });
+    if (s.includes('share/tplconfig')) throw new Error('[HTTP 502 Bad Gateway] tplconfig html');
+    if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
+    if (s.includes('api/sharedownload')) return json({ errno: 2, show_msg: '请求失败', request_id: 'r27' });
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    await assert.rejects(
+      () => resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', ''),
+      (err) => {
+        const msg = String(err.message);
+        return /errno 2/.test(msg)
+          && /请求失败/.test(msg)
+          && /诊断：sign=无, timestamp=无, tplconfig=network: \[HTTP 502/.test(msg)
+          && /原始响应/.test(msg);
       }
     );
   } finally {

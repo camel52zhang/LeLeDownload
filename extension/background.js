@@ -1588,20 +1588,29 @@ async function baiduWxList(apiShorturl, pwd, dirPath) {
 //   -> data.sign / data.timestamp（页面 JS 也是从这里取，非本地盐值算法）。
 // 失败不致命，返回空让 sharedownload 阶段再报错。
 async function baiduGetSign(apiShorturl) {
+  // r27：携带 diag 诊断标签。外部实测（2026-10-27 探针二分）：
+  //   sharedownload errno 2「请求失败」= sign 或 timestamp 缺失（任缺一个都报 2）；
+  //   sign/timestamp 伪造 = errno 113；extra 缺失/sekey 错 = errno 118。
+  // tplconfig 在 SW 环境偶发失败被 catch 静默吞掉 → sign 空 → sharedownload 必报 errno 2。
+  // diag 用于在最终错误里自证失败原因（network / no_sign_in_data）。
   let res;
   try {
     res = await fetchJson('https://pan.baidu.com/share/tplconfig?fields=sign,timestamp&channel=chunlei&web=1&app_id=250528&clienttype=0&surl=' + encodeURIComponent(apiShorturl), {
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
-  } catch (_) {
-    return { sign: '', timestamp: '' };
+  } catch (e) {
+    return { sign: '', timestamp: '', diag: 'network: ' + String((e && e.message) || e).slice(0, 140) };
   }
   const d = (res && res.data) || {};
-  return {
-    sign: d.sign != null ? String(d.sign) : '',
-    timestamp: d.timestamp != null ? String(d.timestamp) : '',
-  };
+  const sign = d.sign != null ? String(d.sign) : '';
+  const timestamp = d.timestamp != null ? String(d.timestamp) : '';
+  let diag = 'ok';
+  if (!sign || !timestamp) {
+    const en = (typeof res.errno !== 'undefined') ? Number(res.errno) : '?';
+    diag = 'no_sign_in_data(errno:' + en + ')';
+  }
+  return { sign, timestamp, diag };
 }
 
 // bdstoken（登录令牌）：GET /api/gettemplatevariable?fields=["bdstoken"]，需登录态（BDUSS）。
@@ -1694,8 +1703,8 @@ async function resolveBaidu(url, pwd) {
   // seckey 是 URL 编码的，解码后作为 sekey 传 sharedownload（避免双重编码触发参数错误）
   const sekey = topList.seckey ? safeDecode(topList.seckey) : '';
 
-  // 2) 令牌（tplconfig 取 sign/timestamp）
-  const { sign, timestamp } = await baiduGetSign(apiShorturl);
+  // 2) 令牌（tplconfig 取 sign/timestamp）。r27：带 diag，errno 2 时进错误信息自证
+  let { sign, timestamp, diag: signDiag } = await baiduGetSign(apiShorturl);
 
   // r20：登录态取 bdstoken，sharedownload 带上可显著降低 errno -20 风控（登录用户有效）
   const bdstoken = await baiduGetBdstoken();
@@ -1708,6 +1717,7 @@ async function resolveBaidu(url, pwd) {
   // 仅当返回 errno 9019 needverify 时才补 verify（取 BDCLND 桥接进 cookie jar）并用 randsk 重试。
   const out = [];
   let triedVerify = false;
+  let retriedSign = false; // r27：errno 2（sign/timestamp 缺失）时自愈重取 tplconfig 一次
   let lastRandsk = '';
   const MAX_DEPTH = 5; // 防无限嵌套（分享循环引用/极深结构）
 
@@ -1731,7 +1741,7 @@ async function resolveBaidu(url, pwd) {
       // 普通文件：原 sharedownload 流程拿 dlink
       let dlink = '';
       let lastErr = '';
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         const curSekey = attempt === 0 ? sekey : (lastRandsk || sekey);
         const extra = JSON.stringify({ sekey: curSekey });
         const body = 'encrypt=0'
@@ -1762,6 +1772,15 @@ async function resolveBaidu(url, pwd) {
           throw new Error('百度 api/sharedownload 请求失败（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）：' + e.message);
         }
         const en = (typeof sd.errno !== 'undefined') ? Number(sd.errno) : '';
+        // r27 自愈：errno 2 = sign/timestamp 缺失（tplconfig 偶发失败）。重取一次令牌再试。
+        if (en === 2 && !retriedSign && (!sign || !timestamp)) {
+          retriedSign = true;
+          const again = await baiduGetSign(apiShorturl);
+          sign = again.sign;
+          timestamp = again.timestamp;
+          signDiag = again.diag || signDiag;
+          continue; // 用同样的 sekey + 新 sign/timestamp 重试
+        }
         if (en === 9019 && !triedVerify) {
           // 补验证：/share/verify 取 randsk（即 BDCLND 令牌）桥接进 cookie jar 后重试
           triedVerify = true;
@@ -1792,6 +1811,10 @@ async function resolveBaidu(url, pwd) {
         const serverMsg = sd.show_msg || sd.errmsg || '';
         const enPart = (typeof en !== 'undefined' && en !== '') ? ('errno ' + en) : '无 errno';
         const isJumpToClient = (en === 0) && (typeof sd.list === 'string' && sd.list.length > 0);
+        // r27：errno 2 = sign/timestamp 缺失。附 tplconfig 诊断标签，让下一轮日志自证失败原因
+        const en2diag = (en === 2)
+          ? '（诊断：sign=' + (sign ? '有' : '无') + ', timestamp=' + (timestamp ? '有' : '无') + ', tplconfig=' + signDiag + '）'
+          : '';
         const hint = isJumpToClient
           ? '（百度限制该文件在网页端直接下载（返回 list:string 跳端下载指令，官方要求跳转 PC 客户端）。建议：换一个分享链接；或直接在浏览器打开该分享并用百度网盘客户端下载）'
           : ((en === -20)
@@ -1800,7 +1823,7 @@ async function resolveBaidu(url, pwd) {
         throw new Error(
           '百度接口提示：' + (serverMsg || (isJumpToClient ? '该文件被限制网页端直接下载' : '未返回 dlink')) +
           '（' + enPart + '）（uk=' + uk + ', shareid=' + shareid + ', fs_id=' + f.fs_id + '）' +
-          hint + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
+          hint + en2diag + '。原始响应：' + JSON.stringify(sd).slice(0, 200)
         );
       }
       if (!dlink) {
