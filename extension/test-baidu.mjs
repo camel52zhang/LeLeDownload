@@ -305,25 +305,30 @@ async function resolveBaidu(url, pwd) {
         if ((jumpNow || en === -20) && !triedNolimit) {
           triedNolimit = true;
           try {
-            // r31 镜像：BDCLND = verify randsk（若已有）否则 wxlist seckey；显式追加进 DNR Cookie
-            if (!lastRandsk) lastRandsk = sekey;
-            if (!lastRandsk) {
-              nolimitDiag = 'no_bdclnd(无randsk/seckey)';
+            // r32 镜像：BDCLND 令牌优先级 = 浏览器 jar 真实 BDCLND > verify randsk > wxlist seckey
+            let bdclnd = '';
+            let bdclndSrc = '';
+            const mBdclnd = cookie && cookie.match(/(?:^|;\s*)BDCLND=([^;]+)/);
+            if (mBdclnd) { bdclnd = mBdclnd[1]; bdclndSrc = 'jar'; }
+            else if (lastRandsk) { bdclnd = lastRandsk; bdclndSrc = 'verify-randsk'; }
+            else if (sekey) { bdclnd = sekey; bdclndSrc = 'wxlist-seckey'; }
+            if (!bdclnd) {
+              nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)';
             } else {
               cookie = cookie
-                ? (/(?:^|;\s*)BDCLND=/.test(cookie) ? cookie : cookie + '; BDCLND=' + lastRandsk)
-                : ('BDCLND=' + lastRandsk);
+                ? (/(?:^|;\s*)BDCLND=/.test(cookie) ? cookie : cookie + '; BDCLND=' + bdclnd)
+                : ('BDCLND=' + bdclnd);
               await ensureBaiduAuthHeaders(cookie);
               const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
                 method: 'POST',
                 credentials: 'include',
                 headers: {
                   'Content-Type': 'application/x-www-form-urlencoded',
-                  'X-Requested-With': 'XMLHttpRequest',
+                  // r32 镜像：去掉 X-Requested-With，对齐 baiduwp-php
                   'Referer': 'https://pan.baidu.com/disk/home',
                 },
                 body: 'encrypt=0'
-                  + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: lastRandsk }))
+                  + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: bdclnd }))
                   + '&fid_list=[' + Number(f.fs_id) + ']'
                   + '&primaryid=' + shareid
                   + '&uk=' + uk
@@ -337,7 +342,7 @@ async function resolveBaidu(url, pwd) {
                 break;
               }
               const nen = (typeof nl.errno !== 'undefined') ? Number(nl.errno) : '?';
-              nolimitDiag = 'errno:' + nen + ((nl.show_msg || nl.errmsg) ? '(' + (nl.show_msg || nl.errmsg) + ')' : '');
+              nolimitDiag = 'errno:' + nen + ((nl.show_msg || nl.errmsg) ? '(' + (nl.show_msg || nl.errmsg) + ')' : '') + '[token=' + bdclndSrc + ']';
             }
           } catch (e) {
             nolimitDiag = 'network: ' + String((e && e.message) || e).slice(0, 120);
@@ -1054,7 +1059,7 @@ test('r30: 跳端下载且 nolimit 兜底失败 → 错误信息带 nolimit 诊�
         const msg = String(err.message);
         return /该文件被限制网页端直接下载/.test(msg)
           && /跳端下载/.test(msg)
-          && /（nolimit兜底: errno:-6）/.test(msg)
+          && /（nolimit兜底: errno:-6[)\[]/.test(msg) // r32：diag 会追加 [token=xxx] 后缀
           && !/未返回 dlink/.test(msg);
       }
     );
@@ -1112,11 +1117,55 @@ test('r30: sharedownload -20 且 nolimit 兜底失败 → 风控提示带 nolimi
         const msg = String(err.message);
         return /errno -20/.test(msg)
           && /风控/.test(msg)
-          && /（nolimit兜底: errno:-6）/.test(msg)
+          && /（nolimit兜底: errno:-6[)\[]/.test(msg) // r32：diag 会追加 [token=xxx] 后缀
           && /原始响应/.test(msg);
       }
     );
   } finally {
+    delete globalThis.fetch;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// r32: BDCLND 令牌优先级 = 浏览器 jar 真实 BDCLND > verify randsk > wxlist seckey。
+// 用户实测 r31：合成令牌显式注入后仍 9019——百度很可能只认浏览器过验证后真实下发的 BDCLND。
+// 同时 r32 去掉 nolimit 请求的 X-Requested-With，完全对齐 baiduwp-php。
+// ---------------------------------------------------------------------------
+test('r32: jar 真实 BDCLND 优先于 seckey/randsk，diag 标记 [token=jar]，nolimit 无 X-Requested-With', async () => {
+  const prevCookie = mockCookie;
+  mockCookie = 'BDUSS=abc123deadbeef; STOKEN=xyz789; BDCLND=JARREALTOKEN';
+  const rec = makeRecorder();
+  const json = (o) => ({ text: async () => JSON.stringify(o), ok: true });
+  rec._handler = (s, opts) => {
+    if (s.includes('share/wxlist')) return json({ errno: 0, data: { uk: '110', shareid: '283', seckey: 'SEK', list: [{ fs_id: 42, server_filename: 'big.dmg', size: 5265524301 }] } });
+    if (s.includes('share/tplconfig')) return json({ data: { sign: 'SIGNVAL', timestamp: '1700000000' } });
+    if (s.includes('gettemplatevariable')) return json({ errno: -6, result: [] });
+    if (s.includes('api/sharedownload')) {
+      if (s.includes('clienttype=12')) {
+        const c = rec.calls.find((x) => x.url.includes('clienttype=12'));
+        assert.ok(c.body.includes(encodeURIComponent('{"sekey":"JARREALTOKEN"}')), 'r32: extra.sekey 必须用 jar 真实 BDCLND: ' + c.body);
+        assert.ok(!c.body.includes('SEK') && !c.body.includes('RANDSK'), 'r32: 不得使用合成令牌 seckey/randsk: ' + c.body);
+        const hdrs = (c.opts && c.opts.headers) || {};
+        assert.ok(!('X-Requested-With' in hdrs), 'r32: nolimit 请求不应带 X-Requested-With: ' + JSON.stringify(hdrs));
+        assert.ok(hdrs.Referer === 'https://pan.baidu.com/disk/home', 'r32: nolimit Referer=disk/home');
+        return json({ errno: -6, show_msg: 'Invalid Bduss' });
+      }
+      return json({ errno: 0, list: 'lcLSYqsqWZI7U5baWnZpVcfhTS5b/XydTZ9yFNZkKrMvRKWu++' }); // 首次：跳端下载
+    }
+    throw new Error('unexpected ' + s);
+  };
+  globalThis.fetch = rec;
+  try {
+    await assert.rejects(
+      () => resolveBaidu('https://pan.baidu.com/s/1ip_a56KjUknFNYLI22KVpA', ''),
+      (err) => {
+        const msg = String(err.message);
+        return /（nolimit兜底: errno:-6\([^)]*\)\[token=jar\]）/.test(msg) // r32: diag 必须自证令牌来源=jar
+          && !/\[token=wxlist-seckey\]/.test(msg);
+      }
+    );
+  } finally {
+    mockCookie = prevCookie;
     delete globalThis.fetch;
   }
 });

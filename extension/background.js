@@ -1807,29 +1807,35 @@ async function resolveBaidu(url, pwd) {
         if ((jumpNow || en === -20) && !triedNolimit) {
           triedNolimit = true;
           try {
-            // r31：BDCLND 令牌 = verify 的 randsk（若已有），否则直接用 wxlist 的 seckey
-            //（baiduwp-php 的 get_BDCLND 即从 wxlist 取，verify 非必需）。
-            if (!lastRandsk) lastRandsk = sekey;
-            if (!lastRandsk) {
-              nolimitDiag = 'no_bdclnd(无randsk/seckey)';
+            // r32：BDCLND 令牌优先级 = 浏览器 jar 真实 BDCLND > verify randsk > wxlist seckey。
+            // 用户实测 r31：合成令牌（seckey/randsk）显式注入后仍 9019——百度很可能只认
+            // 浏览器打开分享并输入提取码后真实下发的 BDCLND。jar 里有就用真的。
+            let bdclnd = '';
+            let bdclndSrc = '';
+            const mBdclnd = cookie && cookie.match(/(?:^|;\s*)BDCLND=([^;]+)/);
+            if (mBdclnd) { bdclnd = mBdclnd[1]; bdclndSrc = 'jar'; }
+            else if (lastRandsk) { bdclnd = lastRandsk; bdclndSrc = 'verify-randsk'; }
+            else if (sekey) { bdclnd = sekey; bdclndSrc = 'wxlist-seckey'; }
+            if (!bdclnd) {
+              nolimitDiag = 'no_bdclnd(无jar/randsk/seckey)';
             } else {
-              // 关键：显式把 BDCLND 追加进 DNR 注入的 Cookie 头——
-              // chrome.cookies.set 可能静默失败，不能只赌 cookie jar；下载引擎 headers 同步带上
+              // 显式把 BDCLND 追加进 DNR 注入的 Cookie 头（去重；jar 已有则原样）；
+              // 下载引擎 headers 同步带上（dlink 下载也需要 BDCLND）
               cookie = cookie
-                ? (/(?:^|;\s*)BDCLND=/.test(cookie) ? cookie : cookie + '; BDCLND=' + lastRandsk)
-                : ('BDCLND=' + lastRandsk);
+                ? (/(?:^|;\s*)BDCLND=/.test(cookie) ? cookie : cookie + '; BDCLND=' + bdclnd)
+                : ('BDCLND=' + bdclnd);
               await ensureBaiduAuthHeaders(cookie);
               const nl = await fetchJson('https://pan.baidu.com/api/sharedownload?app_id=250528&channel=chunlei&clienttype=12&sign=' + encodeURIComponent(sign) + '&timestamp=' + encodeURIComponent(timestamp) + '&web=1', {
                 method: 'POST',
                 credentials: 'include',
                 headers: {
                   'Content-Type': 'application/x-www-form-urlencoded',
-                  'X-Requested-With': 'XMLHttpRequest',
+                  // r32：去掉 X-Requested-With，完全对齐 baiduwp-php 的请求头（UA/Cookie/Referer 而已）
                   'Referer': 'https://pan.baidu.com/disk/home',
                 },
                 body: 'encrypt=0'
-                  + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: lastRandsk }))
-                  + '&fid_list=[' + Number(f.fs_id) + ']'  // r31：对齐 baiduwp 原样字面量（不再 JSON 编码）
+                  + '&extra=' + encodeURIComponent(JSON.stringify({ sekey: bdclnd }))
+                  + '&fid_list=[' + Number(f.fs_id) + ']'
                   + '&primaryid=' + shareid
                   + '&uk=' + uk
                   + '&product=share&type=nolimit',
@@ -1842,7 +1848,7 @@ async function resolveBaidu(url, pwd) {
                 break;
               }
               const nen = (typeof nl.errno !== 'undefined') ? Number(nl.errno) : '?';
-              nolimitDiag = 'errno:' + nen + ((nl.show_msg || nl.errmsg) ? '(' + (nl.show_msg || nl.errmsg) + ')' : '');
+              nolimitDiag = 'errno:' + nen + ((nl.show_msg || nl.errmsg) ? '(' + (nl.show_msg || nl.errmsg) + ')' : '') + '[token=' + bdclndSrc + ']';
             }
           } catch (e) {
             nolimitDiag = 'network: ' + String((e && e.message) || e).slice(0, 120);
