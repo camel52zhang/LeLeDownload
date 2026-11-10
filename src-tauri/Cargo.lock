@@ -2573,7 +2573,6 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "futures-util",
- "hex 0.4.3",
  "librqbit",
  "reqwest 0.12.28",
  "rusqlite",

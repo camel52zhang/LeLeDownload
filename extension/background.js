@@ -1494,36 +1494,6 @@ async function resolveAliyun(url, pwd) {
   return out;
 }
 
-// 从分享页 HTML 提取 window.yunData 完整对象字面量（手动括号匹配，兼容字符串内花括号）
-function extractYunData(html) {
-  const m = html.match(/window\.yunData\s*=\s*\{/);
-  if (!m) return '';
-  const i = m.index + m[0].length - 1; // 定位到 '{'
-  let depth = 0;
-  for (let j = i; j < html.length; j++) {
-    const c = html[j];
-    if (c === '"' || c === "'") {
-      const q = c; j++;
-      // 注意：每个字符都必须推进 j，否则遇到非转义字符会死循环（字符串里几乎所有字符都不是反斜杠）
-      while (j < html.length && html[j] !== q) { if (html[j] === '\\') j++; j++; }
-      continue;
-    }
-    if (c === '{') depth++;
-    else if (c === '}') { depth--; if (depth === 0) return html.slice(i, j + 1); }
-  }
-  return '';
-}
-// 从 yunData 文本里按 key 取数字值（兼容 "uk":123 与 uk:123 两种写法）
-function pickNum(blob, key) {
-  // 兼容 key 带引号（"uk":123）与不带引号（uk:123）两种写法：key 与分隔符之间允许一个可选引号
-  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + '\\s*["\']?\\s*[:=]\\s*["\']?\\s*(\\d+)'));
-  return m ? m[1] : '';
-}
-// 从 yunData 文本里按 key 取字符串值（兼容 "sign":"abc" 与 sign:'abc' 两种写法）
-function pickStr(blob, key) {
-  const m = blob.match(new RegExp('(?:^|[^A-Za-z0-9_])' + key + "\\s*[:=]\\s*[\"']([^\"']*)[\"']"));
-  return m ? m[1] : '';
-}
 // 获取百度分享的 uk / shareid：优先页面 window.yunData，兜底 api/shareinfo
 // 形参：
 //   pageUrl     —— 应抓取的分享页。/s/ 短链抓 https://pan.baidu.com/s/<surl>（新版页，yunData 含 share_uk/shareid，
