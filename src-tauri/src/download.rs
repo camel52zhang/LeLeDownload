@@ -553,11 +553,25 @@ impl DownloadManager {
 
             if let Err(e) = result {
                 tracing::error!("Download failed: {}", e);
+                // 把「发送请求 / 连接」阶段的 reqwest 英文错误翻译成中文并标注为服务端问题，
+                // 避免用户误以为是下载器坏了。
+                // reqwest 的底层原因只存在于 source() 链中，需先拼接整条链再分类；
+                // 未命中分类时回落到只有外壳的 e.to_string()，不向用户暴露内部链串。
+                let top = e.to_string();
+                // `e` 是 trait object（download_file 返回 Box<dyn Error + Send + Sync>）。
+                // 仅当底层是 reqwest::Error 时才拼接 source() 链；其他错误（磁盘空间、
+                // 分片失败等）退化为只有外壳的串——它们本就不是连接类错误。
+                let full = if let Some(re) = e.downcast_ref::<reqwest::Error>() {
+                    error_chain_string(re)
+                } else {
+                    top.clone()
+                };
+                let err_msg = finalize_download_error(&top, &full);
                 if let Some(t) = tasks.write().await.get_mut(&task_id) {
                     t.status = DownloadStatus::Failed;
-                    t.error = Some(e.to_string());
+                    t.error = Some(err_msg.clone());
                 }
-                let _ = app_handle.emit("download-failed", (&task_id, e.to_string()));
+                let _ = app_handle.emit("download-failed", (&task_id, err_msg));
             }
         });
 
@@ -1216,6 +1230,81 @@ impl DownloadManager {
 
 }
 
+/// 把下载引擎里 reqwest 在「发送请求 / 连接」阶段抛出的英文错误，翻译成
+/// 用户可读的中文，并明确标注为「服务端问题」，避免用户误以为下载器本身坏了。
+///
+/// **只匹配连接 / 握手 / 域名解析阶段的错误**；不处理任何 HTTP 4xx/5xx
+/// 响应类错误（那些由各自的响应分支负责）。无命中则原样返回。
+///
+/// 命中时**保留原始错误原文**（括在括号里），便于用户 / 开发者对照诊断。
+fn classify_download_error(msg: &str) -> String {
+    let m = msg.to_lowercase();
+    if m.contains("dns error")
+        || m.contains("nodename nor servname")
+        || m.contains("name or service not known")
+        || m.contains("没有与主机名称关联")
+        || m.contains("nxdomain")
+        || m.contains("无法解析")
+        || m.contains("不知道这样的主机")
+    {
+        format!(
+            "域名解析失败：域名不存在或已下线——服务端问题，与下载器无关；请确认链接或向资源方索取新地址（原始错误: {msg}）"
+        )
+    } else if m.contains("certificate")
+        || m.contains("schannel")
+        || m.contains("sec_e_")
+        || m.contains("tls")
+        || m.contains("ssl")
+        || m.contains("handshake")
+    {
+        format!("TLS/证书校验失败——服务端证书与域名不匹配或已过期，服务端问题（原始错误: {msg}）")
+    } else if m.contains("timed out") || m.contains("timeout") {
+        format!("连接超时——服务器无响应（原始错误: {msg}）")
+    } else if m.contains("refused") {
+        format!("连接被拒绝——服务器端口未开放（原始错误: {msg}）")
+    } else if m.contains("connection reset")
+        || m.contains("broken pipe")
+        || m.contains("connection closed")
+    {
+        format!("连接被重置——服务器中断了连接（原始错误: {msg}）")
+    } else {
+        msg.to_string()
+    }
+}
+
+/// 拼接 reqwest::Error 的完整错误链。
+///
+/// reqwest 的 `Display`（`e.to_string()`）通常只输出最外层
+/// `error sending request for url (https://...)`，**底层原因**（dns error /
+/// schannel 证书错误 / Connection refused 等）藏在 `std::error::Error::source()`
+/// 链里。只对 `e.to_string()` 分类，DNS/TLS/refused 分支几乎必然不命中、全部走透传——
+/// 等于没改。所以必须先拼接整条链，再交给 `classify_download_error`。
+fn error_chain_string(e: &reqwest::Error) -> String {
+    let mut s = e.to_string();
+    // `source()` 来自 std::error::Error trait；reqwest::Error 必须先转型才能调用
+    let mut src: Option<&(dyn std::error::Error + 'static)> = (e as &(dyn std::error::Error + 'static)).source();
+    while let Some(er) = src {
+        s.push_str(": ");
+        s.push_str(&er.to_string());
+        src = er.source();
+    }
+    s
+}
+
+/// 把 reqwest 错误落地为给用户看的文案：
+/// - 先用 `classify_download_error` 对完整错误链（`full_chain`）分类；
+/// - 若命中，返回中文分类文案（其中保留 `full_chain` 原文）；
+/// - 若未命中（透传分支，如 HTTP 4xx/5xx、磁盘空间、分片失败），回落到只有外壳的
+///   `top`（即 `e.to_string()`），**避免把内部 source 链串暴露给用户**。
+fn finalize_download_error(top: &str, full_chain: &str) -> String {
+    let classified = classify_download_error(full_chain);
+    if classified == full_chain {
+        top.to_string()
+    } else {
+        classified
+    }
+}
+
 #[cfg(test)]
 mod tests {
         use super::*;
@@ -1412,6 +1501,103 @@ mod tests {
             assert!(!json.contains("SUPER_SECRET"), "敏感 Cookie 值不得泄露: {}", json);
             assert!(json.contains("\"source\""), "source 字段应可持久化: {}", json);
             assert!(json.contains("share-link"), "source 取值应保留: {}", json);
+        }
+
+        // 以下 6 条分类用例统一走 `finalize_download_error`：
+        // top = 只有外壳的串（模拟 reqwest 的 e.to_string()），
+        // full_chain = top + source 链（含底层原因），断言输出中文分类且保留完整链。
+        #[test]
+        fn test_classify_download_error_dns() {
+            // 域名解析失败（NXDOMAIN / name or service not known / Windows 无法解析 等）
+            let top = "error sending request for url (https://update.hichord.com/fw.bin)";
+            let full = format!("{top}: dns error: failed to lookup address information: Name or service not known");
+            let out = finalize_download_error(top, &full);
+            assert!(out.starts_with("域名解析失败"), "实际输出: {out}");
+            assert!(out.contains("服务端问题"), "应标注服务端问题: {out}");
+            assert!(out.contains(&full), "完整错误链必须保留在括号内: {out}");
+        }
+
+        #[test]
+        fn test_classify_download_error_tls() {
+            // TLS / 证书校验失败
+            let top = "error sending request for url (https://x.test/a)";
+            let full = format!("{top}: error trying to connect: tls handshake failed: certificate verify failed");
+            let out = finalize_download_error(top, &full);
+            assert!(out.starts_with("TLS/证书校验失败"), "实际输出: {out}");
+            assert!(out.contains("服务端问题"), "应标注服务端问题: {out}");
+            assert!(out.contains(&full), "完整错误链必须保留在括号内: {out}");
+        }
+
+        #[test]
+        fn test_classify_download_error_timeout() {
+            // 连接超时（reqwest 对 body 超时的 Display 是 "operation timed out"，已覆盖）
+            let top = "error sending request for url (https://x.test/a)";
+            let full = format!("{top}: operation timed out after 30s");
+            let out = finalize_download_error(top, &full);
+            assert!(out.starts_with("连接超时"), "实际输出: {out}");
+            assert!(out.contains("服务器无响应"), "实际输出: {out}");
+            assert!(out.contains(&full), "完整错误链必须保留在括号内: {out}");
+        }
+
+        #[test]
+        fn test_classify_download_error_refused() {
+            // 连接被拒绝
+            let top = "error sending request for url (https://x.test:81/a)";
+            let full = format!("{top}: error trying to connect: Connection refused (os error 10061)");
+            let out = finalize_download_error(top, &full);
+            assert!(out.starts_with("连接被拒绝"), "实际输出: {out}");
+            assert!(out.contains("服务器端口未开放"), "实际输出: {out}");
+            assert!(out.contains(&full), "完整错误链必须保留在括号内: {out}");
+        }
+
+        #[test]
+        fn test_classify_download_error_reset() {
+            // 连接被重置 / 中断
+            let top = "error sending request for url (https://x.test/a)";
+            let full = format!("{top}: connection closed before message completed");
+            let out = finalize_download_error(top, &full);
+            assert!(out.starts_with("连接被重置"), "实际输出: {out}");
+            assert!(out.contains("服务器中断了连接"), "实际输出: {out}");
+            assert!(out.contains(&full), "完整错误链必须保留在括号内: {out}");
+        }
+
+        #[test]
+        fn test_classify_download_error_passthrough() {
+            // 非连接类错误（如 HTTP 4xx/5xx）未命中分类，回落到只有外壳的 top，
+            // 不把内部 source 链暴露给用户
+            let top = "error sending request for url (https://x.test/a)";
+            let full = format!("{top}: http2 error: stream closed");
+            assert_eq!(finalize_download_error(top, &full), top, "未命中必须回落 top");
+            let http = "HTTP status client error (404 Not Found) for url (https://x.test/a)";
+            assert_eq!(finalize_download_error(http, http), http);
+        }
+
+        #[test]
+        fn test_reqwest_chain_form_required_for_dns_match() {
+            // 回归保护（P0）：reqwest 外壳串本身不含 dns 关键词，只对它分类会漏；
+            // 必须拼接 source 链（full_chain）后才能命中。
+            let top = "error sending request for url (https://update.hichord.com/fw.bin)";
+            // 仅外壳：不应命中，回落到 top
+            assert_eq!(
+                finalize_download_error(top, top),
+                top,
+                "仅外壳串不得命中分类（这正是 P0 修复前的 bug）"
+            );
+            // 拼接完整链：命中 dns 分支
+            let full = format!("{top}: dns error: failed to lookup address information: Name or service not known");
+            let out = finalize_download_error(top, &full);
+            assert!(out.starts_with("域名解析失败"), "拼接链后必须命中 dns 分支: {out}");
+            assert!(out.contains(&full), "完整链须保留在括号内: {out}");
+        }
+
+        #[test]
+        fn test_finalize_download_error_unmatched_falls_back_to_top() {
+            // 明确校验「未命中时回落原始 e.to_string()」：不暴露内部 source 链串。
+            let top = "error sending request for url (https://x.test/a)";
+            let full = format!("{top}: hyper error: body write aborted");
+            let out = finalize_download_error(top, &full);
+            assert_eq!(out, top, "未命中必须回落到 top: {out}");
+            assert!(!out.contains("hyper error"), "内部链不得泄露给用户: {out}");
         }
     }
 
