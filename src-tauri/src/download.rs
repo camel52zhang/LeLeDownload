@@ -56,14 +56,6 @@ impl Default for DownloadStatus {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct ChunkInfo {
-    start: u64,
-    end: u64,
-    downloaded: u64,
-}
-
 fn get_available_space(path: &str) -> Result<u64, String> {
     #[cfg(windows)]
     {
