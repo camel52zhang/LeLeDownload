@@ -150,19 +150,43 @@ fn sanitize_filename(name: &str) -> String {
     out
 }
 
+/// 判断字符串是否「形似 URL query 串」——例如 Chrome 在 downloads.onCreated
+/// 时刻从 URL 推导出的文件名 `format=epub&lang=zh&page=...`（维基文库
+/// ws-export 导出链接整条 URL 都是 query，Anubis 挑战通过前 Chrome 只能推导出
+/// 这个串）。这种串不是真实文件名：真实名在响应头 content-disposition 里，
+/// 应由 extract_filename 解析。
+/// 判定标准（与扩展侧 looksLikeUrlQueryString 一致）：
+/// - 同时含 `=` 与 `&`；或
+/// - 以 `?` 开头；或
+/// - 含 `%` 且 percent-decode 后含 `=`（如 `page=%E4%B8%AD...` 形态）。
+/// 纯函数、可单测；正常文件名（`中山狼傳.epub`、`download` 等）不得命中。
+fn looks_like_url_query_string(s: &str) -> bool {
+    if s.starts_with('?') {
+        return true;
+    }
+    if s.contains('=') && s.contains('&') {
+        return true;
+    }
+    s.contains('%') && percent_decode(s).contains('=')
+}
+
 /// 选择最终文件名：
 /// - 调用方显式指定的真实文件名优先（如网盘解析拿到的服务器文件名，可能含中文/括号）；
-/// - 为空/纯空白时返回 None，由调用方回退到 URL 末段 / content-disposition 推导。
+/// - 为空/纯空白、或形似 URL query 串（onCreated 时刻 Chrome 的 URL 推导名）时返回
+///   None，由调用方回退到 extract_filename（从 content-disposition 拿真实名）。
 /// 抽成纯函数便于单测，避免百度直链末段哈希串被当成文件名。
 fn pick_explicit_filename(explicit: Option<&str>) -> Option<String> {
-    explicit.filter(|s| !s.trim().is_empty()).map(|s| {
-        let cleaned = sanitize_filename(s);
-        if cleaned.is_empty() {
-            "download".to_string()
-        } else {
-            cleaned
-        }
-    })
+    explicit
+        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !looks_like_url_query_string(s))
+        .map(|s| {
+            let cleaned = sanitize_filename(s);
+            if cleaned.is_empty() {
+                "download".to_string()
+            } else {
+                cleaned
+            }
+        })
 }
 
 /// 下载同名文件时避免互相覆盖：若 `dir/filename` 已存在，自动改名保留全部。
@@ -378,6 +402,56 @@ fn with_headers(
         }
     }
     builder
+}
+
+/// Anubis（within.website）工作量证明挑战页特征串（比对时统一转小写）。
+/// 命中任意一个即认为响应体是挑战页而非文件内容。
+/// 实证：ws-export.wmcloud.org 对浏览器 UA 返回 7534 字节挑战页，
+/// 头部即含 `anubis_challenge` / `within.website` /
+/// `Making sure you're not a bot!` / `xess.min.css`。
+const ANUBIS_CHALLENGE_SIGNATURES: [&str; 4] = [
+    "anubis_challenge",
+    "within.website",
+    "making sure you're not a bot",
+    "xess.min.css",
+];
+
+/// 嗅探响应体前 4096 字节是否命中 Anubis 挑战页特征（大小写不敏感）。
+/// 纯函数、可单测。本函数是 F1 原生 UA 重试的唯一触发判据（发版前收紧：
+/// content-type text/html 或项已移除，因会误伤合法 .html 文件下载）——
+/// 因此「合法 HTML 不得命中」是承重属性：EPUB（`PK\x03\x04`）/ PDF（`%PDF`）
+/// 等二进制文件头、普通网页/错误页 HTML 与空切片一律 false。
+fn looks_like_anubis_challenge(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(4096)];
+    let text = String::from_utf8_lossy(head).to_lowercase();
+    ANUBIS_CHALLENGE_SIGNATURES
+        .iter()
+        .any(|sig| text.contains(sig))
+}
+
+/// 用户自定义头里是否实际携带 UA 头（key 大小写无关）。
+/// 仅当主请求带了浏览器 UA 时 Anubis 才返回挑战页——此时「用原生 UA 重试 /
+/// 再探测」才有意义；主请求本就是原生 UA（headers 无 UA 键）还被挑战，
+/// 拿同样的原生 UA 再试一次毫无意义（直接判失败）。
+fn headers_have_user_agent(headers: &Option<HashMap<String, String>>) -> bool {
+    headers
+        .as_ref()
+        .map(|h| h.keys().any(|k| k.trim().eq_ignore_ascii_case("user-agent")))
+        .unwrap_or(false)
+}
+
+/// 完成标记前的字节数校正（纯函数，便于单测）：
+/// - content-length 缺失（total_size==0，Anubis 挑战页/分块编码响应均无
+///   content-length）时，用实际下载字节回填 total_size，避免 UI 显示「0 B」；
+/// - downloaded_size 一律采用实际下载字节数，不再覆盖成 total_size
+///   （无 content-length 时 total_size 为 0，旧代码会把实际字节数冲掉）。
+fn finalize_downloaded_sizes(total_size: u64, downloaded: u64) -> (u64, u64) {
+    let final_total = if total_size == 0 && downloaded > 0 {
+        downloaded
+    } else {
+        total_size
+    };
+    (final_total, downloaded)
 }
 
 impl DownloadManager {
@@ -641,6 +715,7 @@ impl DownloadManager {
                 rate_limiter.clone(),
                 client,
                 headers,
+                false,
             ).await
         } else {
             // Multi-threaded chunked download（支持断点续传：已完成的 .part 分片直接跳过，
@@ -807,10 +882,18 @@ impl DownloadManager {
                 // Merge all part files into the final file
                 Self::merge_chunks(&save_path, num_chunks as usize).await?;
 
+                // 修复(F2)：与 download_single 同一校正——以实际落盘字节为准，
+                // content-length 缺失时回填 total_size（多线程路径正常 total_size>0，
+                // 此处保持语义一致，并防服务端谎报 content-length 时显示假字节）。
+                let (final_total, final_downloaded) = finalize_downloaded_sizes(
+                    total_size,
+                    downloaded_total.load(Ordering::Relaxed),
+                );
                 if let Some(t) = tasks.write().await.get_mut(&task_id) {
                     t.status = DownloadStatus::Completed;
                     t.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    t.downloaded_size = t.total_size;
+                    t.total_size = final_total;
+                    t.downloaded_size = final_downloaded;
                     t.progress = 100.0;
                 }
                 let _ = app_handle.emit("download-completed", &task_id);
@@ -862,6 +945,10 @@ impl DownloadManager {
         rate_limiter: RateLimiter,
         client: reqwest::Client,
         headers: Option<HashMap<String, String>>,
+        // 修复(F1)：是否已用「原生 UA、无用户自定义头」重试过。false=首轮（可能带
+        // 浏览器 UA 被 Anubis 挑战）；true=原生 UA 重试轮（再被挑战即判失败，
+        // 不得标记 Completed）。调用方 download_file 首轮传 false。
+        anubis_retry: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 断点续传：若目标文件已存在，从已下载字节处 Range 续传
         let mut resume_from = fs::metadata(&save_path).map(|m| m.len()).unwrap_or(0);
@@ -872,6 +959,19 @@ impl DownloadManager {
             with_headers(client.get(&url), &headers)
         };
         let response = request.send().await?;
+
+        // 修复(F1)：非 2xx 直接失败。旧代码不检查状态码，会把 4xx/5xx 错误页
+        // （如 403 挑战页、404 页面）当文件流式写入并标记 Completed。
+        // 错误信息带状态码，风格与 classify_download_error 一致。
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(format!(
+                "HTTP {} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Error")
+            )
+            .into());
+        }
 
         // 关键安全校验：很多服务器会忽略 Range 头并返回 200（完整文件）。
         // 若服务端未返回 206 Partial Content，则说明续传未生效，必须当作全新下载处理：
@@ -928,7 +1028,66 @@ impl DownloadManager {
         let start_time = Instant::now();
         let mut last_update = Instant::now();
 
+        let mut first_chunk = true;
         while let Some(chunk_result) = stream_next_with_retry(&mut stream, 3).await? {
+            // 修复(F1)：首个 chunk 嗅探 Anubis 挑战页。Anubis 只挑战浏览器 UA——
+            // 扩展下发的任务带 Chrome UA（+ 可能已过期的挑战 cookie）时拿到的是
+            // 挑战页而非文件。此时放弃当前流，用 client 原生 UA（不带任何用户
+            // 自定义头）重试一次：原生 UA 被 Anubis 直接放行，能拿到真文件
+            // （实测 HEAD 200 + content-disposition + accept-ranges）。
+            //
+            // 收紧（发版前 QA 回归）：触发条件仅认 looks_like_anubis_challenge
+            // 特征串，不再带 content-type text/html 或项。活体证据：特征串在
+            // 挑战页 HTML 前 300 字节内必现（xess.min.css 位于 head 早期），
+            // reqwest 首 chunk 通常一次拿到整个 7.5KB 页面，即使 chunk 仅 1KB
+            // 也能命中——text/html 或项没有实际判别价值，且会误伤合法 .html
+            // 文件下载（用户带浏览器 UA 下 .html 真文件时触发原生 UA 重试，
+            // 站点对 LeLe-Download/1.0 返回 4xx/5xx 会被 F1 非 2xx 检查判
+            // Failed，而旧行为是下载成功）。
+            // 行为变化：合法 text/html 文件不再触发重试，保持旧行为续传下载。
+            if first_chunk {
+                first_chunk = false;
+                let is_anubis = looks_like_anubis_challenge(chunk_result.as_ref());
+                if is_anubis {
+                    if !anubis_retry {
+                        if headers_have_user_agent(&headers) {
+                            // writer 尚未收到任何数据：drop(tx) 令其退出后递归重试。
+                            // 文件已被 writer create/truncate，重试会重新创建，无副作用。
+                            // 异步 fn 递归需 Box::pin（E0733）。
+                            drop(tx);
+                            let _ = writer_handle.await;
+                            tracing::info!("检测到 Anubis 挑战页，改用原生 UA 重试: {}", task_id);
+                            return Box::pin(Self::download_single(
+                                task_id,
+                                url,
+                                save_path,
+                                tasks,
+                                cancel_flags,
+                                app_handle,
+                                rate_limiter,
+                                client,
+                                None,
+                                true,
+                            ))
+                            .await;
+                        }
+                        // 主请求本就是原生 UA（用户头无 UA 键）仍命中挑战特征：
+                        // 拿同样的原生 UA 重试无意义，直接判失败
+                        drop(tx);
+                        let _ = writer_handle.await;
+                        return Err(
+                            "服务器返回 Anubis 验证页而非文件内容（原生 UA 仍被拦截）".into()
+                        );
+                    }
+                    // 原生 UA 重试后仍命中挑战特征：绝不标记 Completed
+                    drop(tx);
+                    let _ = writer_handle.await;
+                    return Err(
+                        "服务器返回 Anubis 验证页而非文件内容（已用原生 UA 重试仍被拦截）".into()
+                    );
+                }
+            }
+
             if let Some(ref flag) = cancel_flag {
                 if flag.load(Ordering::Relaxed) {
                     drop(tx);
@@ -977,10 +1136,15 @@ impl DownloadManager {
         drop(tx);
         let _ = writer_handle.await;
 
+        // 修复(F2)：无 content-length（total_size==0）时用实际下载字节回填 total_size；
+        // downloaded_size 采用实际字节数，不再覆盖成 total_size（旧代码在无
+        // content-length 时把实际字节冲成 0，UI 显示「0 B 已完成」）。
+        let (final_total, final_downloaded) = finalize_downloaded_sizes(total_size, downloaded);
         if let Some(t) = tasks.write().await.get_mut(&task_id) {
             t.status = DownloadStatus::Completed;
             t.completed_at = Some(chrono::Utc::now().to_rfc3339());
-            t.downloaded_size = t.total_size;
+            t.total_size = final_total;
+            t.downloaded_size = final_downloaded;
             t.progress = 100.0;
         }
 
@@ -1174,23 +1338,18 @@ impl DownloadManager {
     }
 
     async fn extract_filename(&self, url: &str, headers: &Option<HashMap<String, String>>) -> Result<String, String> {
-        // HEAD 探测；部分服务器对 HEAD 返回 405/403，fallback 到 GET Range:0-0
-        // 分享链接场景：HEAD/GET 均携带调用方自定义头，确保会话绑定资源可正确返回文件名。
-        let response = match with_headers(self.client.head(url), headers).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => match with_headers(self.client.get(url).header("Range", "bytes=0-0"), headers).send().await {
-                Ok(r) => r,
-                Err(e) => return Err(e.to_string()),
-            },
-        };
+        // 第一段：带调用方自定义头探测（分享链接场景的会话绑定资源必须带头才能拿到真实文件名）。
+        // 部分服务器对 HEAD 返回 405/403，fallback 到 GET Range:0-0。
+        let mut filename = self.probe_content_disposition_filename(url, headers).await;
 
-        let mut filename = None;
-        if let Some(disposition) = response.headers().get("content-disposition") {
-            if let Ok(disposition_str) = disposition.to_str() {
-                // 修复(P1)：优先 RFC 5987 filename*=UTF-8''... 以支持 Unicode 文件名，
-                // 再回退到传统 filename="..."
-                filename = parse_content_disposition(disposition_str);
-            }
+        // 第二段（修复 F3）：带头探测没拿到 content-disposition 时，用 client 原生 UA
+        // （LeLe-Download/1.0，非浏览器 UA）再探测一次。Anubis 只挑战浏览器 UA、
+        // 直接放行原生 UA 并返回 `content-disposition: attachment; filename=xxx.epub`；
+        // 非 Anubis 站点第一段已拿到 disposition，不会进入本段，行为与原来完全一致。
+        // 与 F1 重试同款前置条件：仅当用户头实际携带 UA 头时才值得再探
+        // （主请求本就是原生 UA 时再探一次是重复请求，毫无意义）。
+        if filename.is_none() && headers_have_user_agent(headers) {
+            filename = self.probe_content_disposition_filename(url, &None).await;
         }
 
         if filename.is_none() {
@@ -1218,6 +1377,37 @@ impl DownloadManager {
         // 清洗：去除路径穿越与 Windows/macOS 非法字符，避免写出越界文件或非法名
         let cleaned = sanitize_filename(&filename.unwrap());
         Ok(if cleaned.is_empty() { "download".to_string() } else { cleaned })
+    }
+
+    /// 探测 URL 响应头中的 content-disposition 文件名（无则 None）。
+    /// 先 HEAD；HEAD 非 2xx 时 fallback GET Range:0-0（部分 CDN/对象存储对 HEAD
+    /// 返回 405/403）。GET fallback 的响应不论状态码都参与 disposition 解析
+    /// （与旧逻辑一致：403 等无 disposition 时由调用方走 URL 兜底链）。
+    /// 探测请求本身失败（网络错误等）返回 None，由调用方决定换 UA 再探或走兜底。
+    async fn probe_content_disposition_filename(
+        &self,
+        url: &str,
+        headers: &Option<HashMap<String, String>>,
+    ) -> Option<String> {
+        let response = match with_headers(self.client.head(url), headers).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => {
+                match with_headers(self.client.get(url).header("Range", "bytes=0-0"), headers)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => return None,
+                }
+            }
+        };
+        response
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            // 修复(P1)：优先 RFC 5987 filename*=UTF-8''... 以支持 Unicode 文件名，
+            // 再回退到传统 filename="..."
+            .and_then(parse_content_disposition)
     }
 
 }
@@ -1348,6 +1538,113 @@ mod tests {
                 pick_explicit_filename(Some("a*b:.txt")),
                 Some("ab.txt".to_string())
             );
+        }
+
+        #[test]
+        fn test_looks_like_anubis_challenge() {
+            // 真实 Anubis 挑战页头部字节（ws-export.wmcloud.org 实测 7534 字节页的首部，
+            // 含 title/stylesheet/JS 跳转三类特征）
+            let real_page_head: &[u8] = b"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Making sure you're not a bot!</title>\n<link rel=\"stylesheet\" href=\"/.within.website/xess/min/xess.min.css\">\n</head>\n<body>\n<h1>Making sure you're not a bot!</h1>\n<p>Anubis is a way to prove you are not a bot.</p>\n<script>window.location = \"/.within.website/x/cmd/anubis/api/pass-challenge?response=anubis_challenge&challenge=abc\"</script>\n</body>\n</html>\n";
+            assert!(looks_like_anubis_challenge(real_page_head));
+
+            // 逐特征独立命中：保证任一特征串被删/改坏都能被本测试发现（变异校验用）
+            assert!(looks_like_anubis_challenge(b"<script>challenge=anubis_challenge</script>"));
+            assert!(looks_like_anubis_challenge(
+                b"<a href=\"/.within.website/x/cmd/anubis/api/pass-challenge\">"
+            ));
+            assert!(looks_like_anubis_challenge(b"<title>Making sure you're not a bot!</title>"));
+            assert!(looks_like_anubis_challenge(b"<link rel=\"stylesheet\" href=\"xess.min.css\">"));
+
+            // 大小写不敏感
+            assert!(looks_like_anubis_challenge(b"ANUBIS_CHALLENGE"));
+            assert!(looks_like_anubis_challenge(b"MAKING SURE YOU'RE NOT A BOT!"));
+
+            // 反例：真文件与普通网页不得误报
+            let mut epub = vec![0x50u8, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x08, 0x08];
+            epub.extend((0..512u32).map(|i| (i * 7 % 256) as u8));
+            assert!(!looks_like_anubis_challenge(&epub), "EPUB (ZIP magic) 不得命中");
+            assert!(
+                !looks_like_anubis_challenge(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>"),
+                "PDF 不得命中"
+            );
+            assert!(
+                !looks_like_anubis_challenge(b"<!doctype html><html><body>404 Not Found</body></html>"),
+                "普通 HTML 错误页不得命中"
+            );
+            assert!(
+                !looks_like_anubis_challenge(
+                    b"<!doctype html><html><head><title>My Page</title></head><body>hello</body></html>"
+                ),
+                "合法 .html 文件不得命中（收紧后它是唯一触发判据，误判会打断正常下载）"
+            );
+            assert!(!looks_like_anubis_challenge(b""), "空切片不得命中");
+
+            // 边界：只嗅探前 4096 字节——特征串落在 4096 之后不得命中
+            let mut far = vec![b'x'; 4200];
+            far.extend_from_slice(b"anubis_challenge");
+            assert!(!looks_like_anubis_challenge(&far));
+        }
+
+        #[test]
+        fn test_looks_like_url_query_string() {
+            // query 串形态（Chrome onCreated 时刻从 ws-export URL 推导出的文件名）
+            assert!(looks_like_url_query_string("format=epub&lang=zh&page=x"));
+            assert!(looks_like_url_query_string("?a=b"));
+            assert!(looks_like_url_query_string("page=%E4%B8%AD%E5%B1%B1%E7%8B%BC%E5%82%B3"));
+            // 反例：正常文件名不得命中
+            assert!(!looks_like_url_query_string("中山狼傳.epub"));
+            assert!(!looks_like_url_query_string("Far East Spring 2027_001.pdf"));
+            assert!(!looks_like_url_query_string("醒名花.mobi"));
+            assert!(!looks_like_url_query_string("bc8df8d8c2-147_165756-0.html"));
+            assert!(!looks_like_url_query_string("download"));
+            // 单侧形态（只含 = 或只含 &）不判定为 query 串，可能是合法文件名
+            assert!(!looks_like_url_query_string("key=value.txt"));
+            assert!(!looks_like_url_query_string("Tom & Jerry.pdf"));
+            // 含 % 但 decode 后无 =（百分号非编码用途）不命中
+            assert!(!looks_like_url_query_string("100%_done.txt"));
+        }
+
+        #[test]
+        fn test_pick_explicit_filename_rejects_query_string_shape() {
+            // onCreated 时刻 Chrome 从 URL 推导出的 query 串 → None
+            // （迫使调用方 create_download 回退 extract_filename 从 content-disposition 拿真实名）
+            assert_eq!(pick_explicit_filename(Some("format=epub&lang=zh&page=x")), None);
+            assert_eq!(pick_explicit_filename(Some("?format=epub&lang=zh")), None);
+            assert_eq!(pick_explicit_filename(Some("page=%E4%B8%AD%E5%B1%B1%E7%8B%BC%E5%82%B3")), None);
+            // 反例保护：真实文件名必须照常透传
+            assert_eq!(
+                pick_explicit_filename(Some("中山狼傳.epub")),
+                Some("中山狼傳.epub".to_string())
+            );
+            assert_eq!(
+                pick_explicit_filename(Some("Far East Spring 2027_001.pdf")),
+                Some("Far East Spring 2027_001.pdf".to_string())
+            );
+            assert_eq!(
+                pick_explicit_filename(Some("醒名花.mobi")),
+                Some("醒名花.mobi".to_string())
+            );
+            assert_eq!(
+                pick_explicit_filename(Some("bc8df8d8c2-147_165756-0.html")),
+                Some("bc8df8d8c2-147_165756-0.html".to_string())
+            );
+            assert_eq!(
+                pick_explicit_filename(Some("download")),
+                Some("download".to_string())
+            );
+        }
+
+        #[test]
+        fn test_finalize_downloaded_sizes() {
+            // 有 content-length 且收满：total 不变，downloaded 用实际字节
+            assert_eq!(finalize_downloaded_sizes(22358, 22358), (22358, 22358));
+            // 服务端少发（content-length 1000 实收 800）：显示真实字节，不谎报
+            assert_eq!(finalize_downloaded_sizes(1000, 800), (1000, 800));
+            // 无 content-length（Anubis 挑战页/分块编码响应曾 total=0）：用实际字节回填。
+            // 修复前 downloaded_size 被覆盖成 total_size=0，UI 显示「0 B 已完成」
+            assert_eq!(finalize_downloaded_sizes(0, 7534), (7534, 7534));
+            // 空下载：保持 0
+            assert_eq!(finalize_downloaded_sizes(0, 0), (0, 0));
         }
 
         #[test]

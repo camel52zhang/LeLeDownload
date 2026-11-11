@@ -1,7 +1,8 @@
 // 回归测试：自动接管通用分支的「浏览器请求上下文」组装
 // （对应 extension/background.js 中 buildBrowserHeaders / readCookieStringForUrl /
 //   getBrowserUA / shouldSkipAutoCapture / fallbackFilenameFromUrl /
-//   buildDownloadPostBody / planGenericCapture / handleGenericCapture / onCreated 监听器）
+//   looksLikeUrlQueryString / buildDownloadPostBody / planGenericCapture /
+//   handleGenericCapture / onCreated 监听器）
 //
 // 目的：验证 downloads.onCreated 通用分支对「先过 JS 反爬挑战再给文件」站点
 // （维基文库 EPUB/MOBI/PDF 导出，域名 ws-export.wmcloud.org，被 Anubis 工作量证明
@@ -9,11 +10,16 @@
 //   Cookie（该 URL 的浏览器会话 cookie）+ User-Agent（真实浏览器 UA）+ Referer
 // 并与 item.filename 一并 POST 给 App，让 App 下到真文件而非挑战页 HTML；
 // cookie 组装失败 → 回退无头发送（旧行为）；Cookie 按 UTF-8 字节超 8000 → 放弃接管
-// （不发送、不取消浏览器下载，保留原生下载兜底）。
+// （不发送、不取消浏览器下载，保留原生下载兜底）；item.filename 形似 URL query 串
+// （Anubis 挑战通过前 Chrome 的 URL 推导名）→ 不透传 filename，由 App 从
+// content-disposition 解析真实名。
 //
 // 纯函数逻辑与 onCreated 处理器在本文件内照搬 background.js 实现（node --test 无 chrome
 // 运行环境），chrome.* API 以 globalThis.chrome 打桩模拟，sendToLeleDownload 以桩记录调用；
-// 另设「镜像一致性」用例直读 background.js / magnet-context.js 源码，防常量漂移。
+// 另设「镜像一致性」用例直读 background.js / magnet-context.js 源码，防常量漂移；
+// F5 起新增「生产代码真身」提取（extractFunctionSource + new Function 求值
+// background.js 的 looksLikeUrlQueryString / buildDownloadPostBody），
+// 断言直接作用于生产代码，镜像只做行为对照。
 //
 // 运行： node --test extension/test-anubis-oncreated.mjs
 
@@ -123,12 +129,24 @@ function fallbackFilenameFromUrl(url) {
   }
 }
 
+function looksLikeUrlQueryString(name) {
+  if (!name || typeof name !== 'string') return false;
+  if (name.indexOf('?') === 0) return true;
+  if (name.indexOf('=') !== -1 && name.indexOf('&') !== -1) return true;
+  if (name.indexOf('%') !== -1) {
+    try {
+      if (decodeURIComponent(name).indexOf('=') !== -1) return true;
+    } catch (_) { /* 含孤立 % 时 decodeURIComponent 抛错，按不含 = 处理 */ }
+  }
+  return false;
+}
+
 function buildDownloadPostBody(url, headers, filename) {
   const body = { url: url, timestamp: Date.now() };
   if (headers && typeof headers === 'object' && Object.keys(headers).length > 0) {
     body.headers = headers;
   }
-  if (filename) {
+  if (filename && !looksLikeUrlQueryString(filename)) {
     body.filename = filename;
   }
   return body;
@@ -196,6 +214,42 @@ function handleOnCreated(item) {
   if (isWetransferDownloadUrl(item.url)) return 'wetransfer';
   handleGenericCapture(item, filename).catch(() => {});
   return 'generic';
+}
+
+// ---------------------------------------------------------------------------
+// 生产代码真身提取：直读 background.js 源码，把 looksLikeUrlQueryString 与
+// buildDownloadPostBody 抠出来在同一作用域求值（new Function），使断言直接作用于
+// 生产代码——镜像只做行为对照，真身才是变异校验的靶子（改坏 background.js 必红）。
+// ---------------------------------------------------------------------------
+
+function extractFunctionSource(src, name) {
+  const start = src.indexOf('function ' + name + '(');
+  if (start === -1) return null;
+  const braceStart = src.indexOf('{', start);
+  if (braceStart === -1) return null;
+  let depth = 0;
+  for (let i = braceStart; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function loadRealPostBodyFns() {
+  const bgSrc = readFileSync(new URL('./background.js', import.meta.url), 'utf8');
+  const fnSrc = extractFunctionSource(bgSrc, 'looksLikeUrlQueryString');
+  const bodySrc = extractFunctionSource(bgSrc, 'buildDownloadPostBody');
+  assert.ok(fnSrc, 'background.js 应定义 looksLikeUrlQueryString');
+  assert.ok(bodySrc, 'background.js 应定义 buildDownloadPostBody');
+  const factory = new Function(
+    fnSrc + '\n' + bodySrc +
+    '\nreturn { looksLikeUrlQueryString: looksLikeUrlQueryString, buildDownloadPostBody: buildDownloadPostBody };'
+  );
+  return factory();
 }
 
 // ---------------------------------------------------------------------------
@@ -694,4 +748,96 @@ test('镜像一致性：background.js 常量与 magnet-context.js 键名应与�
     bgSrc.includes('new TextEncoder().encode(cookie).length'),
     'background.js 应按 UTF-8 实测字节判定 Cookie 长度'
   );
+
+  // F5：POST body 组装前必须过滤形似 URL query 串的 filename（与 App 侧
+  // pick_explicit_filename 的 looks_like_url_query_string 同标准、双保险）
+  assert.ok(
+    bgSrc.includes('if (filename && !looksLikeUrlQueryString(filename))'),
+    'background.js 组装 POST body 前应过滤形似 query 串的 filename'
+  );
+  assert.ok(
+    extractFunctionSource(bgSrc, 'looksLikeUrlQueryString') !== null,
+    'background.js 应定义纯函数 looksLikeUrlQueryString'
+  );
+});
+
+// 15) F5 核心：onCreated 的 item.filename 为 query 串（Anubis 挑战通过前 Chrome 只能
+//     从 ws-export URL 推导出 'format=epub&lang=zh&page=...'）时，POST body 不含
+//     filename 字段——真实名由 App 从 content-disposition 解析（App extract_filename
+//     已做原生 UA 二次探测，Anubis 放行原生 UA）。url/浏览器请求上下文照常下发。
+//     断言用 background.js 生产代码真身（loadRealPostBodyFns），改坏生产代码必红。
+test('onCreated 的 item.filename 为 query 串时 POST body 不含 filename 字段', async () => {
+  resetState();
+  installChromeMock({
+    storageData: { lele_browser_ua: 'Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36' },
+    cookieList: [{ name: 'techaro.lua-anubis-cookie', value: 'proof-abc' }]
+  });
+  const item = {
+    id: 77,
+    url: WSEXPORT_URL,
+    referrer: 'https://zh.wikisource.org/wiki/x',
+    filename: 'format=epub&lang=zh&page=x'
+  };
+
+  handleOnCreated(item);
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(sentCalls.length, 1, '仍应下发一次（url/headers 不受影响）');
+  const call = sentCalls[0];
+  assert.equal(call.url, WSEXPORT_URL, 'url 照常下发');
+  assert.ok(call.headers['Cookie'].includes('proof-abc'), '浏览器请求上下文照常下发');
+
+  // 生产代码真身组装 POST body：query 串 filename 必须被过滤
+  const real = loadRealPostBodyFns();
+  const body = real.buildDownloadPostBody(call.url, call.headers, call.filename);
+  assert.equal('filename' in body, false, 'query 串 filename 不得进入 POST body');
+  assert.equal(body.url, WSEXPORT_URL);
+  assert.equal(body.headers['Cookie'], call.headers['Cookie']);
+
+  // 镜像与生产代码行为一致（防镜像漂移）
+  const mirrorBody = buildDownloadPostBody(call.url, call.headers, call.filename);
+  assert.equal('filename' in mirrorBody, false, '镜像组装同样不得含 query 串 filename');
+});
+
+// 16) F5 反例保护：正常文件名（含中文/空格/哈希串/html）仍透传，其他平台不受影响
+test('正常文件名的 POST body 仍含 filename 字段（反例保护）', () => {
+  const real = loadRealPostBodyFns();
+  const keep = [
+    'test.epub',
+    '希臘公廈.epub',
+    '中山狼傳.epub',
+    'Far East Spring 2027_001.pdf',
+    '醒名花.mobi',
+    'bc8df8d8c2-147_165756-0.html',
+    'download'
+  ];
+  for (const name of keep) {
+    const body = real.buildDownloadPostBody('https://example.com/a', { Cookie: 'x=1' }, name);
+    assert.equal(body.filename, name, name + ' 应照常透传');
+  }
+});
+
+// 17) F5 单元：background.js 生产代码 looksLikeUrlQueryString 判定矩阵
+//     （与 Rust 侧 looks_like_url_query_string 同标准：含=且含& / 以?开头 /
+//       decode 后含=；正常文件名不得命中）
+test('background.js looksLikeUrlQueryString 判定矩阵（生产代码真身）', () => {
+  const f = loadRealPostBodyFns().looksLikeUrlQueryString;
+  // query 串形态 → true
+  assert.equal(f('format=epub&lang=zh&page=x'), true);
+  assert.equal(f('?a=b'), true);
+  assert.equal(f('page=%E4%B8%AD%E5%B1%B1%E7%8B%BC%E5%82%B3'), true);
+  // 正常文件名 → false
+  assert.equal(f('test.epub'), false);
+  assert.equal(f('希臘公廈.epub'), false);
+  assert.equal(f('Far East Spring 2027_001.pdf'), false);
+  assert.equal(f('bc8df8d8c2-147_165756-0.html'), false);
+  assert.equal(f('download'), false);
+  // 单侧形态（只含 = 或只含 &）与百分号非编码用途不命中
+  assert.equal(f('key=value.txt'), false);
+  assert.equal(f('Tom & Jerry.pdf'), false);
+  assert.equal(f('100%_done.txt'), false);
+  // 边界：空值/非字符串不命中
+  assert.equal(f(''), false);
+  assert.equal(f(undefined), false);
+  assert.equal(f(null), false);
 });

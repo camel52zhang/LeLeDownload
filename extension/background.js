@@ -100,15 +100,38 @@ async function isAppOnline() {
   }
 }
 
+// 判断文件名是否形似 URL query 串。Chrome 在 downloads.onCreated 时刻给出的
+// item.filename 可能只是从 URL 推导出的 query 串——维基文库 ws-export 导出链接
+// （/?format=epub&lang=zh&page=...）整条 URL 都是 query，Anubis 挑战通过前
+// Chrome 只能推导出 `format=epub&lang=zh&page=...` 这种串，透传给 App 会被
+// 当成任务名落盘。判定标准与 App 侧 pick_explicit_filename 的
+// looks_like_url_query_string 一致：
+//   含 '=' 且含 '&'、或以 '?' 开头、或 percent-decode 后含 '='。
+// 命中则不传 filename，让 App 从 content-disposition 解析真实名
+// （App extract_filename 已做原生 UA 二次探测，Anubis 场景可用）。
+function looksLikeUrlQueryString(name) {
+  if (!name || typeof name !== 'string') return false;
+  if (name.indexOf('?') === 0) return true;
+  if (name.indexOf('=') !== -1 && name.indexOf('&') !== -1) return true;
+  if (name.indexOf('%') !== -1) {
+    try {
+      if (decodeURIComponent(name).indexOf('=') !== -1) return true;
+    } catch (_) { /* 含孤立 % 时 decodeURIComponent 抛错，按不含 = 处理 */ }
+  }
+  return false;
+}
+
 // 组装 POST /download 请求体（纯函数，便于单测）：url + timestamp + 可选 headers/filename。
-// filename 透传后 App 会跳过 extract_filename 的 HEAD 探测 —— Anubis 挑战页对 HEAD
-// 同样返回 text/html，不跳过会得到错误文件名（如 '?format=epub&lang=zh&page=...'）。
+// filename 透传后 App 会跳过 extract_filename 的 HEAD 探测 —— 但形似 URL query 串的
+// filename（onCreated 时刻 Chrome 的 URL 推导名，如 '?format=epub&lang=zh&page=...'）
+// 不透传：App 侧 pick_explicit_filename 会拒绝它并回退 extract_filename，
+// 从 content-disposition 拿真实名（原生 UA 二次探测对 Anubis 站点有效）。
 function buildDownloadPostBody(url, headers, filename) {
   const body = { url: url, timestamp: Date.now() };
   if (headers && typeof headers === 'object' && Object.keys(headers).length > 0) {
     body.headers = headers;
   }
-  if (filename) {
+  if (filename && !looksLikeUrlQueryString(filename)) {
     body.filename = filename;
   }
   return body;
