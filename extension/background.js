@@ -14,6 +14,18 @@ self.addEventListener('error', function (e) {
 const APP_BASE = 'http://127.0.0.1:45678';
 const MENU_ID = 'lele_download';
 
+// 桌面 Chrome UA 兜底常量：magnet-context.js 上报的真实浏览器 UA 缺失时使用
+// （Anubis 等反爬可能把 cookie 绑定浏览器 UA，App 侧 UA 必须像浏览器）。
+const DEFAULT_CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// magnet-context.js 每次在页面执行时把 navigator.userAgent 写入该 storage 键，
+// SW 组装下载请求头时优先读取（SW 自身无 navigator，拿不到真实 UA）。
+const BROWSER_UA_STORAGE_KEY = 'lele_browser_ua';
+
+// Cookie 头上限：超过 16KB 判定异常（App 侧 sanitize_headers 也会因单头超 8KB 丢弃该头），
+// 此时回退无头发送，避免下发一个必然被 App 清洗掉的头。
+const MAX_COOKIE_HEADER_BYTES = 16384;
+
 // 自动接管开关（由 popup 设置，存于 chrome.storage.local.autoCapture）
 let autoCapture = true;
 
@@ -83,17 +95,30 @@ async function isAppOnline() {
   }
 }
 
+// 组装 POST /download 请求体（纯函数，便于单测）：url + timestamp + 可选 headers/filename。
+// filename 透传后 App 会跳过 extract_filename 的 HEAD 探测 —— Anubis 挑战页对 HEAD
+// 同样返回 text/html，不跳过会得到错误文件名（如 '?format=epub&lang=zh&page=...'）。
+function buildDownloadPostBody(url, headers, filename) {
+  const body = { url: url, timestamp: Date.now() };
+  if (headers && typeof headers === 'object' && Object.keys(headers).length > 0) {
+    body.headers = headers;
+  }
+  if (filename) {
+    body.filename = filename;
+  }
+  return body;
+}
+
 // 发送下载链接到桌面应用（返回是否成功）。
 // headers 为可选：分享链接场景由 content-script 上报真实文件请求头（含 Cookie/Referer），
+// 自动接管场景由 buildBrowserHeaders 组装浏览器请求上下文（Anubis 反爬站点必需），
 // 经此透传给 App 引擎带自定义头下载；旧路径（右键/onCreated/popup）不传 headers，行为完全不变。
-async function sendToLeleDownload(url, headers) {
+// filename 为可选：onCreated 时浏览器已填充 item.filename，透传可跳过 App 侧 HEAD 探测。
+async function sendToLeleDownload(url, headers, filename) {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const body = { url: url, timestamp: Date.now() };
-    if (headers && typeof headers === 'object' && Object.keys(headers).length > 0) {
-      body.headers = headers;
-    }
+    const body = buildDownloadPostBody(url, headers, filename);
     const response = await fetch(APP_BASE + '/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -303,34 +328,91 @@ function assembleWetransferHeaders(cookieString) {
   return headers;
 }
 
+// 用 chrome.cookies.getAll 读取指定 URL 可见的 Cookie，拼成 "k=v; k=v"（按名去重，后者覆盖前者）。
+// buildWetransferHeaders / buildBrowserHeaders 共用。
+// 任何失败（无 chrome.cookies / lastError / 同步抛错）都向上抛，由调用方决定降级策略：
+// WeTransfer 路径降级为无 Cookie 头（仍带 UA/Referer/Origin），通用路径降级为整组无头发送。
+async function readCookieStringForUrl(url) {
+  if (typeof chrome === 'undefined' || !chrome.cookies || typeof chrome.cookies.getAll !== 'function') {
+    throw new Error('chrome.cookies.getAll 不可用');
+  }
+  const cks = await new Promise((resolve, reject) => {
+    try {
+      chrome.cookies.getAll({ url: url }, (cks) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || 'cookies.getAll failed'));
+          return;
+        }
+        resolve(cks || []);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+  const list = cks || [];
+  const map = Object.create(null);
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    const pair = c.name + '=' + c.value;
+    const idx = pair.indexOf('=');
+    if (idx > 0) {
+      const name = pair.slice(0, idx).trim();
+      if (name) map[name] = pair.trim(); // 按名去重，后者覆盖前者
+    }
+  }
+  return Object.keys(map).map((k) => map[k]).join('; ');
+}
+
+// 读取 magnet-context.js 上报的真实浏览器 UA；缺失（从未打开过 http(s) 页面 /
+// storage 读取失败）时回退桌面 Chrome UA 常量。不抛错，保证调用方总能拿到 UA。
+function getBrowserUA() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get([BROWSER_UA_STORAGE_KEY], (res) => {
+        if (chrome.runtime.lastError) {
+          resolve(DEFAULT_CHROME_UA);
+          return;
+        }
+        const ua = res && res[BROWSER_UA_STORAGE_KEY];
+        resolve(typeof ua === 'string' && ua ? ua : DEFAULT_CHROME_UA);
+      });
+    } catch (_) {
+      resolve(DEFAULT_CHROME_UA);
+    }
+  });
+}
+
+// 组装「浏览器请求上下文」下载头（通用）：把浏览器发起的下载请求所带的上下文转给 App。
+//   User-Agent：真实浏览器 UA（magnet-context.js 上报，兜底桌面 Chrome 常量）
+//   Referer   ：item.referrer（下载来源页，反爬常校验）
+//   Cookie    ：该 URL 在浏览器里的会话 Cookie（含 HttpOnly，按名去重）
+//
+// 解决「先过 JS 反爬挑战再给文件」站点的接管失效（如维基文库 EPUB/MOBI/PDF 导出，
+// 域名 ws-export.wmcloud.org，被 Anubis 工作量证明挑战把守）：
+// chrome.downloads.onCreated 触发时浏览器已持挑战通过的 cookie，但 App 的 reqwest
+// 是全新请求（无 cookie / 非浏览器 UA），只会拿到挑战页 HTML，存不下真文件。
+//
+// 已知限制（服务端策略，扩展无法绕过，失败时靠「不取消浏览器下载」兜底回退原生下载）：
+//   - 服务端可能把 cookie 绑定浏览器 UA，此时 App UA 与浏览器不一致仍会被拒；
+//   - cookie 会过期，长时间后首次下载可能仍拿到挑战页；
+//   - 跨域重定向时首方 cookie 不适用（浏览器只在最终响应域上重放）。
+async function buildBrowserHeaders(url, referrer) {
+  const headers = {};
+  const ua = await getBrowserUA();
+  if (ua) headers['User-Agent'] = ua;
+  if (referrer) headers['Referer'] = referrer;
+  const cookieString = await readCookieStringForUrl(url); // 失败抛错 → 调用方回退无头发送
+  if (cookieString) headers['Cookie'] = cookieString;
+  return headers;
+}
+
 // 用 chrome.cookies.getAll 取 wetransfer.com 的会话 Cookie，拼成 Cookie 头后组装完整下载头。
 // background service worker 无 document，故仅用 chrome.cookies.getAll（含 HttpOnly）。
+// cookie 读取失败时降级为无 Cookie 头（仍带 UA/Referer/Origin），行为与旧版一致。
 async function buildWetransferHeaders() {
   let cookieString = '';
   try {
-    if (typeof chrome !== 'undefined' && chrome.cookies && typeof chrome.cookies.getAll === 'function') {
-      const cks = await new Promise((resolve) => {
-        chrome.cookies.getAll({ url: 'https://wetransfer.com/' }, (cks) => {
-          if (chrome.runtime.lastError) {
-            resolve([]);
-            return;
-          }
-          resolve(cks || []);
-        });
-      });
-      const list = cks || [];
-      const map = Object.create(null);
-      for (let i = 0; i < list.length; i++) {
-        const c = list[i];
-        const pair = c.name + '=' + c.value;
-        const idx = pair.indexOf('=');
-        if (idx > 0) {
-          const name = pair.slice(0, idx).trim();
-          if (name) map[name] = pair.trim(); // 按名去重，后者覆盖前者
-        }
-      }
-      cookieString = Object.keys(map).map((k) => map[k]).join('; ');
-    }
+    cookieString = await readCookieStringForUrl('https://wetransfer.com/');
   } catch (_) { /* cookie 不可用时 Cookie 头为空，仍带 UA/Referer/Origin */ }
   return assembleWetransferHeaders(cookieString);
 }
@@ -350,14 +432,66 @@ function isWetransferCaptureCooling(url) {
   return false;
 }
 
+// 自动接管跳过判定（纯函数，便于单测）：非 http(s) URL 与 addon 商店域名不接管，
+// 不干扰浏览器自身行为（blob:/data:/magnet: 及扩展商店页下载）。
+function shouldSkipAutoCapture(url) {
+  if (!/^https?:\/\//i.test(url || '')) return true;
+  if (/addons\.mozilla\.org|chromewebstore\.google\.com|edgedaddons\.microsoft\.com/i.test(url || '')) return true;
+  return false;
+}
+
+// 从 URL 推导兜底文件名（item.filename 缺失时用）：剥掉 query/hash 后取末段路径。
+// ws-export 这类整条 URL 都是 query 的（/?format=epub&lang=zh&page=...）会得到空串，
+// 由调用方继续回退到 item.url（App 侧还会再 sanitize）。
+function fallbackFilenameFromUrl(url) {
+  try {
+    const seg = new URL(url).pathname.split('/').pop();
+    return seg || '';
+  } catch (_) {
+    return (url || '').split('/').pop() || '';
+  }
+}
+
+// 自动接管通用分支：组装浏览器请求上下文（Cookie/UA/Referer）+ 显式文件名后下发 App。
+// 组装抛错或 Cookie 头超长 → 回退无头发送（即旧行为），绝不阻塞接管。
+async function captureDownloadItem(item, filename) {
+  let headers = null;
+  try {
+    headers = await buildBrowserHeaders(item.url, item.referrer);
+    if (headers['Cookie'] && headers['Cookie'].length > MAX_COOKIE_HEADER_BYTES) {
+      console.log('[乐乐] Cookie 头超过', MAX_COOKIE_HEADER_BYTES, '字节，回退无头发送：', item.url);
+      headers = null;
+    }
+  } catch (e) {
+    console.log('[乐乐] 浏览器请求上下文组装失败，回退无头接管：', e);
+    headers = null;
+  }
+  return sendToLeleDownload(item.url, headers || undefined, filename);
+}
+
+// 通用分支善后：仅 App 确认接收（res.ok）才取消浏览器默认下载并通知；
+// App 离线 / 接管失败时保持浏览器原生下载不取消（兜底逻辑与旧版一致）。
+async function handleGenericCapture(item, filename) {
+  const res = await captureDownloadItem(item, filename);
+  if (res.ok) {
+    try {
+      chrome.downloads.cancel(item.id);
+      chrome.downloads.erase({ id: item.id });
+    } catch (_) { /* Firefox 部分版本 cancel 行为差异，忽略 */ }
+    notify('乐乐下载器已接管：' + filename);
+  }
+  // 未成功（App 离线）：保持浏览器原生下载，不取消
+  return res;
+}
+
 // 自动接管：浏览器开始任何 http(s) 下载时，交由乐乐下载器接管（类似 IDM 体验）。
+// 通用分支带浏览器请求上下文（Anubis 反爬站点如维基文库导出必需）；
 // WeTransfer 原生下载（/download/ 代理）额外带浏览器头，确保 App 端能真正下到正确文件。
 chrome.downloads.onCreated.addListener((item) => {
   if (!autoCapture) return;
-  if (!/^https?:\/\//i.test(item.url || '')) return;
-  if (/addons\.mozilla\.org|chromewebstore\.google\.com|edgedaddons\.microsoft\.com/i.test(item.url || '')) return;
+  if (shouldSkipAutoCapture(item.url)) return;
 
-  const filename = item.filename || (item.url || '').split('/').pop() || item.url;
+  const filename = item.filename || fallbackFilenameFromUrl(item.url) || item.url;
 
   // WeTransfer 原生下载：带浏览器头接管（含去重冷却）
   if (isWetransferDownloadUrl(item.url)) {
@@ -386,17 +520,10 @@ chrome.downloads.onCreated.addListener((item) => {
     return;
   }
 
-  console.log('[乐乐] 检测到下载，尝试接管：', item.url);
-  // 先尝试把链接交给 App；成功才取消浏览器默认下载，避免 App 未运行时误伤。
-  sendToLeleDownload(item.url).then((res) => {
-    if (res.ok) {
-      try {
-        chrome.downloads.cancel(item.id);
-        chrome.downloads.erase({ id: item.id });
-      } catch (_) { /* Firefox 部分版本 cancel 行为差异，忽略 */ }
-      notify('乐乐下载器已接管：' + filename);
-    }
-    // 未成功（App 离线）：保持浏览器原生下载，不取消
+  console.log('[乐乐] 检测到下载，尝试带浏览器上下文接管：', item.url);
+  // 先尝试把链接（含浏览器请求上下文 + 文件名）交给 App；成功才取消浏览器默认下载，避免 App 未运行时误伤。
+  handleGenericCapture(item, filename).catch((e) => {
+    console.log('[乐乐] 接管处理异常：', e);
   });
 });
 

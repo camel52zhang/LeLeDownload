@@ -7,6 +7,15 @@
   'use strict';
   var SCHEMES = ['magnet:', 'thunder:', 'ed2k:', 'ftp:', 'ftps:'];
 
+  // 每次执行时把真实浏览器 UA 写入 storage，供 background 的自动接管组装下载请求头：
+  // Anubis 等反爬站点可能把 cookie 绑定浏览器 UA，App 侧请求必须带浏览器 UA。
+  // SW 自身无 navigator 拿不到真实 UA，只能靠本内容脚本（已注入所有 http(s) 页面）上报。
+  try {
+    if (navigator.userAgent) {
+      chrome.storage.local.set({ lele_browser_ua: navigator.userAgent });
+    }
+  } catch (_) {}
+
   function findMagnetInText(text) {
     if (!text) return null;
     var m = text.match(/magnet:\?[^\s"'<>]+/i) ||

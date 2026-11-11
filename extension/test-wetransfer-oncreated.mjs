@@ -57,34 +57,45 @@ function assembleWetransferHeaders(cookieString) {
   return headers;
 }
 
+// 用 chrome.cookies.getAll 读取指定 URL 可见的 Cookie，拼成 "k=v; k=v"（按名去重，后者覆盖前者）。
+// 与 extension/background.js 中 readCookieStringForUrl 实现一致（失败抛错，由调用方降级）。
+async function readCookieStringForUrl(url) {
+  if (typeof chrome === 'undefined' || !chrome.cookies || typeof chrome.cookies.getAll !== 'function') {
+    throw new Error('chrome.cookies.getAll 不可用');
+  }
+  const cks = await new Promise((resolve, reject) => {
+    try {
+      chrome.cookies.getAll({ url: url }, (cks) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || 'cookies.getAll failed'));
+          return;
+        }
+        resolve(cks || []);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+  const list = cks || [];
+  const map = Object.create(null);
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    const pair = c.name + '=' + c.value;
+    const idx = pair.indexOf('=');
+    if (idx > 0) {
+      const name = pair.slice(0, idx).trim();
+      if (name) map[name] = pair.trim(); // 按名去重，后者覆盖前者
+    }
+  }
+  return Object.keys(map).map((k) => map[k]).join('; ');
+}
+
 // 用 chrome.cookies.getAll 取 wetransfer.com 的会话 Cookie，拼成 Cookie 头后组装完整下载头。
 // 与 background.js 实现一致，仅读取 globalThis.chrome（测试中以打桩替换）。
 async function buildWetransferHeaders() {
   let cookieString = '';
   try {
-    if (typeof chrome !== 'undefined' && chrome.cookies && typeof chrome.cookies.getAll === 'function') {
-      const cks = await new Promise((resolve) => {
-        chrome.cookies.getAll({ url: 'https://wetransfer.com/' }, (cks) => {
-          if (chrome.runtime.lastError) {
-            resolve([]);
-            return;
-          }
-          resolve(cks || []);
-        });
-      });
-      const list = cks || [];
-      const map = Object.create(null);
-      for (let i = 0; i < list.length; i++) {
-        const c = list[i];
-        const pair = c.name + '=' + c.value;
-        const idx = pair.indexOf('=');
-        if (idx > 0) {
-          const name = pair.slice(0, idx).trim();
-          if (name) map[name] = pair.trim(); // 按名去重，后者覆盖前者
-        }
-      }
-      cookieString = Object.keys(map).map((k) => map[k]).join('; ');
-    }
+    cookieString = await readCookieStringForUrl('https://wetransfer.com/');
   } catch (_) { /* cookie 不可用时 Cookie 头为空，仍带 UA/Referer/Origin */ }
   return assembleWetransferHeaders(cookieString);
 }

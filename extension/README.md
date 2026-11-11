@@ -7,7 +7,10 @@
 ## 功能
 
 - **自动接管**（默认开）：浏览器开始任何 `http(s)` 下载时，自动取消浏览器默认下载，
-  交由乐乐下载器接管（类似 IDM）。可在弹窗里关闭此开关。
+  交由乐乐下载器接管（类似 IDM）。接管时会把**浏览器请求上下文**（该站点的会话 Cookie、
+  真实浏览器 UA、来源页 Referer）与文件名一并转给 App，用于应对「先过 JS 反爬挑战再给文件」
+  的站点（如维基文库 EPUB/MOBI/PDF 导出 `ws-export.wmcloud.org`，被 Anubis 工作量证明挑战
+  把守，直接请求只会拿到挑战页 HTML）。可在弹窗里关闭此开关。
 - **右键菜单**：在链接 / 图片 / 视频 / 音频 / 页面上右键 →「使用乐乐下载器下载」。
 - **弹窗手动添加**：点击扩展图标，粘贴链接 → 开始下载。
 - **自动接管开关**：弹窗内可实时开/关。
@@ -94,6 +97,7 @@ extension/
 ├── test-netdisk-resolver.mjs     # 回归测试：平台识别 + 体积格式化
 ├── test-isLikelyFileRequest.mjs  # 回归测试：文件请求判定
 ├── test-wetransfer-oncreated.mjs # 回归测试：WeTransfer 接管
+├── test-anubis-oncreated.mjs     # 回归测试：Anubis 反爬站点接管（浏览器请求上下文）
 └── icons/                        # 16/48/128 图标
 ```
 
@@ -106,4 +110,7 @@ node --test extension/*.mjs
 ## 说明
 
 - 自动接管会跳过 `blob:`、`data:` 及浏览器扩展商店等地址，不干扰浏览器自身行为。
+- 自动接管对 Anubis 等反爬站点会携带浏览器 Cookie/UA/Referer，已知限制：
+  服务端可能把 cookie 绑定浏览器 UA（此时 App 的 UA 与浏览器不一致仍会失败，
+  自动回退浏览器原生下载）；cookie 会过期；跨域重定向时首方 cookie 不适用。
 - 通信仅限本机回环地址；仅在显式设置 `LELE_HTTP_TOKEN` 环境变量时才启用鉴权。
