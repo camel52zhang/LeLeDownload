@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "lele_download"
-version = "26.11.10"
+version = "26.11.11"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
