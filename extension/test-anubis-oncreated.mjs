@@ -1,22 +1,25 @@
 // 回归测试：自动接管通用分支的「浏览器请求上下文」组装
 // （对应 extension/background.js 中 buildBrowserHeaders / readCookieStringForUrl /
 //   getBrowserUA / shouldSkipAutoCapture / fallbackFilenameFromUrl /
-//   buildDownloadPostBody / captureDownloadItem / handleGenericCapture / onCreated 监听器）
+//   buildDownloadPostBody / planGenericCapture / handleGenericCapture / onCreated 监听器）
 //
 // 目的：验证 downloads.onCreated 通用分支对「先过 JS 反爬挑战再给文件」站点
 // （维基文库 EPUB/MOBI/PDF 导出，域名 ws-export.wmcloud.org，被 Anubis 工作量证明
 // 挑战把守，第一跳只返回 text/html 挑战页）能组装出浏览器请求上下文：
 //   Cookie（该 URL 的浏览器会话 cookie）+ User-Agent（真实浏览器 UA）+ Referer
 // 并与 item.filename 一并 POST 给 App，让 App 下到真文件而非挑战页 HTML；
-// 组装失败 / Cookie 超长 → 回退无头发送，兜底（不取消浏览器下载）行为不变。
+// cookie 组装失败 → 回退无头发送（旧行为）；Cookie 按 UTF-8 字节超 8000 → 放弃接管
+// （不发送、不取消浏览器下载，保留原生下载兜底）。
 //
 // 纯函数逻辑与 onCreated 处理器在本文件内照搬 background.js 实现（node --test 无 chrome
-// 运行环境），chrome.* API 以 globalThis.chrome 打桩模拟，sendToLeleDownload 以桩记录调用。
+// 运行环境），chrome.* API 以 globalThis.chrome 打桩模拟，sendToLeleDownload 以桩记录调用；
+// 另设「镜像一致性」用例直读 background.js / magnet-context.js 源码，防常量漂移。
 //
 // 运行： node --test extension/test-anubis-oncreated.mjs
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
 // 以下实现与 extension/background.js 中对应函数保持一致（chrome.* 经 globalThis 打桩）
@@ -24,7 +27,9 @@ import assert from 'node:assert/strict';
 
 const DEFAULT_CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const BROWSER_UA_STORAGE_KEY = 'lele_browser_ua';
-const MAX_COOKIE_HEADER_BYTES = 16384;
+// 与 background.js 一致：按 UTF-8 字节计的 8000 阈值（App sanitize_headers 对 >8192
+// 字节的头静默丢弃，见 src-tauri/src/main.rs:214，留 192 字节余量）。
+const MAX_COOKIE_HEADER_BYTES = 8000;
 
 // WeTransfer 下载地址判定（通用分支前的专用分支，本文件只验证「不误入」）
 function isWetransferDownloadUrl(url) {
@@ -129,7 +134,9 @@ function buildDownloadPostBody(url, headers, filename) {
   return body;
 }
 
-// 以下三者为 onCreated 处理器骨架的镜像（sendToLeleDownload / notify 以桩替换）
+// 以下为 onCreated 处理器骨架的镜像（sendToLeleDownload / notify 以桩替换）
+// 注意：planGenericCapture 的超限判定必须与 background.js 一致——按 UTF-8 实测字节
+// （TextEncoder），超限返回 { send: false }（放弃接管），而非回退无头发送。
 
 let autoCapture = true;
 let sendResult = { ok: true };
@@ -146,21 +153,31 @@ function notify(message) {
   notifyCalls.push(message);
 }
 
-async function captureDownloadItem(item, filename) {
-  let headers = null;
+async function planGenericCapture(item) {
+  let headers;
   try {
     headers = await buildBrowserHeaders(item.url, item.referrer);
-    if (headers['Cookie'] && headers['Cookie'].length > MAX_COOKIE_HEADER_BYTES) {
-      headers = null;
-    }
   } catch (e) {
-    headers = null;
+    // cookie 组装本身失败：保持旧行为「无头发送」，不扩大行为变更面
+    return { send: true, headers: undefined };
   }
-  return sendToLeleDownload(item.url, headers || undefined, filename);
+  const cookie = headers['Cookie'];
+  if (cookie) {
+    const cookieBytes = new TextEncoder().encode(cookie).length;
+    if (cookieBytes > MAX_COOKIE_HEADER_BYTES) {
+      notifyCalls.push('Cookie 过大，本次不接管，保留浏览器下载');
+      return { send: false };
+    }
+  }
+  return { send: true, headers: headers };
 }
 
 async function handleGenericCapture(item, filename) {
-  const res = await captureDownloadItem(item, filename);
+  const plan = await planGenericCapture(item);
+  if (!plan.send) {
+    return { ok: false, abandoned: true };
+  }
+  const res = await sendToLeleDownload(item.url, plan.headers, filename);
   if (res.ok) {
     try {
       chrome.downloads.cancel(item.id);
@@ -362,35 +379,100 @@ test('无 chrome.cookies 命名空间时应回退无头发送', async () => {
   assert.equal(sentCalls[0].headers, undefined);
 });
 
-// 4) 健壮性：Cookie 头超过 16KB → 回退无头发送（App 侧也会因单头超 8KB 丢弃）
-test('Cookie 头超过 16KB 时应回退无头发送', async () => {
+// 4) P1 修正：Cookie 头按 UTF-8 字节超过 8000 → 放弃接管（不发送、不 cancel/erase、
+//    不通知「已接管」），仅提示为何未接管；浏览器原生下载继续，用户至少能下到正确文件。
+//    背景：App sanitize_headers 对 >8192 字节的头静默丢弃（main.rs:214），硬接管只会
+//    存下挑战页垃圾文件，而浏览器下载已被取消——放弃接管是唯一安全降级。
+test('Cookie 头超过 8000 字节应放弃接管：不发送、不取消浏览器下载', async () => {
   resetState();
-  installChromeMock({
+  const calls = installChromeMock({
     storageData: { lele_browser_ua: 'Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36' },
-    cookieList: [{ name: 'huge', value: 'x'.repeat(17000) }]
+    cookieList: [{ name: 'huge', value: 'x'.repeat(8000) }] // 'huge=' + 8000 = 8005 字节 > 8000
   });
 
   handleOnCreated(WSEXPORT_ITEM);
   await new Promise((r) => setTimeout(r, 0));
 
-  assert.equal(sentCalls.length, 1);
-  assert.equal(sentCalls[0].headers, undefined, '超长 Cookie 应回退无头发送');
+  assert.equal(sentCalls.length, 0, '超限应放弃接管，不得发送（含不得回退无头发送）');
+  assert.deepEqual(calls.cancel, [], '放弃接管不得 cancel 浏览器下载');
+  assert.deepEqual(calls.erase, [], '放弃接管不得 erase 浏览器下载');
+  assert.ok(
+    notifyCalls.some((m) => m.includes('Cookie 过大')),
+    '应通知用户本次为何未接管，避免困惑'
+  );
+  assert.equal(
+    notifyCalls.some((m) => m.includes('已接管')),
+    false,
+    '放弃接管不得发出「已接管」通知'
+  );
 });
 
-// 4b) 边界：Cookie 头未超限（含 16KB 整）应正常携带
-test('Cookie 头未超限时应正常携带下发', async () => {
+// 4b) 边界：8000 字节整（未超限）应正常携带；8001 字节（超 1 字节）即放弃接管
+test('Cookie 头 8000/8001 字节边界：整限携带、超一字节放弃接管', async () => {
+  // 4b-i) 'ok=' + 7996 个 x = 8000 字节整 → 未超限，正常携带
   resetState();
-  const value = 'x'.repeat(16384 - 'ok='.length);
+  const valueAtLimit = 'x'.repeat(8000 - 'ok='.length);
   installChromeMock({
     storageData: { lele_browser_ua: 'Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36' },
-    cookieList: [{ name: 'ok', value: value }]
+    cookieList: [{ name: 'ok', value: valueAtLimit }]
   });
 
   handleOnCreated(WSEXPORT_ITEM);
   await new Promise((r) => setTimeout(r, 0));
 
-  assert.equal(sentCalls.length, 1);
-  assert.equal(sentCalls[0].headers['Cookie'], 'ok=' + value, '未超限 Cookie 应携带');
+  assert.equal(sentCalls.length, 1, '8000 字节整未超限，应发送');
+  assert.equal(sentCalls[0].headers['Cookie'], 'ok=' + valueAtLimit, '未超限 Cookie 应携带');
+
+  // 4b-ii) 'ok=' + 7997 个 x = 8001 字节 → 超 1 字节，放弃接管
+  resetState();
+  const valueOverLimit = 'x'.repeat(8001 - 'ok='.length);
+  const calls2 = installChromeMock({
+    storageData: { lele_browser_ua: 'Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36' },
+    cookieList: [{ name: 'ok', value: valueOverLimit }]
+  });
+
+  handleOnCreated(WSEXPORT_ITEM);
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(sentCalls.length, 0, '8001 字节超限，应放弃接管');
+  assert.deepEqual(calls2.cancel, []);
+  assert.deepEqual(calls2.erase, []);
+});
+
+// 4c) UTF-16/UTF-8 单位差专治：CJK cookie 字符数远小于 8000，但 UTF-8 字节数超 8000
+//     （1 个中文字符 = 1 个 UTF-16 码元 = 3 个 UTF-8 字节）。按 .length（码元）判断会漏过。
+test('CJK cookie 码元数不超限但字节数超限时应放弃接管（UTF-8 实测）', async () => {
+  // 4c-i) 'zh=' + 2666 个中文字符：码元数 3+2666=2669 < 8000，字节数 3+3*2666=8001 > 8000 → 放弃
+  resetState();
+  const cjkOver = '中'.repeat(2666);
+  assert.ok(('zh=' + cjkOver).length < 8000, '前提：码元数未超限');
+  assert.equal(new TextEncoder().encode('zh=' + cjkOver).length, 8001, '前提：字节数超限');
+  const callsA = installChromeMock({
+    storageData: { lele_browser_ua: 'Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36' },
+    cookieList: [{ name: 'zh', value: cjkOver }]
+  });
+
+  handleOnCreated(WSEXPORT_ITEM);
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(sentCalls.length, 0, '字节数超限应放弃接管（不能被码元数蒙混过关）');
+  assert.deepEqual(callsA.cancel, []);
+  assert.deepEqual(callsA.erase, []);
+
+  // 4c-ii) 对照组：'zh=' + 2665 个中文字符 = 7998 字节 ≤ 8000 → 正常携带
+  resetState();
+  const cjkAtLimit = '中'.repeat(2665);
+  assert.equal(new TextEncoder().encode('zh=' + cjkAtLimit).length, 7998);
+  installChromeMock({
+    storageData: { lele_browser_ua: 'Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36' },
+    cookieList: [{ name: 'zh', value: cjkAtLimit }]
+  });
+
+  handleOnCreated(WSEXPORT_ITEM);
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(sentCalls.length, 1, '7998 字节未超限，应发送');
+  assert.equal(sentCalls[0].headers['Cookie'], 'zh=' + cjkAtLimit);
 });
 
 // 5) cookie jar 为空（该域无 cookie）不是错误：仍带 UA/Referer，仅无 Cookie 头
@@ -563,4 +645,53 @@ test('WeTransfer 下载 URL 应走专用分支而非通用分支', async () => {
   assert.equal(branch, 'wetransfer');
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(sentCalls.length, 0, '专用分支由 background.js 内既有链路处理，本镜像不模拟其发送');
+});
+
+// 13) P2：autoCapture=false（弹窗关闭自动接管）时 onCreated 完全不发送、不动浏览器下载
+test('autoCapture=false 时 onCreated 应完全不发送', async () => {
+  resetState();
+  const calls = installChromeMock({
+    storageData: { lele_browser_ua: 'Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36' },
+    cookieList: [{ name: 'techaro.lol-anubis-auth-abc', value: 'jwt' }]
+  });
+  autoCapture = false;
+
+  assert.equal(handleOnCreated(WSEXPORT_ITEM), 'skipped-off');
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(sentCalls.length, 0, '开关关闭时不得发送');
+  assert.deepEqual(calls.cancel, [], '开关关闭时不得 cancel');
+  assert.deepEqual(calls.erase, [], '开关关闭时不得 erase');
+  assert.equal(notifyCalls.length, 0, '开关关闭时不得通知');
+});
+
+// 14) 镜像一致性：直读 background.js / magnet-context.js 源码，防本文件镜像漂移。
+//     尤其守护 P1 修正后的两个关键常量：阈值 8000（UTF-8 字节）与 UA storage 键名。
+test('镜像一致性：background.js 常量与 magnet-context.js 键名应与本测试一致', () => {
+  const bgSrc = readFileSync(new URL('./background.js', import.meta.url), 'utf8');
+  const magnetSrc = readFileSync(new URL('./magnet-context.js', import.meta.url), 'utf8');
+
+  // 阈值：8000 字节（对齐 App sanitize_headers 的 8192 头上限，main.rs:214）
+  assert.ok(
+    bgSrc.includes('MAX_COOKIE_HEADER_BYTES = 8000'),
+    'background.js 的 MAX_COOKIE_HEADER_BYTES 应为 8000'
+  );
+  assert.equal(MAX_COOKIE_HEADER_BYTES, 8000, '本测试镜像阈值应为 8000');
+
+  // UA 上报键名：magnet-context.js 写入 ↔ background.js 读取必须同一键
+  assert.ok(
+    bgSrc.includes("BROWSER_UA_STORAGE_KEY = 'lele_browser_ua'"),
+    "background.js 应定义 BROWSER_UA_STORAGE_KEY = 'lele_browser_ua'"
+  );
+  assert.ok(
+    magnetSrc.includes('lele_browser_ua'),
+    'magnet-context.js 应写入同一 storage 键 lele_browser_ua'
+  );
+  assert.equal(BROWSER_UA_STORAGE_KEY, 'lele_browser_ua', '本测试镜像键名应为 lele_browser_ua');
+
+  // 超限判定必须按 UTF-8 实测字节（TextEncoder），而非字符串 .length（UTF-16 码元）
+  assert.ok(
+    bgSrc.includes('new TextEncoder().encode(cookie).length'),
+    'background.js 应按 UTF-8 实测字节判定 Cookie 长度'
+  );
 });

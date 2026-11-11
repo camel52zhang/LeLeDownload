@@ -14,17 +14,22 @@ self.addEventListener('error', function (e) {
 const APP_BASE = 'http://127.0.0.1:45678';
 const MENU_ID = 'lele_download';
 
-// 桌面 Chrome UA 兜底常量：magnet-context.js 上报的真实浏览器 UA 缺失时使用
-// （Anubis 等反爬可能把 cookie 绑定浏览器 UA，App 侧 UA 必须像浏览器）。
+// 桌面 Chrome UA 兜底常量：magnet-context.js 上报的真实浏览器 UA 缺失时使用。
+// 防御性措施——实测（2026-11-11）wmcloud 的 Anubis 不绑 UA，但其他部署可能开启 UA 绑定。
 const DEFAULT_CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // magnet-context.js 每次在页面执行时把 navigator.userAgent 写入该 storage 键，
 // SW 组装下载请求头时优先读取（SW 自身无 navigator，拿不到真实 UA）。
 const BROWSER_UA_STORAGE_KEY = 'lele_browser_ua';
 
-// Cookie 头上限：超过 16KB 判定异常（App 侧 sanitize_headers 也会因单头超 8KB 丢弃该头），
-// 此时回退无头发送，避免下发一个必然被 App 清洗掉的头。
-const MAX_COOKIE_HEADER_BYTES = 16384;
+// Cookie 头上限（UTF-8 实测字节，TextEncoder 编码后取 length；JS 字符串 .length 是
+// UTF-16 码元，cookie 含 CJK 时 1 码元 = 3 字节，按码元数判断会漏过超长头）。
+// App 侧 sanitize_headers 对值长 > 8192 字节的头是静默 continue 丢弃
+// （src-tauri/src/main.rs:214），不是拒绝请求——8192~上限之间的 Cookie 发下去会被
+// App 悄悄剥掉，reqwest 无 cookie 请求 Anubis 站点只会拿到挑战页 HTML、存成垃圾文件，
+// 而浏览器下载已被取消，用户静默受损。故阈值收紧到 8000，给 App 的 8192 值长上限
+// 留 192 字节余量；超限则放弃接管（见 planGenericCapture），保留浏览器原生下载。
+const MAX_COOKIE_HEADER_BYTES = 8000;
 
 // 自动接管开关（由 popup 设置，存于 chrome.storage.local.autoCapture）
 let autoCapture = true;
@@ -392,9 +397,18 @@ function getBrowserUA() {
 // chrome.downloads.onCreated 触发时浏览器已持挑战通过的 cookie，但 App 的 reqwest
 // 是全新请求（无 cookie / 非浏览器 UA），只会拿到挑战页 HTML，存不下真文件。
 //
-// 已知限制（服务端策略，扩展无法绕过，失败时靠「不取消浏览器下载」兜底回退原生下载）：
-//   - 服务端可能把 cookie 绑定浏览器 UA，此时 App UA 与浏览器不一致仍会被拒；
-//   - cookie 会过期，长时间后首次下载可能仍拿到挑战页；
+// Anubis 挑战机制（主理人 2026-11-11 端到端 PoW 实验实证）：
+//   - 「fast」算法：sha256(randomData + nonce) 的十六进制以 difficulty 个 '0' 开头
+//     （wmcloud 为 difficulty 2，约 1 个零字节，秒级完成）；
+//   - 过挑战后服务端 Set-Cookie `techaro.lol-anubis-auth-*`（Ed25519 签名的 JWT，
+//     有效期约 7 天），浏览器持它重新请求才拿到真文件；
+//   - 挑战页自身还会下发 `techaro.lol-anubis-cookie-verification-*` 与一个空 auth
+//     cookie，chrome.cookies.getAll 会一并带上，无害。
+//
+// 已知限制（服务端策略，扩展无法绕过，失败时靠「不接管/不取消浏览器下载」兜底）：
+//   - UA 不绑定实证：同一 auth cookie 配完全不同的 UA 仍能下到真文件（实验 [6] 组），
+//     真实 UA 采集是防御性措施，供其他可能开启 UA 绑定的部署兜底；
+//   - auth cookie 有效期约 7 天，会过期，长时间后首次下载可能仍拿到挑战页；
 //   - 跨域重定向时首方 cookie 不适用（浏览器只在最终响应域上重放）。
 async function buildBrowserHeaders(url, referrer) {
   const headers = {};
@@ -452,27 +466,44 @@ function fallbackFilenameFromUrl(url) {
   }
 }
 
-// 自动接管通用分支：组装浏览器请求上下文（Cookie/UA/Referer）+ 显式文件名后下发 App。
-// 组装抛错或 Cookie 头超长 → 回退无头发送（即旧行为），绝不阻塞接管。
-async function captureDownloadItem(item, filename) {
-  let headers = null;
+// 通用接管的发送前决策（组装头 + 阈值判定，chrome API 打桩可测）：
+//   { send: true, headers }  —— 应发送（headers 为 undefined 表示无头发送的旧回退路径）
+//   { send: false }          —— 放弃接管：不发送、不 cancel/erase，保留浏览器原生下载
+// 超限判定按 UTF-8 实测字节（TextEncoder）：JS .length 是 UTF-16 码元，cookie 含 CJK 时
+// 1 码元 = 3 字节，按码元数判断会漏过超长头（如 7000 个中文字符 = 21000 字节）。
+// 超限时硬接管（带 UA/Referer 但 Cookie 必被 App 剥掉）在 cookie 门禁站点上只会拿到
+// 挑战页 HTML、存成垃圾文件，而浏览器下载已被取消——放弃接管是唯一安全降级。
+async function planGenericCapture(item) {
+  let headers;
   try {
     headers = await buildBrowserHeaders(item.url, item.referrer);
-    if (headers['Cookie'] && headers['Cookie'].length > MAX_COOKIE_HEADER_BYTES) {
-      console.log('[乐乐] Cookie 头超过', MAX_COOKIE_HEADER_BYTES, '字节，回退无头发送：', item.url);
-      headers = null;
-    }
   } catch (e) {
+    // cookie 组装本身失败（chrome.cookies.getAll 抛错等）：无从判断大小，
+    // 保持旧行为「无头发送」，不扩大行为变更面。
     console.log('[乐乐] 浏览器请求上下文组装失败，回退无头接管：', e);
-    headers = null;
+    return { send: true, headers: undefined };
   }
-  return sendToLeleDownload(item.url, headers || undefined, filename);
+  const cookie = headers['Cookie'];
+  if (cookie) {
+    const cookieBytes = new TextEncoder().encode(cookie).length;
+    if (cookieBytes > MAX_COOKIE_HEADER_BYTES) {
+      console.log('[乐乐] Cookie 头', cookieBytes, '字节 > 上限', MAX_COOKIE_HEADER_BYTES,
+        '，放弃接管，保留浏览器下载：', item.url);
+      notify('Cookie 过大，本次不接管，保留浏览器下载');
+      return { send: false };
+    }
+  }
+  return { send: true, headers: headers };
 }
 
 // 通用分支善后：仅 App 确认接收（res.ok）才取消浏览器默认下载并通知；
-// App 离线 / 接管失败时保持浏览器原生下载不取消（兜底逻辑与旧版一致）。
+// App 离线 / 接管失败 / 放弃接管时保持浏览器原生下载不取消（兜底逻辑与旧版一致）。
 async function handleGenericCapture(item, filename) {
-  const res = await captureDownloadItem(item, filename);
+  const plan = await planGenericCapture(item);
+  if (!plan.send) {
+    return { ok: false, abandoned: true };
+  }
+  const res = await sendToLeleDownload(item.url, plan.headers, filename);
   if (res.ok) {
     try {
       chrome.downloads.cancel(item.id);

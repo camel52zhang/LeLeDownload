@@ -272,3 +272,45 @@ test('不同 WeTransfer URL 的冷却应相互独立', () => {
   assert.equal(isWetransferCaptureCooling(urlA), false);
   assert.equal(isWetransferCaptureCooling(urlB), false, '不同 URL 不应被 urlA 的冷却阻塞');
 });
+
+// 10) P2：onCreated 的 WeTransfer 分支兜底不回退——仅 App 确认接收（res.ok）才
+//     cancel+erase 浏览器下载；App 拒绝/离线时保持浏览器原生下载，绝不误伤。
+//     镜像 background.js onCreated 中 WeTransfer 分支的 then 链（组装头 → 发送 → 善后）。
+test('WeTransfer 分支：App 未接收时不得 cancel/erase，接收后才取消', async () => {
+  const calls = { cancel: [], erase: [] };
+  globalThis.chrome = {
+    cookies: {
+      getAll: (opts, cb) => cb([{ name: '_wt_session', value: 'sess-1' }])
+    },
+    runtime: { lastError: null },
+    downloads: {
+      cancel: (id) => calls.cancel.push(id),
+      erase: (o) => calls.erase.push(o.id)
+    }
+  };
+
+  // 镜像 background.js 中 WeTransfer 分支的善后逻辑
+  async function handleWetransferBranch(item, sender) {
+    const headers = await buildWetransferHeaders();
+    const res = await sender(item.url, headers);
+    if (res.ok) {
+      chrome.downloads.cancel(item.id);
+      chrome.downloads.erase({ id: item.id });
+    }
+    return res;
+  }
+
+  const item = { id: 11, url: 'https://wetransfer.com/download/local-bartender?id=eyJhIjoiYiJ9' };
+
+  // 10a) App 未接收（res.ok=false）：不得取消浏览器下载
+  const resFail = await handleWetransferBranch(item, async () => ({ ok: false, msg: 'create_failed' }));
+  assert.equal(resFail.ok, false);
+  assert.deepEqual(calls.cancel, [], 'App 未接收不得 cancel');
+  assert.deepEqual(calls.erase, [], 'App 未接收不得 erase');
+
+  // 10b) App 确认接收（res.ok=true）：才 cancel+erase
+  const resOk = await handleWetransferBranch(item, async () => ({ ok: true }));
+  assert.equal(resOk.ok, true);
+  assert.deepEqual(calls.cancel, [11], 'App 接收后才 cancel');
+  assert.deepEqual(calls.erase, [11], 'App 接收后才 erase');
+});
