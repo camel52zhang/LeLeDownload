@@ -85,7 +85,7 @@ fn main() {
 
             let db_arc = Arc::new(RwLock::new(db));
             app.manage(db_arc.clone());
-            let dm = Arc::new(DownloadManager::new(handle.clone())?);
+            let dm = Arc::new(DownloadManager::new(handle.clone(), db_arc.clone())?);
             app.manage(dm.clone());
 
             // 网盘解析待办队列（App 内存态，不落盘）

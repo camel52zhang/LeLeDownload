@@ -1,8 +1,9 @@
 // Download Engine - Multi-threaded chunked download
+use crate::db::Database;
 use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
@@ -223,6 +224,50 @@ pub fn resolve_unique_path(dir: &str, filename: &str) -> PathBuf {
     }
 }
 
+/// 与 `resolve_unique_path` 逻辑一致，但唯一性判断同时考虑：
+/// 1) 磁盘上已存在的文件；
+/// 2) `reserved` 中已被其他 in-flight 任务占用的绝对路径。
+///
+/// 用于 one_shot 改名块：并发同名任务在 tasks 写锁内各自收集「其他任务已占用的
+/// save_path」并串行算路径，后者能看到前者刚写入的路径而顺延 _001/_002，
+/// 避免两个 writer 在 File::create 之前都看到目标不存在、选中同一路径互相覆盖。
+/// `resolve_unique_path` 本身保持不变（其它调用点不受影响）。
+fn resolve_unique_path_reserving(
+    dir: &str,
+    filename: &str,
+    reserved: &HashSet<String>,
+) -> PathBuf {
+    let path_key = |p: &PathBuf| p.to_string_lossy().to_string();
+
+    let dir_pb = PathBuf::from(dir);
+    let first = dir_pb.join(filename);
+    if !first.exists() && !reserved.contains(&path_key(&first)) {
+        return first;
+    }
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    let ext_suffix = ext.map(|e| format!(".{}", e)).unwrap_or_default();
+    let mut n: u32 = 1;
+    loop {
+        let cand = dir_pb.join(format!("{}_{:03}{}", stem, n, ext_suffix));
+        if !cand.exists() && !reserved.contains(&path_key(&cand)) {
+            return cand;
+        }
+        n = n.saturating_add(1);
+        if n > 999_999 {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            return dir_pb.join(format!("{}_{}{}", stem, t, ext_suffix));
+        }
+    }
+}
+
 /// 解析 content-disposition 头：优先 RFC 5987 `filename*=UTF-8''...`（Unicode），
 /// 再回退到传统 `filename="..."`。两者都无则返回 None。
 fn parse_content_disposition(disposition: &str) -> Option<String> {
@@ -274,6 +319,107 @@ fn hex_val(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+/// 从「下载那一次 GET」的响应头里解析一次性签名 URL（Google Slides /export/）
+/// 的真实文件名。主路径是 content-disposition（filename* RFC5987 优先），
+/// 缺失时退到 URL 末段（文档 ID）并按 exportFormat / content-type 补正确后缀。
+///
+/// 关键：只消费真实下载 GET 已返回的 headers，零额外请求——one_shot token 只能用
+/// 一次，任何额外探测都会让真下载 400。纯函数，便于用活体响应头样本单测。
+fn resolve_one_shot_filename(
+    url: &str,
+    disposition: Option<&str>,
+    content_type: Option<&str>,
+) -> Option<String> {
+    // 主路径：content-disposition（parse_content_disposition 内 filename* 优先）
+    let from_header = disposition.and_then(parse_content_disposition);
+    let had_header = from_header.is_some();
+
+    // 兜底 stem：URL 末段（Google 签名 URL 末段即文档 ID，无后缀）
+    let stem_source = match from_header {
+        Some(name) => name,
+        None => url::Url::parse(url).ok().and_then(|u| {
+            u.path_segments()
+                .and_then(|segments| segments.last().map(|s| s.to_string()))
+        })?,
+    };
+
+    let name = sanitize_filename(&stem_source);
+    if name.is_empty() {
+        return None;
+    }
+
+    // 已有合法后缀（如「FAR EAST FALL 2027.pptx」）直接返回
+    let has_ext = Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| !e.is_empty())
+        .unwrap_or(false);
+    if has_ext {
+        return Some(name);
+    }
+
+    // 无后缀：按 exportFormat 查询参数 / content-type 补全正确后缀
+    if let Some(ext) = export_extension_for(url, content_type) {
+        return Some(format!("{}.{}", name, ext));
+    }
+
+    // 极端：有真实名但推不出后缀（如纯文件名无后缀）→ 至少保留真实名
+    if had_header {
+        return Some(name);
+    }
+    None
+}
+
+/// 按 Google 导出 URL 的 `exportFormat` 查询参数或响应 content-type 推断后缀。
+/// 纯函数、可单测；两者都识别不了返回 None。
+fn export_extension_for(url: &str, content_type: Option<&str>) -> Option<&'static str> {
+    if let Ok(parsed) = url::Url::parse(url) {
+        for (k, v) in parsed.query_pairs() {
+            if k == "exportFormat" || k == "format" {
+                let ext = match v.to_ascii_lowercase().as_str() {
+                    "pptx" => "pptx",
+                    "odp" => "odp",
+                    "pdf" => "pdf",
+                    "txt" => "txt",
+                    "jpeg" | "jpg" => "jpg",
+                    "png" => "png",
+                    "svg" => "svg",
+                    "docx" => "docx",
+                    "xlsx" => "xlsx",
+                    "html" | "htm" => "html",
+                    "zip" => "zip",
+                    _ => "",
+                };
+                if !ext.is_empty() {
+                    return Some(ext);
+                }
+            }
+        }
+    }
+
+    let ct = content_type?
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match ct.as_str() {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "application/vnd.oasis.opendocument.presentation" => "odp",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "text/html" => "html",
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/svg+xml" => "svg",
+        "application/zip" => "zip",
+        _ => "",
+    };
+    if ext.is_empty() { None } else { Some(ext) }
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +497,9 @@ pub struct DownloadManager {
     tasks: Arc<TokioRwLock<HashMap<String, DownloadTask>>>,
     cancel_flags: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
     app_handle: tauri::AppHandle,
+    // 任务持久化：one_shot 下载改真实文件名后需回写 filename/save_path，
+    // 否则重启恢复（restore_task）又会显示文档 ID 旧名。
+    db: Option<Arc<TokioRwLock<Database>>>,
     config: Arc<TokioRwLock<DownloadConfig>>,
     // 共享限速值（字节/秒，0=不限速）：所有进行中下载的限速器引用同一份，
     // 设置变更时实时更新，使"下载中改限速"也能立即生效。
@@ -499,12 +648,13 @@ fn is_one_shot_signed_url(url: &str) -> bool {
 }
 
 impl DownloadManager {
-    pub fn new(app_handle: tauri::AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(app_handle: tauri::AppHandle, db: Arc<TokioRwLock<Database>>) -> Result<Self, Box<dyn std::error::Error>> {
         let config = DownloadConfig::default();
         Ok(Self {
             tasks: Arc::new(TokioRwLock::new(HashMap::new())),
             cancel_flags: Arc::new(TokioRwLock::new(HashMap::new())),
             app_handle,
+            db: Some(db),
             config: Arc::new(TokioRwLock::new(config.clone())),
             speed_limit_bps: Arc::new(AtomicU64::new(0)),
             client: reqwest::Client::builder()
@@ -621,7 +771,7 @@ impl DownloadManager {
         }
 
         // clone 所有需要传入后台任务的共享 Arc 字段（&self 无法移入 'static spawn，必须先克隆）
-        let (cancel_flags, tasks, app_handle, config, client, active_count, concurrency_notify, speed_limit) = (
+        let (cancel_flags, tasks, app_handle, config, client, active_count, concurrency_notify, speed_limit, db) = (
             self.cancel_flags.clone(),
             self.tasks.clone(),
             self.app_handle.clone(),
@@ -630,6 +780,7 @@ impl DownloadManager {
             self.active_count.clone(),
             self.concurrency_notify.clone(),
             self.speed_limit_bps.clone(),
+            self.db.clone(),
         );
 
         tokio::spawn(async move {
@@ -655,6 +806,7 @@ impl DownloadManager {
                 speed_limit,
                 client,
                 task.headers.clone(),
+                db,
             ).await;
 
             // 释放并发名额并唤醒等待者
@@ -699,6 +851,7 @@ impl DownloadManager {
         speed_limit_bps: Arc<AtomicU64>,
         client: reqwest::Client,
         headers: Option<HashMap<String, String>>,
+        db: Option<Arc<TokioRwLock<Database>>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 一次性签名 URL（Google Slides / /export/ 路径签名导出）：HEAD 会「消费」token 导致后续 GET 400，
         // 必须在 HEAD 探测之前识别并绕过，直接走 GET 单线程下载（total_size 交给 GET 响应或
@@ -775,6 +928,7 @@ impl DownloadManager {
                 headers,
                 one_shot,
                 false,
+                db,
             ).await
         } else {
             // Multi-threaded chunked download（支持断点续传：已完成的 .part 分片直接跳过，
@@ -997,7 +1151,8 @@ impl DownloadManager {
     async fn download_single(
         task_id: String,
         url: String,
-        save_path: String,
+        // one_shot 下载会在拿到 GET 响应头后，于 writer spawn 前据此重算真实文件名路径
+        mut save_path: String,
         tasks: Arc<TokioRwLock<HashMap<String, DownloadTask>>>,
         cancel_flags: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
         app_handle: tauri::AppHandle,
@@ -1011,6 +1166,7 @@ impl DownloadManager {
         // 浏览器 UA 被 Anubis 挑战）；true=原生 UA 重试轮（再被挑战即判失败，
         // 不得标记 Completed）。调用方 download_file 首轮传 false。
         anubis_retry: bool,
+        db: Option<Arc<TokioRwLock<Database>>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 断点续传：若目标文件已存在，从已下载字节处 Range 续传。
         // 一次性签名 URL：忽略残留文件长度，强制从头 GET（不带 Range），并因 resume_from=0
@@ -1039,6 +1195,79 @@ impl DownloadManager {
                 status.canonical_reason().unwrap_or("Error")
             )
             .into());
+        }
+
+        // ===== one_shot 真实文件名修复（BugFix 26.11.19）=====
+        // Google Slides 一次性签名 URL 原本落盘为 URL 末段文档 ID、无 .pptx 后缀。
+        // 真实名就在「这次下载 GET」自身的 content-disposition 里——绝不额外发
+        // HEAD/GET（会消费一次性 token 导致真下载 400）。在 writer spawn 之前决定
+        // 最终 save_path：此刻文件尚未被创建，改路径不会留下错误名的磁盘残留。
+        // 非 one_shot 站点/场景完全不走此分支，行为零变化。
+        if one_shot_url && !anubis_retry {
+            let disposition = response
+                .headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            if let Some(real_name) = resolve_one_shot_filename(
+                &url,
+                disposition.as_deref(),
+                content_type.as_deref(),
+            ) {
+                let parent = Path::new(&save_path)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+
+                // 并发同名防竞态：必须在同一把 tasks 写锁内完成
+                // 「收集其他任务已占用的 save_path → 算唯一路径 → 写回本任务」。
+                // 两个 writer 都在 File::create 之前，仅靠磁盘 exists() 都会看到目标
+                // 不存在而选中同一路径；写锁串行化后，后者能看到前者刚占用的路径，
+                // 顺延 _001/_002。reserved 排除本任务 id（本任务旧路径不算占位）。
+                let (updated, changed) = {
+                    let mut guard = tasks.write().await;
+                    let reserved: HashSet<String> = guard
+                        .iter()
+                        .filter(|(id, _)| id.as_str() != task_id.as_str())
+                        .map(|(_, t)| t.save_path.clone())
+                        .collect();
+                    let new_path = resolve_unique_path_reserving(parent, &real_name, &reserved)
+                        .to_string_lossy()
+                        .to_string();
+                    if new_path != save_path {
+                        tracing::info!(
+                            "one_shot 真实文件名: {:?} -> {:?}: task={}",
+                            save_path, new_path, task_id
+                        );
+                        save_path = new_path.clone();
+                        // 同步内存任务：前端任务列表显示名 /「打开文件夹」均取此处。
+                        let updated = guard.get_mut(&task_id).map(|t| {
+                            t.filename = real_name.clone();
+                            t.save_path = new_path;
+                            t.clone()
+                        });
+                        let changed = updated.is_some();
+                        (updated, changed)
+                    } else {
+                        (None, false)
+                    }
+                };
+                // 回写 SQLite：否则重启恢复（restore_task）又显示旧文档 ID。
+                if let (Some(db), Some(task)) = (&db, updated) {
+                    let _ = db.write().await.insert_task(&task);
+                }
+                // 复用既有 download-created 事件触发前端 reload（前端只监听
+                // 该事件后 loadDownloads，不消费 payload），使任务名即时刷新。
+                if changed {
+                    let _ = app_handle.emit("download-created", ());
+                }
+            }
         }
 
         // 关键安全校验：很多服务器会忽略 Range 头并返回 200（完整文件）。
@@ -1137,6 +1366,7 @@ impl DownloadManager {
                                 None,
                                 one_shot_url,
                                 true,
+                                db,
                             ))
                             .await;
                         }
@@ -1569,8 +1799,182 @@ fn finalize_download_error(top: &str, full_chain: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-        use super::*;
-        use std::time::Duration as StdDuration;
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    // ===== one_shot 真实文件名（BugFix 26.11.19）=====
+
+    #[test]
+    fn test_resolve_one_shot_filename_real_google_response() {
+        // 活体证据：下载那次 GET 自带的响应头（零额外请求、不消耗 token）
+        let disposition = "attachment; filename=\"FAREASTFALL2027.pptx\"; filename*=UTF-8''FAR%20EAST%20FALL%202027.pptx";
+        let url = "https://doc-0c-3k-slides.googleusercontent.com/export/abc/1MLh_0byMi1slXUE5kc0Nt6oFVgX3Oy3ybZhxqvhV_ME?exportFormat=pptx&token=t&dat=d";
+        let name = resolve_one_shot_filename(url, Some(disposition), Some(
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ));
+        // filename* RFC5987 优先于传统 filename=，解码后含空格、.pptx 后缀保留
+        assert_eq!(name.as_deref(), Some("FAR EAST FALL 2027.pptx"));
+    }
+
+    #[test]
+    fn test_resolve_one_shot_filename_legacy_filename() {
+        // 只有传统 filename=（无 filename*）时照常解析
+        let disposition = "attachment; filename=\"report-2026.pdf\"";
+        let url = "https://doc-0c-3k-slides.googleusercontent.com/export/x/DOCID?exportFormat=pptx";
+        assert_eq!(
+            resolve_one_shot_filename(url, Some(disposition), None).as_deref(),
+            Some("report-2026.pdf")
+        );
+    }
+
+    #[test]
+    fn test_resolve_one_shot_filename_export_format_fallback() {
+        // 极端兜底：响应头无 content-disposition，按 URL 的 exportFormat=pptx 补后缀
+        let url = "https://doc-0c-3k-slides.googleusercontent.com/export/abc/1MLh_0byMi1slXUE5kc0Nt6oFVgX3Oy3ybZhxqvhV_ME?exportFormat=pptx&token=t";
+        assert_eq!(
+            resolve_one_shot_filename(url, None, None).as_deref(),
+            Some("1MLh_0byMi1slXUE5kc0Nt6oFVgX3Oy3ybZhxqvhV_ME.pptx")
+        );
+
+        // 其它导出格式：odp / jpg / png / svg / txt 各自补对应后缀
+        for (fmt, ext) in [
+            ("odp", "odp"), ("jpeg", "jpg"), ("png", "png"),
+            ("svg", "svg"), ("txt", "txt"), ("pdf", "pdf"),
+        ] {
+            let u = format!(
+                "https://doc-0c-3k-slides.googleusercontent.com/export/x/DOCID?exportFormat={}&token=t",
+                fmt
+            );
+            let expected = format!("DOCID.{}", ext);
+            assert_eq!(
+                resolve_one_shot_filename(&u, None, None).as_deref(),
+                Some(expected.as_str()),
+                "exportFormat={} 应补 .{}", fmt, ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_one_shot_filename_content_type_fallback() {
+        // 响应头无 disposition、URL 也无 exportFormat：按 content-type 映射补后缀
+        let url = "https://doc-0c-3k-slides.googleusercontent.com/export/x/1MLh_0byMi1slXUE5kc0Nt6oFVgX3Oy3ybZhxqvhV_ME?token=t";
+        assert_eq!(
+            resolve_one_shot_filename(
+                url,
+                None,
+                Some("application/vnd.openxmlformats-officedocument.presentationml.presentation; charset=binary"),
+            ).as_deref(),
+            Some("1MLh_0byMi1slXUE5kc0Nt6oFVgX3Oy3ybZhxqvhV_ME.pptx")
+        );
+        // 完全无任何线索：返回 None，调用方保持原路径（行为不变）
+        assert_eq!(resolve_one_shot_filename(url, None, None), None);
+    }
+
+    #[test]
+    fn test_export_extension_for() {
+        // URL exportFormat 优先于 content-type
+        assert_eq!(
+            export_extension_for(
+                "https://x.googleusercontent.com/export/a?id=x&exportFormat=odp",
+                Some("application/pdf"),
+            ),
+            Some("odp")
+        );
+        // content-type 映射（含分号参数）
+        assert_eq!(
+            export_extension_for("https://x.googleusercontent.com/export/a", Some("image/png; foo=bar")),
+            Some("png")
+        );
+        assert_eq!(
+            export_extension_for("https://x.googleusercontent.com/export/a", Some("image/svg+xml")),
+            Some("svg")
+        );
+        assert_eq!(
+            export_extension_for("https://x.googleusercontent.com/export/a", Some("text/plain")),
+            Some("txt")
+        );
+        // 无法识别
+        assert_eq!(export_extension_for("https://example.com/a", Some("application/octet-stream")), None);
+    }
+
+    #[test]
+    fn test_resolve_one_shot_filename_unique_path_no_overwrite() {
+        // 改名落盘必须防覆盖：真实名已存在时顺延 _001
+        let dir = std::env::temp_dir().join("lele_one_shot_rename");
+        let _ = fs::create_dir_all(&dir);
+        let disposition = "attachment; filename=\"FAREASTFALL2027.pptx\"; filename*=UTF-8''FAR%20EAST%20FALL%202027.pptx";
+        let url = "https://doc-0c-3k-slides.googleusercontent.com/export/x/DOCID?exportFormat=pptx";
+        let name = resolve_one_shot_filename(url, Some(disposition), None).unwrap();
+
+        let p1 = resolve_unique_path(dir.to_str().unwrap(), &name);
+        assert_eq!(p1.file_name().unwrap().to_string_lossy(), "FAR EAST FALL 2027.pptx");
+        fs::write(&p1, b"x").unwrap();
+        let p2 = resolve_unique_path(dir.to_str().unwrap(), &name);
+        assert_eq!(p2.file_name().unwrap().to_string_lossy(), "FAR EAST FALL 2027_001.pptx");
+
+        let _ = fs::remove_file(dir.join("FAR EAST FALL 2027.pptx"));
+        let _ = fs::remove_file(dir.join("FAR EAST FALL 2027_001.pptx"));
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_resolve_unique_path_reserving() {
+        // 并发同名 one_shot 任务：唯一性同时看磁盘与 reserved（其他 in-flight
+        // 任务已占用的绝对路径）。reserved 排除本任务 id 的语义由改名块负责，
+        // 这里只测纯函数对 reserved 集合的占位行为。
+        let dir = std::env::temp_dir().join("lele_unique_reserving");
+        let _ = fs::create_dir_all(&dir);
+        let dir_s = dir.to_str().unwrap();
+        let target = dir.join("ACM.pptx").to_string_lossy().to_string();
+        let target_001 = dir.join("ACM_001.pptx").to_string_lossy().to_string();
+        let own_old = dir.join("DOCID_OLD").to_string_lossy().to_string();
+        let unrelated = dir.join("OTHER.pptx").to_string_lossy().to_string();
+        for f in ["ACM.pptx", "ACM_001.pptx", "ACM_002.pptx", "OTHER.pptx", "DOCID_OLD"] {
+            let _ = fs::remove_file(dir.join(f));
+        }
+
+        // 表驱动：reserved 占位行为（磁盘基准干净）
+        let cases: Vec<(&str, Vec<String>, &str)> = vec![
+            ("reserved 与磁盘均空 → 原名", vec![], "ACM.pptx"),
+            ("reserved 含目标 → 顺延 _001", vec![target.clone()], "ACM_001.pptx"),
+            (
+                "reserved 含目标与 _001 → 顺延 _002",
+                vec![target.clone(), target_001.clone()],
+                "ACM_002.pptx",
+            ),
+            (
+                "reserved 含本任务旧路径 / 无关绝对路径 → 不占位",
+                vec![own_old, unrelated],
+                "ACM.pptx",
+            ),
+        ];
+        for (name, reserved, expected) in cases {
+            let set: HashSet<String> = reserved.into_iter().collect();
+            let got = resolve_unique_path_reserving(dir_s, "ACM.pptx", &set);
+            assert_eq!(
+                got.file_name().unwrap().to_string_lossy(),
+                expected,
+                "case: {}",
+                name
+            );
+        }
+
+        // 磁盘与 reserved 混合：reserved 占目标、磁盘占 _001 → 顺延到 _002
+        fs::write(dir.join("ACM_001.pptx"), b"x").unwrap();
+        let set: HashSet<String> = [target].into_iter().collect();
+        let got = resolve_unique_path_reserving(dir_s, "ACM.pptx", &set);
+        assert_eq!(got.file_name().unwrap().to_string_lossy(), "ACM_002.pptx");
+        let _ = fs::remove_file(dir.join("ACM_001.pptx"));
+
+        // 磁盘已占目标本身（与 resolve_unique_path 同语义）
+        fs::write(dir.join("ACM.pptx"), b"x").unwrap();
+        let got = resolve_unique_path_reserving(dir_s, "ACM.pptx", &HashSet::new());
+        assert_eq!(got.file_name().unwrap().to_string_lossy(), "ACM_001.pptx");
+        let _ = fs::remove_file(dir.join("ACM.pptx"));
+
+        let _ = fs::remove_file(dir.join("ACM_002.pptx"));
+        let _ = fs::remove_dir(&dir);
+    }
 
         #[test]
         fn test_sanitize_filename_path_traversal() {
