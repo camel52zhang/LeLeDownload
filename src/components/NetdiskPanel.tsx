@@ -47,6 +47,12 @@ const PLATFORMS: { key: string; label: string; match: (h: string) => boolean }[]
     // 否则 weather.com / weibo.com 这类含 "we" 的域名会被误判成网盘链接。
     match: (h) => h === 'we.tl' || h === 'wetransfer.com' || h.endsWith('.wetransfer.com'),
   },
+  {
+    key: 'hightail',
+    label: 'Hightail',
+    // 与扩展侧 detectNetdiskPlatform 一致：官方公开分享域 spaces.hightail.com（含子域）。
+    match: (h) => h === 'spaces.hightail.com' || h.endsWith('.spaces.hightail.com'),
+  },
 ]
 
 function detectPlatform(u: string): { key: string | null; label: string } {
@@ -80,8 +86,8 @@ function extractPwdFromUrl(rawUrl: string): { cleanUrl: string; pwd: string | nu
   return { cleanUrl: clean, pwd }
 }
 
-export function NetdiskPanel() {
-  const [url, setUrl] = useState('')
+export function NetdiskPanel({ initialUrl }: { initialUrl?: string } = {}) {
+  const [url, setUrl] = useState(initialUrl || '')
   const [pwd, setPwd] = useState('')
   const [platform, setPlatform] = useState('自动')
   const [loading, setLoading] = useState(false)
@@ -141,7 +147,7 @@ export function NetdiskPanel() {
     const p = detectPlatform(url)
     setPlatform(p.label)
     if (!p.key) {
-      setError('暂不支持该链接所属的网盘平台（当前支持：百度 / 阿里 / 夸克 / 123 / 天翼 / 迅雷 / WeTransfer）')
+      setError('暂不支持该链接所属的网盘平台（当前支持：百度 / 阿里 / 夸克 / 123 / 天翼 / 迅雷 / WeTransfer / Hightail）')
       return
     }
     setError('')

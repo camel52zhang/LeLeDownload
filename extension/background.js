@@ -633,6 +633,9 @@ function detectNetdiskPlatform(url) {
     // 这类含 "we" 的域名被误判成网盘链接。
     if (h === 'we.tl') return 'wetransfer';
     if (h === 'wetransfer.com' || h.endsWith('.wetransfer.com')) return 'wetransfer';
+    // Hightail：官方分享域 spaces.hightail.com（/receive/<shareId> 公开分享，无需登录）。
+    // 精确匹配主域 + 子域，避免 hightail 相关营销域名误命中。
+    if (h === 'spaces.hightail.com' || h.endsWith('.spaces.hightail.com')) return 'hightail';
   } catch (_) { /* ignore */ }
   return null;
 }
@@ -2972,6 +2975,145 @@ async function resolveWeTransfer(url, pwd) {
   return { files: files, warning: warning };
 }
 
+// ---------- Hightail 公开分享解析 ----------
+// 分享页 spaces.hightail.com/receive/<shareId> 是 AngularJS SPA，公开分享无需登录。
+// 真实浏览器抓包链路（2026-11-19 验证）：
+//   1) GET https://api.spaces.hightail.com/api/v1/auth/sessionInfo?cacheBuster=<ts>
+//      → 返回 body.sessionId（== Set-Cookie 的 sessionId 值），同时 Set-Cookie 落 jar。
+//   2) GET /api/v1/spaces/url/<shareId>?status=SEND → { id: "sp-...", ... }
+//   3) GET /api/v1/files/<spaceId>/untagged?depth=1&limit=20&offset=0&spaceUrl=<shareId>&term=
+//      → { children: [{ name, size, versionId, isDirectory, ... }] }
+//      目录子项走 GET /api/v2/spacetags/files/<parentFileId>?limit=&offset=&sort=&dir=&term=
+//   4) 每个文件拼接下载直链：https://download.spaces.hightail.com/api/v1/download/<versionId>
+//      ?redirectOnError=%2Freceive%2F<shareId>
+//      → 307 到 S3 预签名 URL（8h 有效，支持 Range，content-disposition 带真实名）。
+// 鉴权要点：上述 API 需 sessionId cookie；SW fetch 手动写 Cookie 头会被浏览器丢弃，
+//   故先 fetch sessionInfo（credentials:'include' 让 Set-Cookie 落 jar），
+//   再用 DNR 会话规则把 Cookie/Referer 显式注入到 api.spaces.hightail.com 请求。
+//   回传给 App 的 headers 里带 Cookie: sessionId=...（走 Rust reqwest，不受 forbidden header 限制），
+//   App 下载 download.spaces.hightail.com 时 307 会带上 cookie 完成鉴权。
+
+const HIGHTAIL_API = 'https://api.spaces.hightail.com/api';
+const HIGHTAIL_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const HIGHTAIL_REFERER = 'https://spaces.hightail.com/';
+let HIGHTAIL_AUTH_RULE_ID = 5002;
+
+// 从分享链接提取 shareId（/receive/<id>）
+function extractHightailShareId(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const m = u.pathname.match(/\/receive\/([A-Za-z0-9_-]+)/);
+    return m ? m[1] : null;
+  } catch (_) { return null; }
+}
+
+// DNR 注入 Cookie/Referer 到 api.spaces.hightail.com（Cookie 是 forbidden header，fetch 无法手设）
+async function ensureHightailAuthHeaders(sessionId) {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.declarativeNetRequest ||
+        typeof chrome.declarativeNetRequest.updateSessionRules !== 'function') return;
+    if (!sessionId) return;
+    const rules = [{
+      id: HIGHTAIL_AUTH_RULE_ID,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [
+          { header: 'Cookie', operation: 'set', value: 'sessionId=' + sessionId },
+          { header: 'Referer', operation: 'set', value: HIGHTAIL_REFERER },
+        ],
+      },
+      condition: { urlFilter: '||api.spaces.hightail.com/', resourceTypes: ['xmlhttprequest'] },
+    }];
+    await chrome.declarativeNetRequest.updateSessionRules({ addRules: rules, removeRuleIds: [HIGHTAIL_AUTH_RULE_ID] });
+  } catch (_) { /* DNR 不可用/被拒时静默降级为匿名请求 */ }
+}
+
+// 拉单页文件列表；parentId 为空=顶层 untagged，非空=目录子项（v2 spacetags）
+async function fetchHightailChildren(spaceId, shareId, parentId, offset, limit) {
+  let url;
+  if (parentId) {
+    url = HIGHTAIL_API + '/v2/spacetags/files/' + encodeURIComponent(parentId)
+      + '?limit=' + limit + '&offset=' + offset + '&sort=custom&dir=ASC&term=';
+  } else {
+    url = HIGHTAIL_API + '/v1/files/' + encodeURIComponent(spaceId) + '/untagged'
+      + '?cacheBuster=' + Date.now() + '&depth=1&dir=ASC&limit=' + limit
+      + '&offset=' + offset + '&sort=custom&spaceUrl=' + encodeURIComponent(shareId) + '&term=';
+  }
+  const data = await fetchJson(url, { headers: { 'User-Agent': HIGHTAIL_UA } }, 20000);
+  const children = Array.isArray(data && data.children) ? data.children : [];
+  return children;
+}
+
+async function resolveHightail(url, pwd) {
+  const shareId = extractHightailShareId(url);
+  if (!shareId) throw new Error('无法从链接提取 Hightail 分享 ID（应为 spaces.hightail.com/receive/<id>）：' + url);
+
+  // 1) 建立匿名会话：sessionInfo 的 Set-Cookie 由 credentials:'include' 落 jar，
+  //    body.sessionId 用于 DNR 注入 + 回传 App 的 Cookie 头。
+  let sessionInfo;
+  try {
+    sessionInfo = await fetchJson(HIGHTAIL_API + '/v1/auth/sessionInfo?cacheBuster=' + Date.now(), {
+      headers: { 'User-Agent': HIGHTAIL_UA },
+    }, 15000);
+  } catch (e) {
+    throw new Error('Hightail 建立会话失败：' + String((e && e.message) || e));
+  }
+  const sessionId = String((sessionInfo && sessionInfo.sessionId) || '');
+  if (!sessionId) throw new Error('Hightail 建立会话失败：sessionInfo 未返回 sessionId');
+  await ensureHightailAuthHeaders(sessionId);
+
+  // 2) spaceId
+  const space = await fetchJson(HIGHTAIL_API + '/v1/spaces/url/' + encodeURIComponent(shareId) + '?status=SEND', {
+    headers: { 'User-Agent': HIGHTAIL_UA },
+  }, 15000);
+  const spaceId = String((space && space.id) || '');
+  if (!spaceId) throw new Error('Hightail 取空间信息失败：未返回 space id（分享可能已失效或需要访问码）');
+
+  // 3) 顶层文件列表（分页）+ 递归展开目录，最多 10 层防环。
+  const files = [];
+  const seenDirs = new Set();
+  async function walk(parentId, depth) {
+    if (depth > 10) return;
+    const LIMIT = 100;
+    for (let offset = 0; ; offset += LIMIT) {
+      const children = await fetchHightailChildren(spaceId, shareId, parentId, offset, LIMIT);
+      for (const f of children) {
+        if (!f || f.isDeleted || f.gone) continue;
+        if (f.isDirectory) {
+          const dirId = String(f.fileId || '');
+          if (dirId && !seenDirs.has(dirId)) {
+            seenDirs.add(dirId);
+            await walk(dirId, depth + 1);
+          }
+          continue;
+        }
+        const versionId = String(f.versionId || '');
+        if (!versionId) continue; // 无版本号的条目无法拼下载直链
+        const name = String(f.name || 'file');
+        const size = (f.size !== undefined && f.size !== null && f.size !== '') ? bytesToSize(Number(f.size)) : '';
+        const direct = 'https://download.spaces.hightail.com/api/v1/download/' + encodeURIComponent(versionId)
+          + '?redirectOnError=' + encodeURIComponent('/receive/' + shareId);
+        files.push({
+          name: name,
+          size: size,
+          url: direct,
+          headers: {
+            'User-Agent': HIGHTAIL_UA,
+            'Referer': HIGHTAIL_REFERER,
+            'Cookie': 'sessionId=' + sessionId,
+          },
+        });
+      }
+      if (children.length < LIMIT) break; // 最后一页
+    }
+  }
+  await walk('', 0);
+  if (!files.length) throw new Error('Hightail 分享内没有可下载文件（可能是空分享或全部条目缺少版本信息）');
+
+  return { files: files };
+}
+
 // 分发
 async function resolveNetdisk(req) {
   const platform = detectNetdiskPlatform(req.url) || req.platform;
@@ -2983,6 +3125,7 @@ async function resolveNetdisk(req) {
     case 'pan123': return await resolvePan123(req.url, req.pwd);
     case 'tianyi': return await resolveTianyi(req.url, req.pwd);
     case 'wetransfer': return await resolveWeTransfer(req.url, req.pwd);
+    case 'hightail': return await resolveHightail(req.url, req.pwd);
     default: throw new Error('不支持的网盘平台：' + (req.url || ''));
   }
 }

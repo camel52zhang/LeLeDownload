@@ -18,6 +18,9 @@ function App() {
   const [filterStatus, setFilterStatus] = useState<'all' | 'downloading' | 'completed' | 'failed'>('all')
   const [downloadDir, setDownloadDir] = useState('')
   const [activeTab, setActiveTab] = useState<'downloads' | 'netdisk'>('downloads')
+  // 从「下载列表」粘贴 Hightail 分享链接时，自动切到网盘解析并预填该链接
+  // （分享页本身是 SPA HTML，直接下载只会得到一个无用的 html 文件）。
+  const [netdiskInitialUrl, setNetdiskInitialUrl] = useState('')
   // 待用户勾选文件的 BT 来源（非 null 时弹出 BtFileSelectPanel）
   const [btPending, setBtPending] = useState<{ list: BtFileList; source: string; saveDir?: string } | null>(null)
 
@@ -84,6 +87,14 @@ function App() {
   }, [btTasks.length > 0])
 
   const isBtSource = (url: string) => url.trim().startsWith('magnet:') || /\.torrent($|\?)/i.test(url.trim())
+  // Hightail 公开分享页 spaces.hightail.com/receive/<id> 是 SPA，不能直接当文件下载；
+  // 与 isBtSource 同理，粘贴到主下载框时引导到「网盘解析」标签（并预填链接）。
+  const isHightailShare = (url: string) => {
+    try {
+      const h = new URL(url.trim()).hostname.toLowerCase()
+      return (h === 'spaces.hightail.com' || h.endsWith('.spaces.hightail.com')) && /\/receive\//i.test(url)
+    } catch { return false }
+  }
   // invoke 包超时：librqbit 启动 DHT/UTP listener 偶尔阻塞，前端 30s 后强制断 Promise 让 finally 执行重置按钮
   function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     return Promise.race([
@@ -96,6 +107,13 @@ function App() {
     setIsAdding(true)
     try {
       const dir = saveDir || downloadDir || undefined
+      if (isHightailShare(url)) {
+        // Hightail 分享页不能直接下载：切到网盘解析标签并预填，由扩展解析出真实直链。
+        setNetdiskInitialUrl(url.trim())
+        setActiveTab('netdisk')
+        setIsAdding(false)
+        return
+      }
       if (isBtSource(url)) {
         // 磁力 / torrent → 强制先取种子内文件清单供勾选，确认后只下勾选项
         // （list_only 真实换 metadata，不下载；后端顺带缓存 .torrent 字节供 add 复用，
@@ -260,7 +278,7 @@ function App() {
       </main>
       <StatusBar totalTasks={tasks.length} downloadingCount={downloadingCount} onClearCompleted={handleClearCompleted} hasCompleted={hasCompleted} />
       </>)}
-      {activeTab === 'netdisk' && <NetdiskPanel />}
+      {activeTab === 'netdisk' && <NetdiskPanel initialUrl={netdiskInitialUrl} />}
       {btPending && (
         <BtFileSelectPanel
           list={btPending.list}

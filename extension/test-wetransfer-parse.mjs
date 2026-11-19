@@ -30,6 +30,8 @@ function detectNetdiskPlatform(url) {
     // WeTransfer：短链域 we.tl + 官方主域（含子域），精确匹配避免误伤 weather.com
     if (h === 'we.tl') return 'wetransfer';
     if (h === 'wetransfer.com' || h.endsWith('.wetransfer.com')) return 'wetransfer';
+    // Hightail：官方公开分享域（与 background.js 保持一致）
+    if (h === 'spaces.hightail.com' || h.endsWith('.spaces.hightail.com')) return 'hightail';
   } catch (_) { /* ignore */ }
   return null;
 }
