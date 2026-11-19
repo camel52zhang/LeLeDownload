@@ -454,6 +454,50 @@ fn finalize_downloaded_sizes(total_size: u64, downloaded: u64) -> (u64, u64) {
     (final_total, downloaded)
 }
 
+/// 识别 Google Slides / Presentation 导出产生的「一次性签名 URL」。
+///
+/// 背景：用户在 Google Slides 点「文件 > 下载 > Microsoft PowerPoint (.pptx)」时，
+/// 浏览器会 307 跳转到形如 `doc-*-slides.googleusercontent.com/export/...?...&token=...&dat=...`
+/// 的一次性签名 URL。该签名 token 是一次性的：HEAD 请求会「消费」token（返回 200 +
+/// content-length: 0 的空响应），随后的 GET 必然 400。因此必须在 HEAD 探测「之前」
+/// 识别并绕过，直接走 GET（download_single）。
+///
+/// 判据（求稳，宁可少判不可误伤）：
+/// - scheme 为 http/https；
+/// - host 以 `.googleusercontent.com` 结尾（大小写无关）；
+/// - path 含 `/export/`。
+///
+/// 覆盖范围：Slides/Presentation 等 path 含 `/export/` 的 googleusercontent 签名导出
+/// （pptx/odp/jpg/png/svg 等）。注意 Google Docs / Sheets 的签名导出走 `/docs/` 路径
+/// （如 `doc-0c-0k-docs.googleusercontent.com/docs/abc`），当前判据不覆盖；若后续遇到
+/// 同类一次性签名问题，需另行扩展判据，此处不做无实证的扩大。
+///
+/// 精确性说明：
+/// - 常规下载走 `/download?id=...`、头像走 `/image`，均不含 `/export/`；
+/// - `drive.usercontent.google.com` 属于 `.google.com`，不匹配 `.googleusercontent.com`；
+/// - 未跳转的 `docs.google.com/presentation/d/<id>/export/pdf` host 不匹配，PDF 行为不变；
+/// - 即便偶发误判，跳过 HEAD 也只会退化为单线程下载（total_size 由 GET 响应或 F2
+///   `finalize_downloaded_sizes` 回填），功能始终正确，损害仅限失去多线程加速。
+/// 纯函数、可单测。
+fn is_one_shot_signed_url(url: &str) -> bool {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return false,
+    }
+    let host = match parsed.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return false,
+    };
+    if !host.ends_with(".googleusercontent.com") {
+        return false;
+    }
+    parsed.path().contains("/export/")
+}
+
 impl DownloadManager {
     pub fn new(app_handle: tauri::AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
         let config = DownloadConfig::default();
@@ -656,21 +700,35 @@ impl DownloadManager {
         client: reqwest::Client,
         headers: Option<HashMap<String, String>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // HEAD 探测；部分 CDN/对象存储对 HEAD 返回 405/403，fallback 到 GET Range:0-0 拿 headers
-        // 分享链接场景：HEAD/GET 均携带调用方自定义头（Cookie/Referer 等），用于会话绑定资源鉴权。
-        let head_response = match with_headers(client.head(&url), &headers).send().await {
-            Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::PARTIAL_CONTENT => r,
-            _ => with_headers(client.get(&url).header("Range", "bytes=0-0"), &headers).send().await?,
+        // 一次性签名 URL（Google Slides / /export/ 路径签名导出）：HEAD 会「消费」token 导致后续 GET 400，
+        // 必须在 HEAD 探测之前识别并绕过，直接走 GET 单线程下载（total_size 交给 GET 响应或
+        // F2 finalize_downloaded_sizes 回填）。注意：这里只改探测策略，SSRF 校验(is_url_safe)
+        // 在上游命令层已完成，不受影响。
+        let one_shot = is_one_shot_signed_url(&url);
+        if one_shot {
+            tracing::info!("检测到一次性签名导出 URL，跳过 HEAD 探测直接 GET: task={}", task_id);
+        }
+
+        let (accept_ranges, total_size) = if one_shot {
+            (false, 0u64)
+        } else {
+            // HEAD 探测；部分 CDN/对象存储对 HEAD 返回 405/403，fallback 到 GET Range:0-0 拿 headers
+            // 分享链接场景：HEAD/GET 均携带调用方自定义头（Cookie/Referer 等），用于会话绑定资源鉴权。
+            let head_response = match with_headers(client.head(&url), &headers).send().await {
+                Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::PARTIAL_CONTENT => r,
+                _ => with_headers(client.get(&url).header("Range", "bytes=0-0"), &headers).send().await?,
+            };
+
+            let accept_ranges = head_response
+                .headers()
+                .get("accept-ranges")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == "bytes")
+                .unwrap_or(false);
+
+            let total_size = head_response.content_length().unwrap_or(0);
+            (accept_ranges, total_size)
         };
-        
-        let accept_ranges = head_response
-            .headers()
-            .get("accept-ranges")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v == "bytes")
-            .unwrap_or(false);
-        
-        let total_size = head_response.content_length().unwrap_or(0);
 
         // 修复(P1)：用真实 content-length 校验磁盘空间（create_download 仅 100MB 兜底）
         if total_size > 0 {
@@ -715,6 +773,7 @@ impl DownloadManager {
                 rate_limiter.clone(),
                 client,
                 headers,
+                one_shot,
                 false,
             ).await
         } else {
@@ -945,13 +1004,22 @@ impl DownloadManager {
         rate_limiter: RateLimiter,
         client: reqwest::Client,
         headers: Option<HashMap<String, String>>,
+        // 一次性签名 URL（Google 导出）：token 只能用一次，禁止发 Range 续传请求
+        // （否则可能 416/400，或让首次 GET 失效），一律从头完整 GET。
+        one_shot_url: bool,
         // 修复(F1)：是否已用「原生 UA、无用户自定义头」重试过。false=首轮（可能带
         // 浏览器 UA 被 Anubis 挑战）；true=原生 UA 重试轮（再被挑战即判失败，
         // 不得标记 Completed）。调用方 download_file 首轮传 false。
         anubis_retry: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 断点续传：若目标文件已存在，从已下载字节处 Range 续传
-        let mut resume_from = fs::metadata(&save_path).map(|m| m.len()).unwrap_or(0);
+        // 断点续传：若目标文件已存在，从已下载字节处 Range 续传。
+        // 一次性签名 URL：忽略残留文件长度，强制从头 GET（不带 Range），并因 resume_from=0
+        // 走 File::create 覆盖写，避免残留/重复字节。
+        let mut resume_from = if one_shot_url {
+            0
+        } else {
+            fs::metadata(&save_path).map(|m| m.len()).unwrap_or(0)
+        };
         // 分享链接场景：GET 携带调用方自定义头；引擎的 Range 头在用户头之后追加，确保续传控制优先。
         let request = if resume_from > 0 {
             with_headers(client.get(&url), &headers).header("Range", format!("bytes={}-", resume_from))
@@ -1067,6 +1135,7 @@ impl DownloadManager {
                                 rate_limiter,
                                 client,
                                 None,
+                                one_shot_url,
                                 true,
                             ))
                             .await;
@@ -1338,9 +1407,20 @@ impl DownloadManager {
     }
 
     async fn extract_filename(&self, url: &str, headers: &Option<HashMap<String, String>>) -> Result<String, String> {
+        // 一次性签名 URL（Google Slides / /export/ 路径签名导出）：任何 HTTP 探测（HEAD 或 GET
+        // Range:0-0）都会「消费」token，导致真正下载时 GET 400。跳过全部网络探测，
+        // 直接走下面的 `filename=` 查询参数 / URL 末段兜底链。
+        // 正常场景（扩展在 onCreated 已透传 item.filename）根本不会进到本函数，
+        // 因此该守卫对其它站点零影响。
+        let one_shot = is_one_shot_signed_url(url);
+
         // 第一段：带调用方自定义头探测（分享链接场景的会话绑定资源必须带头才能拿到真实文件名）。
         // 部分服务器对 HEAD 返回 405/403，fallback 到 GET Range:0-0。
-        let mut filename = self.probe_content_disposition_filename(url, headers).await;
+        let mut filename = if one_shot {
+            None
+        } else {
+            self.probe_content_disposition_filename(url, headers).await
+        };
 
         // 第二段（修复 F3）：带头探测没拿到 content-disposition 时，用 client 原生 UA
         // （LeLe-Download/1.0，非浏览器 UA）再探测一次。Anubis 只挑战浏览器 UA、
@@ -1348,7 +1428,7 @@ impl DownloadManager {
         // 非 Anubis 站点第一段已拿到 disposition，不会进入本段，行为与原来完全一致。
         // 与 F1 重试同款前置条件：仅当用户头实际携带 UA 头时才值得再探
         // （主请求本就是原生 UA 时再探一次是重复请求，毫无意义）。
-        if filename.is_none() && headers_have_user_agent(headers) {
+        if filename.is_none() && !one_shot && headers_have_user_agent(headers) {
             filename = self.probe_content_disposition_filename(url, &None).await;
         }
 
@@ -1645,6 +1725,107 @@ mod tests {
             assert_eq!(finalize_downloaded_sizes(0, 7534), (7534, 7534));
             // 空下载：保持 0
             assert_eq!(finalize_downloaded_sizes(0, 0), (0, 0));
+        }
+
+        #[test]
+        fn test_is_one_shot_signed_url() {
+            // 表驱动：正例 = Google Slides/Presentation 的 /export/ 一次性签名 URL（pptx/odp/jpg 等）；
+            // 反例 = 未跳转 export/pdf、drive 常规直链、其它 googleusercontent 路径、
+            // ws-export、百度直链、非 google 域、非法 URL / 非 http(s)。
+            let cases: &[(&str, bool, &str)] = &[
+                // ---- 正例：googleusercontent /export/ 一次性签名 URL ----
+                (
+                    "https://doc-0c-3k-slides.googleusercontent.com/export/abc/def?id=XYZ&exportFormat=pptx&token=AMtJabc%3A1795054372357&dat=verylongsignature",
+                    true,
+                    "pptx 签名导出（含 token 与 dat）",
+                ),
+                (
+                    "https://doc-0c-3k-slides.googleusercontent.com/export/abc?exportFormat=odp&token=t1&dat=d1",
+                    true,
+                    "odp 签名导出",
+                ),
+                (
+                    "https://doc-00-8c-slides.googleusercontent.com/export/abc?exportFormat=jpeg&token=t2&dat=d2",
+                    true,
+                    "jpg 签名导出",
+                ),
+                (
+                    "https://doc-0c-3k-slides.googleusercontent.com/export/x?exportFormat=png&token=t3",
+                    true,
+                    "png 仅 token",
+                ),
+                (
+                    "https://doc-0c-3k-slides.googleusercontent.com/export/x?exportFormat=svg&dat=d4",
+                    true,
+                    "svg 仅 dat",
+                ),
+                (
+                    "https://doc-0c-3k-abc.googleusercontent.com/export/x?exportFormat=txt&token=t5",
+                    true,
+                    "非 slides 子域但同为 googleusercontent /export/ 签名",
+                ),
+                (
+                    "https://DOC-0C-3K-SLIDES.GOOGLEUSERCONTENT.COM/export/x?token=t6",
+                    true,
+                    "host 大写归一化",
+                ),
+                // ---- 反例：必须保持原有 HEAD 行为 ----
+                (
+                    "https://docs.google.com/presentation/d/1MLh_0byMi1sl/edit?usp=sharing",
+                    false,
+                    "docs 编辑页",
+                ),
+                (
+                    "https://docs.google.com/presentation/d/1MLh_0byMi1sl/export/pdf?id=1MLh_0by&pageid=p1",
+                    false,
+                    "未跳转 export/pdf（PDF 下载行为不变）",
+                ),
+                (
+                    "https://drive.usercontent.google.com/download?id=abc&export=download&authuser=0",
+                    false,
+                    "drive 常规直链（.google.com，非 googleusercontent）",
+                ),
+                (
+                    "https://lh3.googleusercontent.com/d/abc123=s0",
+                    false,
+                    "googleusercontent 头像/图片直链（无 /export/）",
+                ),
+                (
+                    "https://doc-0c-3k-slides.googleusercontent.com/asset/logo.png",
+                    false,
+                    "googleusercontent 非 export 路径",
+                ),
+                (
+                    "https://ws-export.wmcloud.org/api/v1/export?format=pdf",
+                    false,
+                    "ws-export Anubis 站点",
+                ),
+                (
+                    "https://d.pcs.baidu.com/file/abc?fid=123",
+                    false,
+                    "百度直链",
+                ),
+                (
+                    "https://example.com/export/file?token=abc",
+                    false,
+                    "非 google 域但含 /export/ 与 token",
+                ),
+                ("not a url", false, "非法 URL"),
+                (
+                    "ftp://doc-0c-3k-slides.googleusercontent.com/export/x?token=t",
+                    false,
+                    "非 http(s) scheme",
+                ),
+            ];
+            for (url, expected, name) in cases {
+                assert_eq!(
+                    is_one_shot_signed_url(url),
+                    *expected,
+                    "case: {} (url={})",
+                    name,
+                    url
+                );
+            }
         }
 
         #[test]
